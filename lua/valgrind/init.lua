@@ -103,9 +103,8 @@ end
 
 -- TODO: Investigate why this doesn't work on calls subsequent to the first call.
 M.extract_valgrind_error = function(xml_file, error_file)
-    -- TODO: Use luarocks for this. See: https://github.com/theHamsta/nvim_rocks
-    local xml2lua = require("valgrind.lib.xml2lua.xml2lua")
-    local handler = require("valgrind.lib.xml2lua.xmlhandler.tree")
+    local xml2lua = require("xml2lua")
+    local handler = require("xmlhandler.tree")
 
     -- TODO: Check that the following supports valgrind tools other than memcheck and helgrind.
     local parser = xml2lua.parser(handler)
