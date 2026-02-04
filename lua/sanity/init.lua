@@ -4,8 +4,8 @@ function M.setup(opts)
     opts = opts or {}
 
     vim.api.nvim_create_user_command("Valgrind", M.run_valgrind, { nargs = 1 })
-    vim.api.nvim_create_user_command("ValgrindLoadXml", M.valgrind_load_xml, { nargs = 1 })
-    vim.api.nvim_create_user_command("SanitizerLoadLog", M.sanitizer_load_log, { nargs = 1 })
+    vim.api.nvim_create_user_command("ValgrindLoadXml", M.valgrind_load_xml, { nargs = 1, complete = "file" })
+    vim.api.nvim_create_user_command("SanitizerLoadLog", M.sanitizer_load_log, { nargs = 1, complete = "file" })
 end
 
 local function starts_with(str, start)
