@@ -1,4 +1,4 @@
-# valgrind.nvim
+# sanity.nvim
 
 A neovim plugin for valgrind (memcheck and helgrind) and sanitizers (address and thread) integration.
 
@@ -8,7 +8,7 @@ This plugin depends on [xml2lua](https://github.com/manoelcampos/xml2lua). The i
 
 ```lua
 {
-  'dlyongemallo/valgrind.nvim',
+  'dlyongemallo/sanity.nvim',
   config = true,
   dependencies = {
     {
@@ -38,14 +38,14 @@ vim program.c
 ```
 
 ```vim
-:Valgind --tool=memcheck ./program
+:Valgrind --tool=memcheck ./program
 :copen
 ```
 
 Note that `--tool=memcheck` is optional as it is the default tool for valgrind.
 
 ```vim
-:Valgind --tool=helgrind ./program
+:Valgrind --tool=helgrind ./program
 :copen
 ```
 
@@ -57,7 +57,7 @@ vim program.c
 ```
 
 ```vim
-:ValgindLoadXml memcheck.xml
+:ValgrindLoadXml memcheck.xml
 :copen
 ```
 
@@ -67,7 +67,7 @@ vim program.c
 ```
 
 ```vim
-:ValgindLoadXml helgrind.xml
+:ValgrindLoadXml helgrind.xml
 :copen
 ```
 
