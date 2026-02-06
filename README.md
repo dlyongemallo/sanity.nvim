@@ -94,3 +94,4 @@ vim program.c
 
 It is recommended to use the [Trouble](https://github.com/folke/trouble.nvim) plugin to display the quickfix list in a more useful way.
 
+Further examples may be found in [examples/demo.c](examples/demo.c).

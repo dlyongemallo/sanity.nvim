@@ -1,0 +1,9 @@
+# Compiled binaries
+demo
+demo_asan
+demo_tsan
+
+# Valgrind/sanitizer output files
+*.xml
+*.log
+*.supp
