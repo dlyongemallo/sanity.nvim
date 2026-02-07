@@ -559,6 +559,8 @@ end
 local function pick_files_fzf_lua(callback)
     require("fzf-lua").files({
         prompt = "SanityLoadLog> ",
+        fd_opts = "--type f --no-ignore -e xml -e log -e txt",
+        rg_opts = "--files --no-ignore -g *.xml -g *.log -g *.txt",
         actions = {
             ["default"] = function(selected)
                 local paths = {}
@@ -576,6 +578,8 @@ local function pick_files_telescope(callback)
     local action_state = require("telescope.actions.state")
     require("telescope.builtin").find_files({
         prompt_title = "SanityLoadLog",
+        no_ignore = true,
+        find_command = { "fd", "--type", "f", "--no-ignore", "-e", "xml", "-e", "log", "-e", "txt" },
         attach_mappings = function(prompt_bufnr, _)
             actions.select_default:replace(function()
                 local picker = action_state.get_current_picker(prompt_bufnr)
@@ -597,28 +601,69 @@ local function pick_files_telescope(callback)
     })
 end
 
+local function pick_files_mini_pick(callback)
+    MiniPick.builtin.cli(
+        { command = { "rg", "--files", "--no-follow", "--color=never", "--no-ignore",
+                       "--glob", "*.xml", "--glob", "*.log", "--glob", "*.txt" } },
+        {
+            source = {
+                name = "SanityLoadLog",
+                choose = function(item)
+                    if item then callback({ item }) end
+                end,
+                choose_marked = function(items)
+                    if #items > 0 then callback(items) end
+                end,
+            },
+        }
+    )
+end
+
+local function pick_files_snacks(callback)
+    require("snacks").picker.files({
+        ft = { "xml", "log", "txt" },
+        ignored = true,
+        confirm = function(picker)
+            picker:close()
+            local items = picker:selected({ fallback = true })
+            local paths = {}
+            for _, item in ipairs(items) do
+                if item.file then
+                    table.insert(paths, item.file)
+                end
+            end
+            if #paths > 0 then callback(paths) end
+        end,
+    })
+end
+
 -- Open a file picker using the configured or auto-detected picker plugin.
 local function pick_files(callback)
-    if config.picker == "fzf-lua" then
-        pick_files_fzf_lua(callback)
+    local pickers = {
+        ["fzf-lua"]   = { mod = "fzf-lua",   fn = pick_files_fzf_lua },
+        ["telescope"] = { mod = "telescope",  fn = pick_files_telescope },
+        ["mini.pick"] = { mod = "mini.pick",  fn = pick_files_mini_pick },
+        ["snacks"]    = { mod = "snacks",     fn = pick_files_snacks },
+    }
+    if config.picker then
+        local p = pickers[config.picker]
+        if p then
+            p.fn(callback)
+            return
+        end
+        vim.notify("SanityLoadLog: unknown picker '" .. config.picker .. "'", vim.log.levels.ERROR)
         return
     end
-    if config.picker == "telescope" then
-        pick_files_telescope(callback)
-        return
+    -- Auto-detect in priority order.
+    for _, name in ipairs({ "fzf-lua", "telescope", "mini.pick", "snacks" }) do
+        local ok = pcall(require, pickers[name].mod)
+        if ok then
+            pickers[name].fn(callback)
+            return
+        end
     end
-    -- Auto-detect: try fzf-lua first, then telescope.
-    local has_fzf_lua = pcall(require, "fzf-lua")
-    if has_fzf_lua then
-        pick_files_fzf_lua(callback)
-        return
-    end
-    local has_telescope = pcall(require, "telescope")
-    if has_telescope then
-        pick_files_telescope(callback)
-        return
-    end
-    vim.notify("SanityLoadLog: no picker available (install fzf-lua or telescope.nvim)", vim.log.levels.ERROR)
+    vim.notify("SanityLoadLog: no picker available (install fzf-lua, telescope.nvim, mini.pick, or snacks.nvim)",
+        vim.log.levels.ERROR)
 end
 
 M.sanity_load_log = function(args)
