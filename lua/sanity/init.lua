@@ -101,10 +101,10 @@ local populate_link = function(link, prev_target)
 
 end
 
--- TODO: Investigate why this doesn't work on calls subsequent to the first call.
 M.extract_valgrind_error = function(xml_file, error_file)
     local xml2lua = require("xml2lua")
-    local handler = require("xmlhandler.tree")
+    -- Create a fresh handler each call to avoid xml2lua's repeated-parse bug.
+    local handler = require("xmlhandler.tree"):new()
 
     -- TODO: Check that the following supports valgrind tools other than memcheck and helgrind.
     local parser = xml2lua.parser(handler)
