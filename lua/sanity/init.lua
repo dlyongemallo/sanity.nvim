@@ -1,15 +1,54 @@
 local M = {}
 
+local config = {}
+
 function M.setup(opts)
     opts = opts or {}
+    config.picker = opts.picker
 
     vim.api.nvim_create_user_command("Valgrind", M.run_valgrind, { nargs = 1 })
-    vim.api.nvim_create_user_command("ValgrindLoadXml", M.valgrind_load_xml, { nargs = 1 })
-    vim.api.nvim_create_user_command("SanitizerLoadLog", M.sanitizer_load_log, { nargs = 1 })
+    vim.api.nvim_create_user_command("SanityLoadLog", M.sanity_load_log, { nargs = "*", complete = "file" })
 end
 
 local function starts_with(str, start)
     return str:sub(1, #start) == start
+end
+
+-- Iterate over a table in numeric key order.
+-- xml2lua creates tables with numeric keys, but pairs() doesn't preserve order.
+-- Handles both numeric keys (1, 2, 3) and string keys ("1", "2", "3").
+local function ipairs_safe(t)
+    if type(t) ~= "table" then
+        return function() end
+    end
+    local numeric_keys = {}
+    local other_keys = {}
+    for k in pairs(t) do
+        local num = tonumber(k)
+        if num then
+            table.insert(numeric_keys, { key = k, num = num })
+        else
+            table.insert(other_keys, k)
+        end
+    end
+    -- Sort numeric keys by their numeric value.
+    table.sort(numeric_keys, function(a, b) return a.num < b.num end)
+    -- Build final key list: numeric keys first (in order), then other keys.
+    local keys = {}
+    for _, entry in ipairs(numeric_keys) do
+        table.insert(keys, entry.key)
+    end
+    for _, k in ipairs(other_keys) do
+        table.insert(keys, k)
+    end
+    local i = 0
+    return function()
+        i = i + 1
+        local k = keys[i]
+        if k then
+            return k, t[k]
+        end
+    end
 end
 
 local summarize_rw = function(rw)
@@ -101,10 +140,57 @@ local populate_link = function(link, prev_target)
 
 end
 
--- TODO: Investigate why this doesn't work on calls subsequent to the first call.
+-- Detect the format of a log file by reading the first few lines.
+local function detect_log_format(filepath)
+    local f = io.open(filepath, "r")
+    if not f then
+        vim.notify("Failed to open file: " .. filepath, vim.log.levels.ERROR)
+        return nil
+    end
+    for _ = 1, 10 do
+        local line = f:read("*l")
+        if not line then break end
+        if line:find("<%?xml") or line:find("<valgrindoutput") then
+            f:close()
+            return "valgrind_xml"
+        end
+        if line:match("WARNING: .*Sanitizer:") or line:match("ERROR: .*Sanitizer:") then
+            f:close()
+            return "sanitizer_log"
+        end
+    end
+    f:close()
+    vim.notify("Unrecognised log format: " .. filepath, vim.log.levels.ERROR)
+    return nil
+end
+
+-- Load an error file into the quickfix list, appending and deduplicating.
+local function load_error_file(error_file)
+    local efm = vim.bo.efm
+    vim.bo.efm = "%f:%l:%m"
+    vim.cmd("caddfile " .. error_file)
+    vim.bo.efm = efm
+
+    -- Deduplicate quickfix entries.
+    local qflist = vim.fn.getqflist()
+    local seen = {}
+    local deduped = {}
+    for _, entry in ipairs(qflist) do
+        local key = entry.bufnr .. ":" .. entry.lnum .. ":" .. entry.text
+        if not seen[key] then
+            seen[key] = true
+            table.insert(deduped, entry)
+        end
+    end
+    if #deduped < #qflist then
+        vim.fn.setqflist(deduped, "r")
+    end
+end
+
 M.extract_valgrind_error = function(xml_file, error_file)
     local xml2lua = require("xml2lua")
-    local handler = require("xmlhandler.tree")
+    -- Create a fresh handler each call to avoid xml2lua's repeated-parse bug.
+    local handler = require("xmlhandler.tree"):new()
 
     -- TODO: Check that the following supports valgrind tools other than memcheck and helgrind.
     local parser = xml2lua.parser(handler)
@@ -132,7 +218,7 @@ M.extract_valgrind_error = function(xml_file, error_file)
         if stack.stack and #stack.stack > 1 then
            stack = stack.stack
         end
-        for _, s in pairs(stack) do
+        for _, s in ipairs_safe(stack) do
             if not s.frame then goto not_frame_continue end
             local frame = s
             if frame.frame and #frame.frame > 1 then
@@ -140,7 +226,7 @@ M.extract_valgrind_error = function(xml_file, error_file)
             end
             local target
             local prev_target
-            for _, f in pairs(frame) do
+            for _, f in ipairs_safe(frame) do
                 if not f.dir or not f.file then goto not_file_continue end
                 if not starts_with(f.dir, vim.fn.getcwd()) then goto not_file_continue end
                 -- Add leading zeroes to line numbers for sorting.
@@ -259,10 +345,7 @@ M.valgrind_load_xml = function(args)
     local error_file = vim.fn.tempname()
 
     M.extract_valgrind_error(xml_file, error_file)
-    local efm = vim.bo.efm
-    vim.bo.efm = "%f:%l:%m"
-    vim.cmd("cfile " .. error_file)
-    vim.bo.efm = efm
+    load_error_file(error_file)
 
     -- print("Valgrind error log written to: " .. error_file)
     vim.fn.delete(error_file)
@@ -312,7 +395,7 @@ M.sanitizer_load_log = function(args)
         else
             target = string.match(line, "#%d+ 0x%x+ .* (.+)")  -- ASAN format
             if not target then
-                target = string.match(line, "#%d+ .* (.+) %(.+%)")  -- TSAN format
+                target = string.match(line, "#%d+ %S+ ([^%(]+)%s+%(")  -- TSAN format
             end
             if not target then
                 print("Failed to parse link target from line:\n" .. line)
@@ -453,16 +536,143 @@ M.sanitizer_load_log = function(args)
     end
     error_file_handle:close()
 
-    local efm = vim.bo.efm
-    vim.bo.efm = "%f:%l:%m"
-    vim.cmd("cfile " .. error_file)
-    vim.bo.efm = efm
+    load_error_file(error_file)
 
     -- Inform user of some stats.
     vim.notify("Processed " .. num_processed_lines .. " lines from '" .. log_file .. "' into " .. num_output_lines .. " locations.")
 
     -- print("Sanitizer error log written to: " .. error_file)
     vim.fn.delete(error_file)
+end
+
+local function load_files(filepaths)
+    for _, filepath in ipairs(filepaths) do
+        local format = detect_log_format(filepath)
+        if format == "valgrind_xml" then
+            M.valgrind_load_xml({ args = filepath })
+        elseif format == "sanitizer_log" then
+            M.sanitizer_load_log({ args = filepath })
+        end
+    end
+end
+
+local function pick_files_fzf_lua(callback)
+    require("fzf-lua").files({
+        prompt = "SanityLoadLog> ",
+        fd_opts = "--type f --no-ignore -e xml -e log -e txt",
+        rg_opts = "--files --no-ignore -g *.xml -g *.log -g *.txt",
+        actions = {
+            ["default"] = function(selected)
+                local paths = {}
+                for _, sel in ipairs(selected) do
+                    table.insert(paths, require("fzf-lua.path").entry_to_file(sel).path)
+                end
+                callback(paths)
+            end,
+        },
+    })
+end
+
+local function pick_files_telescope(callback)
+    local actions = require("telescope.actions")
+    local action_state = require("telescope.actions.state")
+    require("telescope.builtin").find_files({
+        prompt_title = "SanityLoadLog",
+        no_ignore = true,
+        find_command = { "fd", "--type", "f", "--no-ignore", "-e", "xml", "-e", "log", "-e", "txt" },
+        attach_mappings = function(prompt_bufnr, _)
+            actions.select_default:replace(function()
+                local picker = action_state.get_current_picker(prompt_bufnr)
+                local selections = picker:get_multi_selection()
+                actions.close(prompt_bufnr)
+                local paths = {}
+                if #selections > 0 then
+                    for _, entry in ipairs(selections) do
+                        table.insert(paths, entry[1])
+                    end
+                else
+                    local entry = action_state.get_selected_entry()
+                    if entry then table.insert(paths, entry[1]) end
+                end
+                callback(paths)
+            end)
+            return true
+        end,
+    })
+end
+
+local function pick_files_mini_pick(callback)
+    MiniPick.builtin.cli(
+        { command = { "rg", "--files", "--no-follow", "--color=never", "--no-ignore",
+                       "--glob", "*.xml", "--glob", "*.log", "--glob", "*.txt" } },
+        {
+            source = {
+                name = "SanityLoadLog",
+                choose = function(item)
+                    if item then callback({ item }) end
+                end,
+                choose_marked = function(items)
+                    if #items > 0 then callback(items) end
+                end,
+            },
+        }
+    )
+end
+
+local function pick_files_snacks(callback)
+    require("snacks").picker.files({
+        ft = { "xml", "log", "txt" },
+        ignored = true,
+        confirm = function(picker)
+            picker:close()
+            local items = picker:selected({ fallback = true })
+            local paths = {}
+            for _, item in ipairs(items) do
+                if item.file then
+                    table.insert(paths, item.file)
+                end
+            end
+            if #paths > 0 then callback(paths) end
+        end,
+    })
+end
+
+-- Open a file picker using the configured or auto-detected picker plugin.
+local function pick_files(callback)
+    local pickers = {
+        ["fzf-lua"]   = { mod = "fzf-lua",   fn = pick_files_fzf_lua },
+        ["telescope"] = { mod = "telescope",  fn = pick_files_telescope },
+        ["mini.pick"] = { mod = "mini.pick",  fn = pick_files_mini_pick },
+        ["snacks"]    = { mod = "snacks",     fn = pick_files_snacks },
+    }
+    if config.picker then
+        local p = pickers[config.picker]
+        if p then
+            p.fn(callback)
+            return
+        end
+        vim.notify("SanityLoadLog: unknown picker '" .. config.picker .. "'", vim.log.levels.ERROR)
+        return
+    end
+    -- Auto-detect in priority order.
+    for _, name in ipairs({ "fzf-lua", "telescope", "mini.pick", "snacks" }) do
+        local ok = pcall(require, pickers[name].mod)
+        if ok then
+            pickers[name].fn(callback)
+            return
+        end
+    end
+    vim.notify("SanityLoadLog: no picker available (install fzf-lua, telescope.nvim, mini.pick, or snacks.nvim)",
+        vim.log.levels.ERROR)
+end
+
+M.sanity_load_log = function(args)
+    local filepaths = vim.split(args.args, "%s+", { trimempty = true })
+    if #filepaths == 0 then
+        pick_files(load_files)
+        return
+    end
+    load_files(filepaths)
 end
 
 return M
