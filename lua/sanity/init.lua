@@ -138,6 +138,29 @@ local populate_link = function(link, prev_target)
 
 end
 
+-- Load an error file into the quickfix list, appending and deduplicating.
+local function load_error_file(error_file)
+    local efm = vim.bo.efm
+    vim.bo.efm = "%f:%l:%m"
+    vim.cmd("caddfile " .. error_file)
+    vim.bo.efm = efm
+
+    -- Deduplicate quickfix entries.
+    local qflist = vim.fn.getqflist()
+    local seen = {}
+    local deduped = {}
+    for _, entry in ipairs(qflist) do
+        local key = entry.bufnr .. ":" .. entry.lnum .. ":" .. entry.text
+        if not seen[key] then
+            seen[key] = true
+            table.insert(deduped, entry)
+        end
+    end
+    if #deduped < #qflist then
+        vim.fn.setqflist(deduped, "r")
+    end
+end
+
 M.extract_valgrind_error = function(xml_file, error_file)
     local xml2lua = require("xml2lua")
     -- Create a fresh handler each call to avoid xml2lua's repeated-parse bug.
@@ -296,10 +319,7 @@ M.valgrind_load_xml = function(args)
     local error_file = vim.fn.tempname()
 
     M.extract_valgrind_error(xml_file, error_file)
-    local efm = vim.bo.efm
-    vim.bo.efm = "%f:%l:%m"
-    vim.cmd("cfile " .. error_file)
-    vim.bo.efm = efm
+    load_error_file(error_file)
 
     -- print("Valgrind error log written to: " .. error_file)
     vim.fn.delete(error_file)
@@ -490,10 +510,7 @@ M.sanitizer_load_log = function(args)
     end
     error_file_handle:close()
 
-    local efm = vim.bo.efm
-    vim.bo.efm = "%f:%l:%m"
-    vim.cmd("cfile " .. error_file)
-    vim.bo.efm = efm
+    load_error_file(error_file)
 
     -- Inform user of some stats.
     vim.notify("Processed " .. num_processed_lines .. " lines from '" .. log_file .. "' into " .. num_output_lines .. " locations.")
