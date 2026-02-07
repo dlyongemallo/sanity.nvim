@@ -369,7 +369,7 @@ M.sanitizer_load_log = function(args)
         else
             target = string.match(line, "#%d+ 0x%x+ .* (.+)")  -- ASAN format
             if not target then
-                target = string.match(line, "#%d+ .* (.+) %(.+%)")  -- TSAN format
+                target = string.match(line, "#%d+ %S+ ([^%(]+)%s+%(")  -- TSAN format
             end
             if not target then
                 print("Failed to parse link target from line:\n" .. line)
