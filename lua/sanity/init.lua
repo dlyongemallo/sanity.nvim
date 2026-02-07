@@ -12,6 +12,43 @@ local function starts_with(str, start)
     return str:sub(1, #start) == start
 end
 
+-- Iterate over a table in numeric key order.
+-- xml2lua creates tables with numeric keys, but pairs() doesn't preserve order.
+-- Handles both numeric keys (1, 2, 3) and string keys ("1", "2", "3").
+local function ipairs_safe(t)
+    if type(t) ~= "table" then
+        return function() end
+    end
+    local numeric_keys = {}
+    local other_keys = {}
+    for k in pairs(t) do
+        local num = tonumber(k)
+        if num then
+            table.insert(numeric_keys, { key = k, num = num })
+        else
+            table.insert(other_keys, k)
+        end
+    end
+    -- Sort numeric keys by their numeric value.
+    table.sort(numeric_keys, function(a, b) return a.num < b.num end)
+    -- Build final key list: numeric keys first (in order), then other keys.
+    local keys = {}
+    for _, entry in ipairs(numeric_keys) do
+        table.insert(keys, entry.key)
+    end
+    for _, k in ipairs(other_keys) do
+        table.insert(keys, k)
+    end
+    local i = 0
+    return function()
+        i = i + 1
+        local k = keys[i]
+        if k then
+            return k, t[k]
+        end
+    end
+end
+
 local summarize_rw = function(rw)
     local has_read = false
     local has_write = false
@@ -132,7 +169,7 @@ M.extract_valgrind_error = function(xml_file, error_file)
         if stack.stack and #stack.stack > 1 then
            stack = stack.stack
         end
-        for _, s in pairs(stack) do
+        for _, s in ipairs_safe(stack) do
             if not s.frame then goto not_frame_continue end
             local frame = s
             if frame.frame and #frame.frame > 1 then
@@ -140,7 +177,7 @@ M.extract_valgrind_error = function(xml_file, error_file)
             end
             local target
             local prev_target
-            for _, f in pairs(frame) do
+            for _, f in ipairs_safe(frame) do
                 if not f.dir or not f.file then goto not_file_continue end
                 if not starts_with(f.dir, vim.fn.getcwd()) then goto not_file_continue end
                 -- Add leading zeroes to line numbers for sorting.
