@@ -1,10 +1,13 @@
 local M = {}
 
+local config = {}
+
 function M.setup(opts)
     opts = opts or {}
+    config.picker = opts.picker
 
     vim.api.nvim_create_user_command("Valgrind", M.run_valgrind, { nargs = 1 })
-    vim.api.nvim_create_user_command("SanityLoadLog", M.sanity_load_log, { nargs = "+", complete = "file" })
+    vim.api.nvim_create_user_command("SanityLoadLog", M.sanity_load_log, { nargs = "*", complete = "file" })
 end
 
 local function starts_with(str, start)
@@ -542,8 +545,7 @@ M.sanitizer_load_log = function(args)
     vim.fn.delete(error_file)
 end
 
-M.sanity_load_log = function(args)
-    local filepaths = vim.split(args.args, "%s+", { trimempty = true })
+local function load_files(filepaths)
     for _, filepath in ipairs(filepaths) do
         local format = detect_log_format(filepath)
         if format == "valgrind_xml" then
@@ -552,6 +554,80 @@ M.sanity_load_log = function(args)
             M.sanitizer_load_log({ args = filepath })
         end
     end
+end
+
+local function pick_files_fzf_lua(callback)
+    require("fzf-lua").files({
+        prompt = "SanityLoadLog> ",
+        actions = {
+            ["default"] = function(selected)
+                local paths = {}
+                for _, sel in ipairs(selected) do
+                    table.insert(paths, require("fzf-lua.path").entry_to_file(sel).path)
+                end
+                callback(paths)
+            end,
+        },
+    })
+end
+
+local function pick_files_telescope(callback)
+    local actions = require("telescope.actions")
+    local action_state = require("telescope.actions.state")
+    require("telescope.builtin").find_files({
+        prompt_title = "SanityLoadLog",
+        attach_mappings = function(prompt_bufnr, _)
+            actions.select_default:replace(function()
+                local picker = action_state.get_current_picker(prompt_bufnr)
+                local selections = picker:get_multi_selection()
+                actions.close(prompt_bufnr)
+                local paths = {}
+                if #selections > 0 then
+                    for _, entry in ipairs(selections) do
+                        table.insert(paths, entry[1])
+                    end
+                else
+                    local entry = action_state.get_selected_entry()
+                    if entry then table.insert(paths, entry[1]) end
+                end
+                callback(paths)
+            end)
+            return true
+        end,
+    })
+end
+
+-- Open a file picker using the configured or auto-detected picker plugin.
+local function pick_files(callback)
+    if config.picker == "fzf-lua" then
+        pick_files_fzf_lua(callback)
+        return
+    end
+    if config.picker == "telescope" then
+        pick_files_telescope(callback)
+        return
+    end
+    -- Auto-detect: try fzf-lua first, then telescope.
+    local has_fzf_lua = pcall(require, "fzf-lua")
+    if has_fzf_lua then
+        pick_files_fzf_lua(callback)
+        return
+    end
+    local has_telescope = pcall(require, "telescope")
+    if has_telescope then
+        pick_files_telescope(callback)
+        return
+    end
+    vim.notify("SanityLoadLog: no picker available (install fzf-lua or telescope.nvim)", vim.log.levels.ERROR)
+end
+
+M.sanity_load_log = function(args)
+    local filepaths = vim.split(args.args, "%s+", { trimempty = true })
+    if #filepaths == 0 then
+        pick_files(load_files)
+        return
+    end
+    load_files(filepaths)
 end
 
 return M

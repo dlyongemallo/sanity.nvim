@@ -9,7 +9,9 @@ This plugin depends on [xml2lua](https://github.com/manoelcampos/xml2lua). The i
 ```lua
 {
   'dlyongemallo/sanity.nvim',
-  config = true,
+  opts = {
+    -- picker = "fzf-lua",  -- or "telescope"; nil to auto-detect
+  },
   dependencies = {
     {
       'vhyrro/luarocks.nvim',
@@ -25,9 +27,9 @@ This plugin depends on [xml2lua](https://github.com/manoelcampos/xml2lua). The i
 
 ```vim
 :Valgrind <command>
-:SanityLoadLog <file> [<file> ...]
+:SanityLoadLog [<file> ...]
 ```
-The output will be populated into the quickfix list. `:SanityLoadLog` auto-detects the file format (valgrind XML or sanitizer log) and accepts multiple files.
+The output will be populated into the quickfix list. `:SanityLoadLog` auto-detects the file format (valgrind XML or sanitizer log) and accepts multiple files. When called with no arguments, a file picker opens with multi-select support (requires [fzf-lua](https://github.com/ibhagwan/fzf-lua) or [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim)).
 
 ### Examples
 
