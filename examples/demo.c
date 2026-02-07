@@ -8,18 +8,18 @@
  * Compile and run with different tools:
  *
  *   # Memcheck (memory errors and leaks)
- *   gcc -g -lpthread demo.c -o demo
+ *   gcc -g -pthread demo.c -o demo
  *   valgrind --tool=memcheck --xml=yes --xml-file=memcheck.xml ./demo
  *
  *   # Helgrind (thread errors)
  *   valgrind --tool=helgrind --xml=yes --xml-file=helgrind.xml ./demo
  *
  *   # AddressSanitizer
- *   gcc -g -fsanitize=address demo.c -o demo_asan
+ *   gcc -g -fsanitize=address -pthread demo.c -o demo_asan
  *   ./demo_asan 2> asan.log
  *
  *   # ThreadSanitizer
- *   gcc -g -fsanitize=thread -lpthread demo.c -o demo_tsan
+ *   gcc -g -fsanitize=thread -pthread demo.c -o demo_tsan
  *   ./demo_tsan 2> tsan.log
  */
 
@@ -231,8 +231,9 @@ void demonstrate_nested_leak(void) {
  * BUG 9: Lock Order Violation (Potential Deadlock)
  *
  * Two threads acquire locks in different orders, which can
- * lead to deadlock. Helgrind will detect this. Note that this
- * program may not terminate.
+ * lead to deadlock. Helgrind will detect this. The threads are
+ * run sequentially to avoid an actual deadlock while still
+ * exposing the inconsistent lock ordering to Helgrind.
  * ============================================================ */
 
 pthread_mutex_t lock_a = PTHREAD_MUTEX_INITIALIZER;
@@ -262,9 +263,14 @@ void *thread_order_ba(void *arg) {
 
 void demonstrate_lock_order(void) {
     pthread_t t1, t2;
+
+    /* Run AB order first. */
     pthread_create(&t1, NULL, thread_order_ab, NULL);
-    pthread_create(&t2, NULL, thread_order_ba, NULL);
     pthread_join(t1, NULL);
+
+    /* Then run BA order separately so tools still see inconsistent
+     * lock ordering, but we avoid an actual deadlock. */
+    pthread_create(&t2, NULL, thread_order_ba, NULL);
     pthread_join(t2, NULL);
 }
 
