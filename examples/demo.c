@@ -18,9 +18,9 @@
  *   gcc -g -fsanitize=address -pthread demo.c -o demo_asan
  *   ./demo_asan 2> asan.log
  *
- *   # ThreadSanitizer
+ *   # ThreadSanitizer (setarch works around ASLR incompatibility on newer kernels)
  *   gcc -g -fsanitize=thread -pthread demo.c -o demo_tsan
- *   ./demo_tsan 2> tsan.log
+ *   setarch $(uname -m) --addr-no-randomize ./demo_tsan 2> tsan.log
  */
 
 #include <pthread.h>
