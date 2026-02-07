@@ -25,10 +25,9 @@ This plugin depends on [xml2lua](https://github.com/manoelcampos/xml2lua). The i
 
 ```vim
 :Valgrind <command>
-:ValgrindLoadXml <xml-file>
-:SanitizerLoadLog <log-file>
+:SanityLoadLog <file> [<file> ...]
 ```
-The output will be populated into the quickfix list.
+The output will be populated into the quickfix list. `:SanityLoadLog` auto-detects the file format (valgrind XML or sanitizer log) and accepts multiple files.
 
 ### Examples
 
@@ -57,7 +56,7 @@ vim program.c
 ```
 
 ```vim
-:ValgrindLoadXml memcheck.xml
+:SanityLoadLog memcheck.xml
 :copen
 ```
 
@@ -67,7 +66,7 @@ vim program.c
 ```
 
 ```vim
-:ValgrindLoadXml helgrind.xml
+:SanityLoadLog helgrind.xml
 :copen
 ```
 
@@ -79,7 +78,7 @@ gcc -g -fsanitize=address program.c -o ./program
 ```
 
 ```vim
-:SanitizerLoadLog asan.log
+:SanityLoadLog asan.log
 ```
 
 ```bash
@@ -89,7 +88,13 @@ vim program.c
 ```
 
 ```vim
-:SanitizerLoadLog tsan.log
+:SanityLoadLog tsan.log
+```
+
+You can also load multiple files at once:
+
+```vim
+:SanityLoadLog memcheck.xml tsan.log
 ```
 
 It is recommended to use the [Trouble](https://github.com/folke/trouble.nvim) plugin to display the quickfix list in a more useful way.

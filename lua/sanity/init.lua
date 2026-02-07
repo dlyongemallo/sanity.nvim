@@ -4,8 +4,7 @@ function M.setup(opts)
     opts = opts or {}
 
     vim.api.nvim_create_user_command("Valgrind", M.run_valgrind, { nargs = 1 })
-    vim.api.nvim_create_user_command("ValgrindLoadXml", M.valgrind_load_xml, { nargs = 1, complete = "file" })
-    vim.api.nvim_create_user_command("SanitizerLoadLog", M.sanitizer_load_log, { nargs = 1, complete = "file" })
+    vim.api.nvim_create_user_command("SanityLoadLog", M.sanity_load_log, { nargs = "+", complete = "file" })
 end
 
 local function starts_with(str, start)
@@ -136,6 +135,30 @@ local populate_link = function(link, prev_target)
         link['END'] = true
     end
 
+end
+
+-- Detect the format of a log file by reading the first few lines.
+local function detect_log_format(filepath)
+    local f = io.open(filepath, "r")
+    if not f then
+        vim.notify("Failed to open file: " .. filepath, vim.log.levels.ERROR)
+        return nil
+    end
+    for _ = 1, 10 do
+        local line = f:read("*l")
+        if not line then break end
+        if line:find("<%?xml") or line:find("<valgrindoutput") then
+            f:close()
+            return "valgrind_xml"
+        end
+        if line:match("WARNING: .*Sanitizer:") or line:match("ERROR: .*Sanitizer:") then
+            f:close()
+            return "sanitizer_log"
+        end
+    end
+    f:close()
+    vim.notify("Unrecognised log format: " .. filepath, vim.log.levels.ERROR)
+    return nil
 end
 
 -- Load an error file into the quickfix list, appending and deduplicating.
@@ -517,6 +540,18 @@ M.sanitizer_load_log = function(args)
 
     -- print("Sanitizer error log written to: " .. error_file)
     vim.fn.delete(error_file)
+end
+
+M.sanity_load_log = function(args)
+    local filepaths = vim.split(args.args, "%s+", { trimempty = true })
+    for _, filepath in ipairs(filepaths) do
+        local format = detect_log_format(filepath)
+        if format == "valgrind_xml" then
+            M.valgrind_load_xml({ args = filepath })
+        elseif format == "sanitizer_log" then
+            M.sanitizer_load_log({ args = filepath })
+        end
+    end
 end
 
 return M
