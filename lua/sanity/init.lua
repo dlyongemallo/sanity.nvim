@@ -597,9 +597,14 @@ M.filter_errors = function(args)
     end
 
     local filter_kinds = {}
+    local seen = {}
     for kind in args.args:gmatch("%S+") do
-        table.insert(filter_kinds, kind)
+        if not seen[kind] then
+            seen[kind] = true
+            table.insert(filter_kinds, kind)
+        end
     end
+    if #filter_kinds == 0 then return end
     current_filter = filter_kinds
     populate_quickfix_from_errors()
     set_diagnostics()
@@ -1520,6 +1525,7 @@ M.sanity_stack = function()
     vim.bo[buf].bufhidden = "wipe"
     vim.bo[buf].swapfile = false
     vim.bo[buf].filetype = "sanity_stack"
+    vim.api.nvim_buf_set_name(buf, "sanity_stack")
 
     -- Open a horizontal split at the bottom.
     local height = math.min(15, #buf_lines)

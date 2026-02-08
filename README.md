@@ -114,4 +114,14 @@ You can also load multiple files at once:
 
 It is recommended to use the [Trouble](https://github.com/folke/trouble.nvim) plugin to display the quickfix list in a more useful way.
 
+### Lualine
+
+If you use [lualine.nvim](https://github.com/nvim-lualine/lualine.nvim), enable the built-in `quickfix` extension so that the quickfix statusline shows the sanity title (including any active filter) instead of `[No Name]`:
+
+```lua
+require('lualine').setup {
+  extensions = { 'quickfix' },
+}
+```
+
 Further examples may be found in [examples/demo.c](examples/demo.c).
