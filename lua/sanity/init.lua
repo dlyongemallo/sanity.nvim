@@ -8,6 +8,7 @@ local errors = {}
 local error_id_counter = 0
 local location_index = {}  -- "file:line" -> { error_id, ... }
 local qf_error_ids = {}    -- qf index -> { error_id, ... }
+local qf_file_lines = {}   -- qf index -> { file, line } using original frame paths
 
 local ns = vim.api.nvim_create_namespace("sanity")
 
@@ -18,6 +19,7 @@ local function reset_state()
     error_id_counter = 0
     location_index = {}
     qf_error_ids = {}
+    qf_file_lines = {}
     vim.diagnostic.reset(ns)
 end
 
@@ -408,6 +410,7 @@ local function populate_quickfix_from_errors()
 
     local qf_entries = {}
     qf_error_ids = {}
+    qf_file_lines = {}
 
     for _, group_key in ipairs(group_order) do
         local group = groups[group_key]
@@ -436,6 +439,7 @@ local function populate_quickfix_from_errors()
             table.insert(ids, err.id)
         end
         table.insert(qf_error_ids, ids)
+        table.insert(qf_file_lines, { file = group.file, line = group.line })
     end
 
     vim.fn.setqflist(qf_entries, " ")
@@ -445,6 +449,7 @@ local function populate_quickfix_from_errors()
     local seen = {}
     local deduped = {}
     local deduped_ids = {}
+    local deduped_fl = {}
     for i, entry in ipairs(qflist) do
         local key = entry.bufnr .. ":" .. entry.lnum .. ":" .. (entry.text or "")
         if not seen[key] then
@@ -453,11 +458,15 @@ local function populate_quickfix_from_errors()
             if qf_error_ids[i] then
                 table.insert(deduped_ids, qf_error_ids[i])
             end
+            if qf_file_lines[i] then
+                table.insert(deduped_fl, qf_file_lines[i])
+            end
         end
     end
     if #deduped < #qflist then
         vim.fn.setqflist(deduped, "r")
         qf_error_ids = deduped_ids
+        qf_file_lines = deduped_fl
     end
 end
 
@@ -858,12 +867,20 @@ local function get_error_by_id(id)
 end
 
 -- Get the current file and line from cursor position or quickfix entry.
+-- Returns (file, line, error_ids). The third value is non-nil only when
+-- called from the quickfix window — it carries the error IDs directly so
+-- callers can bypass location_index (whose keys may not match Vim's
+-- normalised buffer paths).
 local function get_current_position()
     if vim.bo.buftype == "quickfix" then
+        local idx = vim.fn.line(".")
+        local ids = qf_error_ids[idx]
+        local fl = qf_file_lines[idx]
+        if fl then return fl.file, fl.line, ids end
         local qflist = vim.fn.getqflist()
-        local entry = qflist[vim.fn.line(".")]
+        local entry = qflist[idx]
         if not entry or entry.bufnr == 0 then return nil, nil end
-        return vim.api.nvim_buf_get_name(entry.bufnr), entry.lnum
+        return vim.api.nvim_buf_get_name(entry.bufnr), entry.lnum, ids
     end
     return vim.api.nvim_buf_get_name(0), vim.api.nvim_win_get_cursor(0)[1]
 end
@@ -984,40 +1001,69 @@ end
 
 -- SanityStack: interactive split showing all stacks at the cursor line.
 
-local stack_bufnr = nil  -- Track the stack split buffer for toggling.
+local stack_bufnr = nil       -- Track the stack split buffer for toggling.
+local stack_frame_map = nil   -- buf line number (1-based) -> { file, line }
+local stack_win = nil         -- The stack split window.
+local stack_preview_win = nil -- The source/preview window.
+local stack_last_key = nil    -- "file:line" key to avoid redundant refreshes.
+local stack_augroup = nil     -- Augroup for source-tracking autocmd.
+local stack_last_preview = "" -- Preview dedup key.
 local stack_preview_ns = vim.api.nvim_create_namespace("sanity_stack_preview")
 
 local function close_stack_split()
+    if stack_augroup then
+        vim.api.nvim_del_augroup_by_id(stack_augroup)
+        stack_augroup = nil
+    end
     if stack_bufnr and vim.api.nvim_buf_is_valid(stack_bufnr) then
         local wins = vim.fn.win_findbuf(stack_bufnr)
         for _, win in ipairs(wins) do
             vim.api.nvim_win_close(win, true)
         end
     end
-    stack_bufnr = nil
-end
-
-M.sanity_stack = function()
-    -- Toggle off if already open.
-    if stack_bufnr and vim.api.nvim_buf_is_valid(stack_bufnr) then
-        local wins = vim.fn.win_findbuf(stack_bufnr)
-        if #wins > 0 then
-            close_stack_split()
-            return
+    -- Clear preview highlights from all buffers.
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_valid(b) then
+            vim.api.nvim_buf_clear_namespace(b, stack_preview_ns, 0, -1)
         end
     end
+    stack_bufnr = nil
+    stack_frame_map = nil
+    stack_win = nil
+    stack_preview_win = nil
+    stack_last_key = nil
+    stack_last_preview = ""
+end
 
-    local file, line = get_current_position()
-    if not file or not line then
-        vim.notify("No position to show stacks for.", vim.log.levels.WARN)
-        return
+-- Find a suitable preview window, avoiding quickfix and stack buffer windows.
+local function find_preview_win()
+    local alt = vim.fn.win_getid(vim.fn.winnr("#"))
+    if alt ~= 0 and vim.api.nvim_win_is_valid(alt) then
+        local bt = vim.bo[vim.api.nvim_win_get_buf(alt)].buftype
+        local bn = vim.api.nvim_win_get_buf(alt)
+        if bt == "" and bn ~= stack_bufnr then
+            return alt
+        end
     end
-    local key = file .. ":" .. line
-    local ids = location_index[key]
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+        local buf = vim.api.nvim_win_get_buf(win)
+        if vim.bo[buf].buftype == "" and buf ~= stack_bufnr then
+            return win
+        end
+    end
+    return vim.api.nvim_get_current_win()
+end
+
+-- Build the stack content lines and frame map for a given file:line.
+-- When error_ids is provided (from quickfix), uses those directly instead of
+-- looking up location_index, which avoids path-normalisation mismatches.
+-- Returns buf_lines, frame_map, cursor_line or nil if no errors.
+local function build_stack_content(file, line, error_ids)
+    local ids = error_ids
     if not ids or #ids == 0 then
-        vim.notify("No errors at this line.", vim.log.levels.INFO)
-        return
+        ids = location_index[file .. ":" .. line]
     end
+    if not ids or #ids == 0 then return nil end
 
     -- Collect unique errors at this line.
     local err_list = {}
@@ -1029,25 +1075,18 @@ M.sanity_stack = function()
             if err then table.insert(err_list, err) end
         end
     end
+    if #err_list == 0 then return nil end
 
-    if #err_list == 0 then
-        vim.notify("No stacks at this line.", vim.log.levels.INFO)
-        return
-    end
-
-    -- Build buffer lines and frame_map.
     local buf_lines = {}
-    local frame_map = {}   -- buf line number (1-based) -> { file, line }
-    local cursor_line = nil  -- Line to place cursor on (the matching frame).
+    local frame_map = {}
+    local cursor_line = nil
 
-    -- Helper: format a frame line with a given prefix.
     local function format_frame(prefix, frame)
         local func_col = frame.func or "???"
         local basename = frame.file:match("[^/]+$") or frame.file
         return string.format("%s%-28s %s:%d", prefix, func_col, basename, frame.line)
     end
 
-    -- Emit a frame line into buf_lines/frame_map and track cursor.
     local function emit_frame(prefix, frame)
         table.insert(buf_lines, format_frame(prefix, frame))
         frame_map[#buf_lines] = { file = frame.file, line = frame.line }
@@ -1056,7 +1095,6 @@ M.sanity_stack = function()
         end
     end
 
-    -- Find the longest common prefix across stacks (shared deep callees).
     local function find_common_prefix(stacks)
         if #stacks < 2 then return 0 end
         local min_len = math.huge
@@ -1078,7 +1116,6 @@ M.sanity_stack = function()
         return common
     end
 
-    -- Find the longest common suffix across stacks (shared shallow callers).
     local function find_common_suffix(stacks)
         if #stacks < 2 then return 0 end
         local min_len = math.huge
@@ -1293,10 +1330,60 @@ M.sanity_stack = function()
         end
     end
 
-    cursor_line = cursor_line or 1
+    return buf_lines, frame_map, cursor_line or 1
+end
 
-    -- Remember the preview window (the window the user invoked the command from).
-    local preview_win = vim.api.nvim_get_current_win()
+-- Refresh the stack buffer content for a new file:line position.
+-- When there are no errors at the new position, keeps the last stack visible.
+local function refresh_stack(file, line, error_ids)
+    if not stack_bufnr or not vim.api.nvim_buf_is_valid(stack_bufnr) then return end
+
+    local new_key = file .. ":" .. line
+    if new_key == stack_last_key then return end
+
+    local buf_lines, frame_map, cursor_line = build_stack_content(file, line, error_ids)
+    if not buf_lines then return end
+
+    stack_last_key = new_key
+    stack_frame_map = frame_map
+
+    vim.bo[stack_bufnr].modifiable = true
+    vim.api.nvim_buf_set_lines(stack_bufnr, 0, -1, false, buf_lines)
+    vim.bo[stack_bufnr].modifiable = false
+
+    if stack_win and vim.api.nvim_win_is_valid(stack_win) then
+        vim.api.nvim_win_set_height(stack_win, math.min(15, #buf_lines))
+        vim.api.nvim_win_set_cursor(stack_win, { cursor_line, 0 })
+    end
+
+    -- Reset preview so the next CursorMoved triggers a fresh preview.
+    stack_last_preview = ""
+end
+
+M.sanity_stack = function()
+    -- Toggle off if already open.
+    if stack_bufnr and vim.api.nvim_buf_is_valid(stack_bufnr) then
+        local wins = vim.fn.win_findbuf(stack_bufnr)
+        if #wins > 0 then
+            close_stack_split()
+            return
+        end
+    end
+
+    local file, line, error_ids = get_current_position()
+    if not file or not line then
+        vim.notify("No position to show stacks for.", vim.log.levels.WARN)
+        return
+    end
+
+    local buf_lines, frame_map, cursor_line = build_stack_content(file, line, error_ids)
+    if not buf_lines then
+        vim.notify("No errors at this line.", vim.log.levels.INFO)
+        return
+    end
+
+    -- Find the preview window before creating the split.
+    stack_preview_win = find_preview_win()
 
     -- Create the stack buffer.
     local buf = vim.api.nvim_create_buf(false, true)
@@ -1306,46 +1393,51 @@ M.sanity_stack = function()
     vim.bo[buf].swapfile = false
     vim.bo[buf].filetype = "sanity_stack"
 
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, buf_lines)
-    vim.bo[buf].modifiable = false
-
     -- Open a horizontal split at the bottom.
     local height = math.min(15, #buf_lines)
     vim.cmd("botright " .. height .. "split")
-    local stack_win = vim.api.nvim_get_current_win()
+    stack_win = vim.api.nvim_get_current_win()
     vim.api.nvim_win_set_buf(stack_win, buf)
-    vim.api.nvim_win_set_cursor(stack_win, { cursor_line, 0 })
     vim.wo[stack_win].cursorline = true
     vim.wo[stack_win].number = false
     vim.wo[stack_win].relativenumber = false
     vim.wo[stack_win].signcolumn = "no"
     vim.wo[stack_win].winfixheight = true
 
-    -- Preview state to avoid redundant updates.
-    local last_preview = ""
+    -- Set initial content.
+    stack_frame_map = frame_map
+    stack_last_key = file .. ":" .. line
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, buf_lines)
+    vim.bo[buf].modifiable = false
+    vim.api.nvim_win_set_cursor(stack_win, { cursor_line, 0 })
 
+    -- Preview a frame in the source window.
     local function preview_frame(frame_info)
         local preview_key = frame_info.file .. ":" .. frame_info.line
-        if preview_key == last_preview then return end
-        last_preview = preview_key
+        if preview_key == stack_last_preview then return end
+        stack_last_preview = preview_key
 
-        if not vim.api.nvim_win_is_valid(preview_win) then return end
+        if not stack_preview_win or not vim.api.nvim_win_is_valid(stack_preview_win) then
+            return
+        end
 
         -- Open the file in the preview window.
-        local cur_buf = vim.api.nvim_win_get_buf(preview_win)
+        local cur_buf = vim.api.nvim_win_get_buf(stack_preview_win)
         local cur_name = vim.api.nvim_buf_get_name(cur_buf)
         if cur_name ~= frame_info.file then
-            vim.api.nvim_win_call(preview_win, function()
+            vim.api.nvim_win_call(stack_preview_win, function()
                 vim.cmd("edit " .. vim.fn.fnameescape(frame_info.file))
             end)
         end
 
         -- Scroll to the line and centre it.
-        local target_buf = vim.api.nvim_win_get_buf(preview_win)
-        local line_count = vim.api.nvim_buf_line_count(target_buf)
-        local target_line = math.min(frame_info.line, line_count)
-        vim.api.nvim_win_set_cursor(preview_win, { target_line, 0 })
-        vim.api.nvim_win_call(preview_win, function() vim.cmd("normal! zz") end)
+        local target_buf = vim.api.nvim_win_get_buf(stack_preview_win)
+        local lc = vim.api.nvim_buf_line_count(target_buf)
+        local target_line = math.min(frame_info.line, lc)
+        vim.api.nvim_win_set_cursor(stack_preview_win, { target_line, 0 })
+        vim.api.nvim_win_call(stack_preview_win, function()
+            vim.cmd("normal! zz")
+        end)
 
         -- Highlight the previewed line.
         vim.api.nvim_buf_clear_namespace(target_buf, stack_preview_ns, 0, -1)
@@ -1354,42 +1446,54 @@ M.sanity_stack = function()
     end
 
     -- Preview the initial frame.
-    if frame_map[cursor_line] then
-        preview_frame(frame_map[cursor_line])
+    if stack_frame_map[cursor_line] then
+        preview_frame(stack_frame_map[cursor_line])
     end
 
-    -- CursorMoved autocmd for live preview.
+    -- CursorMoved autocmd on the stack buffer for live preview.
     vim.api.nvim_create_autocmd("CursorMoved", {
         buffer = buf,
         callback = function()
+            if not stack_win or not vim.api.nvim_win_is_valid(stack_win) then return end
             local cur = vim.api.nvim_win_get_cursor(stack_win)[1]
-            local info = frame_map[cur]
+            local info = stack_frame_map and stack_frame_map[cur]
             if info then
                 preview_frame(info)
             end
         end,
     })
 
-    -- Clean up preview highlight when the stack buffer is wiped.
+    -- Source-tracking autocmd: refresh stack when cursor moves in other windows.
+    -- Deferred via vim.schedule so buffer modifications happen outside the
+    -- CursorMoved handler (avoids silent failures in special buffers like quickfix).
+    stack_augroup = vim.api.nvim_create_augroup("sanity_stack_track", { clear = true })
+    vim.api.nvim_create_autocmd("CursorMoved", {
+        group = stack_augroup,
+        callback = function()
+            if vim.api.nvim_get_current_buf() == stack_bufnr then return end
+            vim.schedule(function()
+                local f, l, ids = get_current_position()
+                if f and l then refresh_stack(f, l, ids) end
+            end)
+        end,
+    })
+
+    -- Clean up when the stack buffer is wiped.
     vim.api.nvim_create_autocmd("BufWipeout", {
         buffer = buf,
         callback = function()
-            stack_bufnr = nil
-            -- Clear preview highlights from all buffers.
-            for _, b in ipairs(vim.api.nvim_list_bufs()) do
-                if vim.api.nvim_buf_is_valid(b) then
-                    vim.api.nvim_buf_clear_namespace(b, stack_preview_ns, 0, -1)
-                end
-            end
+            close_stack_split()
         end,
     })
 
     -- Helper: find next/previous frame line.
     local function jump_to_frame_line(direction)
+        if not stack_win or not vim.api.nvim_win_is_valid(stack_win) then return end
         local cur = vim.api.nvim_win_get_cursor(stack_win)[1]
+        local line_count = vim.api.nvim_buf_line_count(stack_bufnr)
         local target = cur + direction
-        while target >= 1 and target <= #buf_lines do
-            if frame_map[target] then
+        while target >= 1 and target <= line_count do
+            if stack_frame_map and stack_frame_map[target] then
                 vim.api.nvim_win_set_cursor(stack_win, { target, 0 })
                 return
             end
@@ -1402,9 +1506,11 @@ M.sanity_stack = function()
 
     -- Close the split.
     local function close()
+        -- Capture preview win before close clears it.
+        local pw = stack_preview_win
         close_stack_split()
-        if vim.api.nvim_win_is_valid(preview_win) then
-            vim.api.nvim_set_current_win(preview_win)
+        if pw and vim.api.nvim_win_is_valid(pw) then
+            vim.api.nvim_set_current_win(pw)
         end
     end
     vim.keymap.set("n", "q", close, kopts)
@@ -1412,14 +1518,16 @@ M.sanity_stack = function()
 
     -- Jump to frame under cursor.
     vim.keymap.set("n", "<CR>", function()
+        if not stack_win or not vim.api.nvim_win_is_valid(stack_win) then return end
         local cur = vim.api.nvim_win_get_cursor(stack_win)[1]
-        local info = frame_map[cur]
+        local info = stack_frame_map and stack_frame_map[cur]
         if not info then return end
+        local pw = stack_preview_win
         close_stack_split()
-        if vim.api.nvim_win_is_valid(preview_win) then
-            vim.api.nvim_set_current_win(preview_win)
+        if pw and vim.api.nvim_win_is_valid(pw) then
+            vim.api.nvim_set_current_win(pw)
             vim.cmd("edit " .. vim.fn.fnameescape(info.file))
-            vim.api.nvim_win_set_cursor(preview_win, { info.line, 0 })
+            vim.api.nvim_win_set_cursor(pw, { info.line, 0 })
         end
     end, kopts)
 
