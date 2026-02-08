@@ -5,6 +5,7 @@ local config = {}
 
 -- Structured error storage.
 local errors = {}
+local errors_by_id = {}
 local error_id_counter = 0
 local location_index = {}  -- "file:line" -> { error_id, ... }
 local qf_error_ids = {}    -- qf index -> { error_id, ... }
@@ -16,6 +17,7 @@ local set_diagnostics  -- Forward declaration; defined after populate_quickfix_f
 
 local function reset_state()
     errors = {}
+    errors_by_id = {}
     error_id_counter = 0
     location_index = {}
     qf_error_ids = {}
@@ -35,6 +37,7 @@ local function new_error(kind, message, source, stacks, meta)
         meta = meta or {},
     }
     table.insert(errors, err)
+    errors_by_id[err.id] = err
     for _, stack in ipairs(stacks) do
         for _, frame in ipairs(stack.frames) do
             local key = frame.file .. ":" .. frame.line
@@ -491,7 +494,8 @@ set_diagnostics = function(only_bufnr)
     local buf_diags = {}
     for _, group_key in ipairs(group_order) do
         local group = groups[group_key]
-        local bufnr = vim.fn.bufnr(group.file, true)
+        local bufnr = vim.fn.bufnr(group.file, false)
+        if bufnr == -1 then goto diag_continue end
         if only_bufnr and bufnr ~= only_bufnr then goto diag_continue end
         if not buf_diags[bufnr] then
             buf_diags[bufnr] = {}
@@ -652,8 +656,8 @@ M.parse_valgrind_xml = function(xml_file)
 
         if #err_stacks > 0 then
             new_error(e.kind, message, "valgrind", err_stacks, meta)
+            num_errors = num_errors + 1
         end
-        num_errors = num_errors + 1
         ::not_error_continue::
     end
 
@@ -710,13 +714,6 @@ M.parse_sanitizer_log = function(log_file)
             finalize_stack()
             current_label = last_addr .. " " .. line
             current_meta.heap_block = true
-            local size, addr, thr = string.match(current_label,
-                "^%s*Location is heap block of size (%d+) at (0x%x+) allocated by (.*):$")
-            if size then
-                current_meta.size = size
-                current_meta.addr = addr
-                current_meta.thr = thr
-            end
         elseif not starts_with(line, "    #") then
             -- Non-frame line: could be a new error or a section header within an error.
             -- Match ASAN format (==PID==ERROR:) and TSAN format (bare WARNING:).
@@ -872,10 +869,7 @@ end
 -- Stack frame navigation.
 
 local function get_error_by_id(id)
-    for _, err in ipairs(errors) do
-        if err.id == id then return err end
-    end
-    return nil
+    return errors_by_id[id]
 end
 
 -- Get the current file and line from cursor position or quickfix entry.
@@ -1382,7 +1376,10 @@ local function refresh_stack(file, line, error_ids)
     if new_key == stack_last_key then return end
 
     local buf_lines, frame_map, cursor_line = build_stack_content(file, line, error_ids)
-    if not buf_lines then return end
+    if not buf_lines then
+        stack_last_key = new_key
+        return
+    end
 
     stack_last_key = new_key
     stack_frame_map = frame_map
