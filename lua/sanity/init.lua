@@ -547,7 +547,13 @@ M.parse_valgrind_xml = function(xml_file)
     local handler = require("xmlhandler.tree"):new()
 
     local parser = xml2lua.parser(handler)
-    parser:parse(xml2lua.loadFile(xml_file))
+    local ok, parse_err = pcall(function()
+        parser:parse(xml2lua.loadFile(xml_file))
+    end)
+    if not ok then
+        vim.notify("Failed to parse XML: " .. tostring(parse_err), vim.log.levels.ERROR)
+        return 0
+    end
 
     local output = handler.root.valgrindoutput
     local error_list = output.error
@@ -658,7 +664,7 @@ end
 M.parse_sanitizer_log = function(log_file)
     local log_file_handle = io.open(log_file, "r")
     if not log_file_handle then
-        print("Failed to read sanitizer log file: " .. log_file)
+        vim.notify("Failed to read sanitizer log file: " .. log_file, vim.log.levels.ERROR)
         return 0
     end
 
@@ -697,6 +703,7 @@ M.parse_sanitizer_log = function(log_file)
         in_error = false
     end
 
+    local ok, parse_err = pcall(function()
     for line in log_file_handle:lines() do
         if starts_with(line, "allocated by") then
             -- "allocated by" continues the current error as a new stack section.
@@ -809,7 +816,12 @@ M.parse_sanitizer_log = function(log_file)
         end
         ::not_source_file_continue::
     end
+    end)
     log_file_handle:close()
+    if not ok then
+        vim.notify("Error parsing log: " .. tostring(parse_err), vim.log.levels.ERROR)
+        return 0
+    end
 
     -- Finalize the last error.
     finalize_error()
@@ -934,7 +946,7 @@ local function jump_to_frame(target)
     if vim.bo.buftype == "quickfix" then
         local qflist = vim.fn.getqflist()
         for i, entry in ipairs(qflist) do
-            if entry.lnum == target.line
+            if entry.bufnr ~= 0 and entry.lnum == target.line
                 and vim.api.nvim_buf_get_name(entry.bufnr) == target.file then
                 vim.cmd("silent " .. i .. "cc")
                 vim.cmd("wincmd p")
