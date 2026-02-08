@@ -1065,15 +1065,43 @@ local function build_stack_content(file, line, error_ids)
     end
     if not ids or #ids == 0 then return nil end
 
-    -- Collect unique errors at this line.
-    local err_list = {}
+    -- Expand to all related errors: any error sharing a frame with the initial
+    -- set is included, transitively.  This ensures the full tree is shown
+    -- regardless of which frame the user triggered the stack from.
     local seen_ids = {}
+    local queue = {}
     for _, id in ipairs(ids) do
         if not seen_ids[id] then
             seen_ids[id] = true
-            local err = get_error_by_id(id)
-            if err then table.insert(err_list, err) end
+            table.insert(queue, id)
         end
+    end
+    local qi = 1
+    while qi <= #queue do
+        local err = get_error_by_id(queue[qi])
+        qi = qi + 1
+        if err then
+            for _, stack in ipairs(err.stacks) do
+                for _, frame in ipairs(stack.frames) do
+                    local neighbours = location_index[frame.file .. ":" .. frame.line]
+                    if neighbours then
+                        for _, nid in ipairs(neighbours) do
+                            if not seen_ids[nid] then
+                                seen_ids[nid] = true
+                                table.insert(queue, nid)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Collect the expanded error set.
+    local err_list = {}
+    for _, id in ipairs(queue) do
+        local err = get_error_by_id(id)
+        if err then table.insert(err_list, err) end
     end
     if #err_list == 0 then return nil end
 
