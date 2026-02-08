@@ -1,6 +1,6 @@
 # sanity.nvim
 
-A neovim plugin for valgrind (memcheck and helgrind) and sanitizers (address and thread) integration.
+A neovim plugin for integrating dynamic analysis tools such as valgrind (memcheck and helgrind) and sanitizers (address and thread).
 
 ## Installation
 
@@ -9,12 +9,14 @@ This plugin depends on [xml2lua](https://github.com/manoelcampos/xml2lua). The i
 ```lua
 {
   'dlyongemallo/sanity.nvim',
+  cmd = { "SanityLoadLog", "SanityRunValgrind" },
   opts = {
     -- picker = "fzf-lua",  -- "telescope", "mini.pick", "snacks"; nil to auto-detect
     -- keymaps = {
     --   stack_next = "]s",   -- set to false to disable
     --   stack_prev = "[s",   -- set to false to disable
-    --   show_stack = false,  -- set to a key (e.g. "gS") to enable
+    --   show_stack = false,  -- set to a key (e.g., "<a-s>") to enable
+    --   explain    = false,  -- set to a key (e.g., "<a-e>") to enable
     -- },
   },
   dependencies = {
@@ -27,6 +29,8 @@ This plugin depends on [xml2lua](https://github.com/manoelcampos/xml2lua). The i
   },
 }
 ```
+
+The `cmd` field makes lazy.nvim defer loading until one of those commands is first used. Keymaps (`]s`/`[s`) are also deferred until a log is actually loaded.
 
 ## Usage
 
