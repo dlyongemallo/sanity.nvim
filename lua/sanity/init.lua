@@ -1,4 +1,5 @@
 local M = {}
+local pickers = require("sanity.pickers")
 
 local config = {}
 
@@ -176,7 +177,7 @@ local function load_error_file(error_file)
     local seen = {}
     local deduped = {}
     for _, entry in ipairs(qflist) do
-        local key = entry.bufnr .. ":" .. entry.lnum .. ":" .. entry.text
+        local key = entry.bufnr .. ":" .. entry.lnum .. ":" .. (entry.text or "")
         if not seen[key] then
             seen[key] = true
             table.insert(deduped, entry)
@@ -331,7 +332,8 @@ end
 M.run_valgrind = function(args)
     local xml_file = vim.fn.tempname()
 
-    local valgrind_cmd_line = "!valgrind --num-callers=500 --xml=yes --xml-file=" .. xml_file .. " " .. args.args
+    local valgrind_cmd_line = "!valgrind --num-callers=500 --xml=yes --xml-file="
+        .. vim.fn.shellescape(xml_file) .. " " .. args.args
 
     vim.cmd(valgrind_cmd_line)
     M.valgrind_load_xml({args = xml_file})
@@ -556,120 +558,10 @@ local function load_files(filepaths)
     end
 end
 
-local function pick_files_fzf_lua(callback)
-    require("fzf-lua").files({
-        prompt = "SanityLoadLog> ",
-        fd_opts = "--type f --no-ignore -e xml -e log -e txt",
-        rg_opts = "--files --no-ignore -g *.xml -g *.log -g *.txt",
-        actions = {
-            ["default"] = function(selected)
-                local paths = {}
-                for _, sel in ipairs(selected) do
-                    table.insert(paths, require("fzf-lua.path").entry_to_file(sel).path)
-                end
-                callback(paths)
-            end,
-        },
-    })
-end
-
-local function pick_files_telescope(callback)
-    local actions = require("telescope.actions")
-    local action_state = require("telescope.actions.state")
-    require("telescope.builtin").find_files({
-        prompt_title = "SanityLoadLog",
-        no_ignore = true,
-        find_command = { "fd", "--type", "f", "--no-ignore", "-e", "xml", "-e", "log", "-e", "txt" },
-        attach_mappings = function(prompt_bufnr, _)
-            actions.select_default:replace(function()
-                local picker = action_state.get_current_picker(prompt_bufnr)
-                local selections = picker:get_multi_selection()
-                actions.close(prompt_bufnr)
-                local paths = {}
-                if #selections > 0 then
-                    for _, entry in ipairs(selections) do
-                        table.insert(paths, entry[1])
-                    end
-                else
-                    local entry = action_state.get_selected_entry()
-                    if entry then table.insert(paths, entry[1]) end
-                end
-                callback(paths)
-            end)
-            return true
-        end,
-    })
-end
-
-local function pick_files_mini_pick(callback)
-    MiniPick.builtin.cli(
-        { command = { "rg", "--files", "--no-follow", "--color=never", "--no-ignore",
-                       "--glob", "*.xml", "--glob", "*.log", "--glob", "*.txt" } },
-        {
-            source = {
-                name = "SanityLoadLog",
-                choose = function(item)
-                    if item then callback({ item }) end
-                end,
-                choose_marked = function(items)
-                    if #items > 0 then callback(items) end
-                end,
-            },
-        }
-    )
-end
-
-local function pick_files_snacks(callback)
-    require("snacks").picker.files({
-        ft = { "xml", "log", "txt" },
-        ignored = true,
-        confirm = function(picker)
-            picker:close()
-            local items = picker:selected({ fallback = true })
-            local paths = {}
-            for _, item in ipairs(items) do
-                if item.file then
-                    table.insert(paths, item.file)
-                end
-            end
-            if #paths > 0 then callback(paths) end
-        end,
-    })
-end
-
--- Open a file picker using the configured or auto-detected picker plugin.
-local function pick_files(callback)
-    local pickers = {
-        ["fzf-lua"]   = { mod = "fzf-lua",   fn = pick_files_fzf_lua },
-        ["telescope"] = { mod = "telescope",  fn = pick_files_telescope },
-        ["mini.pick"] = { mod = "mini.pick",  fn = pick_files_mini_pick },
-        ["snacks"]    = { mod = "snacks",     fn = pick_files_snacks },
-    }
-    if config.picker then
-        local p = pickers[config.picker]
-        if p then
-            p.fn(callback)
-            return
-        end
-        vim.notify("SanityLoadLog: unknown picker '" .. config.picker .. "'", vim.log.levels.ERROR)
-        return
-    end
-    -- Auto-detect in priority order.
-    for _, name in ipairs({ "fzf-lua", "telescope", "mini.pick", "snacks" }) do
-        local ok = pcall(require, pickers[name].mod)
-        if ok then
-            pickers[name].fn(callback)
-            return
-        end
-    end
-    vim.notify("SanityLoadLog: no picker available (install fzf-lua, telescope.nvim, mini.pick, or snacks.nvim)",
-        vim.log.levels.ERROR)
-end
-
 M.sanity_load_log = function(args)
-    local filepaths = vim.split(args.args, "%s+", { trimempty = true })
+    local filepaths = args.fargs
     if #filepaths == 0 then
-        pick_files(load_files)
+        pickers.pick_files(config.picker, load_files)
         return
     end
     load_files(filepaths)
