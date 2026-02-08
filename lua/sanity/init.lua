@@ -9,11 +9,16 @@ local error_id_counter = 0
 local location_index = {}  -- "file:line" -> { error_id, ... }
 local qf_error_ids = {}    -- qf index -> { error_id, ... }
 
+local ns = vim.api.nvim_create_namespace("sanity")
+
+local set_diagnostics  -- Forward declaration; defined after populate_quickfix_from_errors.
+
 local function reset_state()
     errors = {}
     error_id_counter = 0
     location_index = {}
     qf_error_ids = {}
+    vim.diagnostic.reset(ns)
 end
 
 -- Create an error object, register it, and update location_index.
@@ -43,16 +48,41 @@ end
 function M.setup(opts)
     opts = opts or {}
     config.picker = opts.picker
-    config.keymaps = opts.keymaps or {}
+    config.diagnostics_enabled = true
 
     vim.api.nvim_create_user_command("Valgrind", M.run_valgrind, { nargs = 1 })
     vim.api.nvim_create_user_command("SanityLoadLog", M.sanity_load_log, { nargs = "*", complete = "file" })
-    vim.api.nvim_create_user_command("SanityStacks", M.sanity_stacks, { nargs = 0 })
+    vim.api.nvim_create_user_command("SanityStack", M.sanity_stack, { nargs = 0 })
+    vim.api.nvim_create_user_command("SanityStackNext", function() M.stack_next() end, { nargs = 0 })
+    vim.api.nvim_create_user_command("SanityStackPrev", function() M.stack_prev() end, { nargs = 0 })
+    vim.api.nvim_create_user_command("SanityDiagnostics", M.toggle_diagnostics, { nargs = "?" })
 
-    vim.keymap.set("n", config.keymaps.stack_next or "]s", M.stack_next,
-        { desc = "Next stack frame" })
-    vim.keymap.set("n", config.keymaps.stack_prev or "[s", M.stack_prev,
-        { desc = "Previous stack frame" })
+    -- Refresh diagnostic columns when a source file is opened.
+    vim.api.nvim_create_autocmd("BufReadPost", {
+        group = vim.api.nvim_create_augroup("sanity", { clear = true }),
+        callback = function(ev)
+            if #errors > 0 and config.diagnostics_enabled then
+                set_diagnostics(ev.buf)
+            end
+        end,
+    })
+
+    -- Set keymaps unless explicitly disabled with false.
+    local keymaps = opts.keymaps or {}
+    local next_key = keymaps.stack_next
+    if next_key == nil then next_key = "]s" end
+    if next_key then
+        vim.keymap.set("n", next_key, M.stack_next, { desc = "Next stack frame" })
+    end
+    local prev_key = keymaps.stack_prev
+    if prev_key == nil then prev_key = "[s" end
+    if prev_key then
+        vim.keymap.set("n", prev_key, M.stack_prev, { desc = "Previous stack frame" })
+    end
+    local show_key = keymaps.show_stack
+    if show_key then
+        vim.keymap.set("n", show_key, M.sanity_stack, { desc = "Show stack explorer" })
+    end
 end
 
 local function starts_with(str, start)
@@ -321,11 +351,11 @@ local function format_sanitizer_group(kind, errs, links)
     return string.format("%s (%s)", errs[1].message, links)
 end
 
--- Populate the quickfix list from the errors array.
--- Creates an entry for every frame in every stack, matching the old per-frame behaviour.
--- Groups entries by (file, line, kind), with links pointing from each frame to the
--- previous (deeper) frame in the same stack (END for the deepest frame).
-local function populate_quickfix_from_errors()
+-- Group error frames by (file, line, kind), collecting link sets.
+-- Each group tracks its errors, file/line, kind, and a link set showing where
+-- each frame points in the stack (END for the deepest, ->basename:line otherwise).
+-- Returns (groups, group_order) where group_order is sorted by file:line:kind.
+local function group_error_frames()
     local group_order = {}
     local groups = {}
 
@@ -349,13 +379,11 @@ local function populate_quickfix_from_errors()
 
                 local group = groups[group_key]
 
-                -- Add error to group if not already present.
                 if not group.error_id_set[err.id] then
                     group.error_id_set[err.id] = true
                     table.insert(group.errors, err)
                 end
 
-                -- Compute link for this frame position.
                 -- Deepest frame (first in array) links to END.
                 -- Each subsequent frame links to the previous frame (one level deeper).
                 if fi == 1 then
@@ -371,6 +399,12 @@ local function populate_quickfix_from_errors()
     end
 
     table.sort(group_order)
+    return groups, group_order
+end
+
+-- Populate the quickfix list from the errors array.
+local function populate_quickfix_from_errors()
+    local groups, group_order = group_error_frames()
 
     local qf_entries = {}
     qf_error_ids = {}
@@ -424,6 +458,76 @@ local function populate_quickfix_from_errors()
     if #deduped < #qflist then
         vim.fn.setqflist(deduped, "r")
         qf_error_ids = deduped_ids
+    end
+end
+
+-- Map error kind to diagnostic severity.
+local function get_severity(kind)
+    if kind:match("^Leak_StillReachable") then
+        return vim.diagnostic.severity.INFO
+    elseif kind:match("^Leak_Possibly") or kind:match("^Leak_Indirect") then
+        return vim.diagnostic.severity.WARN
+    else
+        return vim.diagnostic.severity.ERROR
+    end
+end
+
+-- Set diagnostics on buffers for all error frames.
+-- When only_bufnr is given, only refresh diagnostics for that buffer.
+set_diagnostics = function(only_bufnr)
+    if not config.diagnostics_enabled then return end
+
+    local groups, group_order = group_error_frames()
+
+    local buf_diags = {}
+    for _, group_key in ipairs(group_order) do
+        local group = groups[group_key]
+        local bufnr = vim.fn.bufnr(group.file, true)
+        if only_bufnr and bufnr ~= only_bufnr then goto diag_continue end
+        if not buf_diags[bufnr] then
+            buf_diags[bufnr] = {}
+        end
+        -- Use first non-blank column so lsp_lines.nvim arrows align with code.
+        local lnum = group.line - 1  -- Diagnostics use 0-based lines.
+        local col = 0
+        if vim.api.nvim_buf_is_loaded(bufnr) then
+            local lines = vim.api.nvim_buf_get_lines(bufnr, lnum, lnum + 1, false)
+            if lines[1] then
+                col = #(lines[1]:match("^(%s*)") or "")
+            end
+        end
+        local links = format_link_set(group.link_set)
+        local msg = string.format("[%s] %s (%s)", group.kind, group.errors[1].message, links)
+        table.insert(buf_diags[bufnr], {
+            lnum = lnum,
+            col = col,
+            message = msg,
+            severity = get_severity(group.kind),
+            source = "sanity",
+        })
+        ::diag_continue::
+    end
+
+    for bufnr, diags in pairs(buf_diags) do
+        vim.diagnostic.set(ns, bufnr, diags)
+    end
+end
+
+M.toggle_diagnostics = function(args)
+    local arg = args.args
+    if arg == "on" then
+        config.diagnostics_enabled = true
+        set_diagnostics()
+    elseif arg == "off" then
+        config.diagnostics_enabled = false
+        vim.diagnostic.reset(ns)
+    else
+        config.diagnostics_enabled = not config.diagnostics_enabled
+        if config.diagnostics_enabled then
+            set_diagnostics()
+        else
+            vim.diagnostic.reset(ns)
+        end
     end
 end
 
@@ -485,9 +589,17 @@ M.parse_valgrind_xml = function(xml_file)
             stacks_list = { stacks_list }
         end
 
+        -- Extract auxwhat labels for secondary stacks.
+        local auxwhat_list = e.auxwhat
+        if type(auxwhat_list) == "string" then
+            auxwhat_list = { auxwhat_list }
+        end
+
         local err_stacks = {}
+        local stack_idx = 0
         for _, s in ipairs_safe(stacks_list) do
             if not s.frame then goto not_stack_continue end
+            stack_idx = stack_idx + 1
             local frame_list = s.frame
             if frame_list and #frame_list <= 1 then
                 frame_list = { frame_list }
@@ -500,13 +612,23 @@ M.parse_valgrind_xml = function(xml_file)
                 table.insert(frames, {
                     file = f.dir .. "/" .. f.file,
                     line = tonumber(f.line) or 1,
+                    func = f.fn,
                 })
                 ::not_frame_continue::
             end
 
             if #frames > 0 then
+                -- First stack uses the error message; subsequent stacks use auxwhat.
+                local label
+                if stack_idx == 1 then
+                    label = message
+                elseif auxwhat_list and auxwhat_list[stack_idx - 1] then
+                    label = auxwhat_list[stack_idx - 1]
+                else
+                    label = message
+                end
                 table.insert(err_stacks, {
-                    label = "[" .. e.kind .. "] " .. message,
+                    label = label,
                     frames = frames,
                 })
             end
@@ -590,7 +712,10 @@ M.parse_sanitizer_log = function(log_file)
                 -- New error starts.
                 finalize_error()
                 current_message = maybe_error_message or maybe_warning_message
-                current_kind = current_message:match("^(%S+)") or "unknown"
+                -- Handle multi-word kinds like "data race (pid=...)" → "data-race".
+                current_kind = current_message:match("^(%S+%s%S+)%s+%(")
+                    or current_message:match("^(%S+)") or "unknown"
+                current_kind = current_kind:gsub("%s+", "-")
                 current_label = current_message
                 in_error = true
             elseif in_error then
@@ -645,9 +770,15 @@ M.parse_sanitizer_log = function(log_file)
             end
         else
             -- Frame line.
-            local target = string.match(line, "#%d+ 0x%x+ .* (.+)")  -- ASAN format.
+            -- Extract function name (nil when unavailable).
+            local func_name = line:match("#%d+ 0x%x+ in (%S+)")       -- ASAN format.
+            if not func_name then
+                func_name = line:match("#%d+ (%S+) /")                 -- TSAN format.
+            end
+
+            local target = string.match(line, "#%d+ 0x%x+ .* (.+)")   -- ASAN format.
             if not target then
-                target = string.match(line, "#%d+ %S+ ([^%(]+)%s+%(")  -- TSAN format.
+                target = string.match(line, "#%d+ %S+ ([^%(]+)%s+%(") -- TSAN format.
             end
             if not target then
                 goto not_source_file_continue
@@ -663,6 +794,7 @@ M.parse_sanitizer_log = function(log_file)
             table.insert(current_frames, {
                 file = filename,
                 line = tonumber(line_number),
+                func = func_name,
             })
             num_processed_lines = num_processed_lines + 1
         end
@@ -693,6 +825,8 @@ M.valgrind_load_xml = function(args)
     reset_state()
     local num_errors = M.parse_valgrind_xml(xml_file)
     populate_quickfix_from_errors()
+    set_diagnostics()
+    if #qf_error_ids > 0 then vim.cmd("cfirst") end
     vim.notify("Processed " .. num_errors .. " errors from '" .. xml_file .. "' into " .. #qf_error_ids .. " locations.")
 end
 
@@ -709,6 +843,8 @@ local function load_files(filepaths)
         end
     end
     populate_quickfix_from_errors()
+    set_diagnostics()
+    if #qf_error_ids > 0 then vim.cmd("cfirst") end
     vim.notify("Loaded " .. #errors .. " errors into " .. #qf_error_ids .. " quickfix entries.")
 end
 
@@ -846,124 +982,31 @@ M.stack_prev = function()
     navigate_stack(1)
 end
 
--- SanityStacks: show all stacks at the current cursor line.
+-- SanityStack: interactive split showing all stacks at the cursor line.
 
-local function pick_stacks_fzf_lua(items, on_select)
-    require("fzf-lua").fzf_exec(
-        vim.tbl_map(function(item) return item.display end, items),
-        {
-            prompt = "SanityStacks> ",
-            actions = {
-                ["default"] = function(selected)
-                    if #selected > 0 then
-                        -- Find the matching item.
-                        for _, item in ipairs(items) do
-                            if item.display == selected[1] then
-                                on_select(item)
-                                return
-                            end
-                        end
-                    end
-                end,
-            },
-        }
-    )
-end
+local stack_bufnr = nil  -- Track the stack split buffer for toggling.
+local stack_preview_ns = vim.api.nvim_create_namespace("sanity_stack_preview")
 
-local function pick_stacks_telescope(items, on_select)
-    local pickers = require("telescope.pickers")
-    local finders = require("telescope.finders")
-    local conf = require("telescope.config").values
-    local actions = require("telescope.actions")
-    local action_state = require("telescope.actions.state")
-
-    pickers.new({}, {
-        prompt_title = "SanityStacks",
-        finder = finders.new_table({
-            results = items,
-            entry_maker = function(item)
-                return {
-                    value = item,
-                    display = item.display,
-                    ordinal = item.display,
-                }
-            end,
-        }),
-        sorter = conf.generic_sorter({}),
-        attach_mappings = function(prompt_bufnr, _)
-            actions.select_default:replace(function()
-                local entry = action_state.get_selected_entry()
-                actions.close(prompt_bufnr)
-                if entry then
-                    on_select(entry.value)
-                end
-            end)
-            return true
-        end,
-    }):find()
-end
-
-local function pick_stacks_mini_pick(items, on_select)
-    MiniPick.start({
-        source = {
-            name = "SanityStacks",
-            items = vim.tbl_map(function(item) return item.display end, items),
-            choose = function(chosen)
-                for _, item in ipairs(items) do
-                    if item.display == chosen then
-                        on_select(item)
-                        return
-                    end
-                end
-            end,
-        },
-    })
-end
-
-local function pick_stacks_snacks(items, on_select)
-    require("snacks").picker({
-        title = "SanityStacks",
-        items = vim.tbl_map(function(item)
-            return { text = item.display, item = item }
-        end, items),
-        confirm = function(picker)
-            picker:close()
-            local sel = picker:selected({ fallback = true })
-            if #sel > 0 and sel[1].item then
-                on_select(sel[1].item)
-            end
-        end,
-    })
-end
-
-local function pick_stacks(items, on_select)
-    local pickers_map = {
-        ["fzf-lua"]   = { mod = "fzf-lua",   fn = pick_stacks_fzf_lua },
-        ["telescope"] = { mod = "telescope",  fn = pick_stacks_telescope },
-        ["mini.pick"] = { mod = "mini.pick",  fn = pick_stacks_mini_pick },
-        ["snacks"]    = { mod = "snacks",     fn = pick_stacks_snacks },
-    }
-    if config.picker then
-        local p = pickers_map[config.picker]
-        if p then
-            p.fn(items, on_select)
-            return
+local function close_stack_split()
+    if stack_bufnr and vim.api.nvim_buf_is_valid(stack_bufnr) then
+        local wins = vim.fn.win_findbuf(stack_bufnr)
+        for _, win in ipairs(wins) do
+            vim.api.nvim_win_close(win, true)
         end
-        vim.notify("SanityStacks: unknown picker '" .. config.picker .. "'", vim.log.levels.ERROR)
-        return
     end
-    for _, name in ipairs({ "fzf-lua", "telescope", "mini.pick", "snacks" }) do
-        local ok = pcall(require, pickers_map[name].mod)
-        if ok then
-            pickers_map[name].fn(items, on_select)
+    stack_bufnr = nil
+end
+
+M.sanity_stack = function()
+    -- Toggle off if already open.
+    if stack_bufnr and vim.api.nvim_buf_is_valid(stack_bufnr) then
+        local wins = vim.fn.win_findbuf(stack_bufnr)
+        if #wins > 0 then
+            close_stack_split()
             return
         end
     end
-    vim.notify("SanityStacks: no picker available (install fzf-lua, telescope.nvim, mini.pick, or snacks.nvim)",
-        vim.log.levels.ERROR)
-end
 
-M.sanity_stacks = function()
     local file, line = get_current_position()
     if not file or not line then
         vim.notify("No position to show stacks for.", vim.log.levels.WARN)
@@ -976,38 +1019,413 @@ M.sanity_stacks = function()
         return
     end
 
-    local items = {}
+    -- Collect unique errors at this line.
+    local err_list = {}
     local seen_ids = {}
     for _, id in ipairs(ids) do
         if not seen_ids[id] then
             seen_ids[id] = true
             local err = get_error_by_id(id)
-            if err then
-                for _, stack in ipairs(err.stacks) do
-                    for fi, frame in ipairs(stack.frames) do
-                        if frame.file == file and frame.line == line then
-                            table.insert(items, {
-                                display = string.format("[%s] %s — frame %d of %d (%s:%d)",
-                                    err.kind, stack.label, fi, #stack.frames,
-                                    frame.file:match("[^/]+$"), frame.line),
-                                file = frame.file,
-                                line = frame.line,
-                            })
+            if err then table.insert(err_list, err) end
+        end
+    end
+
+    if #err_list == 0 then
+        vim.notify("No stacks at this line.", vim.log.levels.INFO)
+        return
+    end
+
+    -- Build buffer lines and frame_map.
+    local buf_lines = {}
+    local frame_map = {}   -- buf line number (1-based) -> { file, line }
+    local cursor_line = nil  -- Line to place cursor on (the matching frame).
+
+    -- Helper: format a frame line with a given prefix.
+    local function format_frame(prefix, frame)
+        local func_col = frame.func or "???"
+        local basename = frame.file:match("[^/]+$") or frame.file
+        return string.format("%s%-28s %s:%d", prefix, func_col, basename, frame.line)
+    end
+
+    -- Emit a frame line into buf_lines/frame_map and track cursor.
+    local function emit_frame(prefix, frame)
+        table.insert(buf_lines, format_frame(prefix, frame))
+        frame_map[#buf_lines] = { file = frame.file, line = frame.line }
+        if not cursor_line and frame.file == file and frame.line == line then
+            cursor_line = #buf_lines
+        end
+    end
+
+    -- Find the longest common prefix across stacks (shared deep callees).
+    local function find_common_prefix(stacks)
+        if #stacks < 2 then return 0 end
+        local min_len = math.huge
+        for _, s in ipairs(stacks) do min_len = math.min(min_len, #s.frames) end
+        local common = 0
+        for i = 1, min_len do
+            local ref = stacks[1].frames[i]
+            local all_match = true
+            for si = 2, #stacks do
+                local f = stacks[si].frames[i]
+                if f.file ~= ref.file or f.line ~= ref.line then
+                    all_match = false
+                    break
+                end
+            end
+            if not all_match then break end
+            common = common + 1
+        end
+        return common
+    end
+
+    -- Find the longest common suffix across stacks (shared shallow callers).
+    local function find_common_suffix(stacks)
+        if #stacks < 2 then return 0 end
+        local min_len = math.huge
+        for _, s in ipairs(stacks) do min_len = math.min(min_len, #s.frames) end
+        local common = 0
+        for offset = 1, min_len do
+            local ref = stacks[1].frames[#stacks[1].frames - offset + 1]
+            local all_match = true
+            for si = 2, #stacks do
+                local f = stacks[si].frames[#stacks[si].frames - offset + 1]
+                if f.file ~= ref.file or f.line ~= ref.line then
+                    all_match = false
+                    break
+                end
+            end
+            if not all_match then break end
+            common = common + 1
+        end
+        return common
+    end
+
+    -- Group errors by kind so same-kind errors are merged into one tree.
+    local kind_groups = {}
+    local kind_order = {}
+    for _, err in ipairs(err_list) do
+        if not kind_groups[err.kind] then
+            kind_groups[err.kind] = {}
+            table.insert(kind_order, err.kind)
+        end
+        table.insert(kind_groups[err.kind], err)
+    end
+
+    for ki, kind in ipairs(kind_order) do
+        local group_errs = kind_groups[kind]
+        if ki > 1 then table.insert(buf_lines, "") end
+
+        local header = string.format("[%s] %s", kind, group_errs[1].message)
+        if #group_errs > 1 then
+            header = header .. string.format(" (+%d more)", #group_errs - 1)
+        end
+        table.insert(buf_lines, header)
+
+        -- Pool all stacks, deduplicating by frame sequence.
+        local all_stacks = {}
+        local stack_seen = {}
+        for _, err in ipairs(group_errs) do
+            for _, stack in ipairs(err.stacks) do
+                local parts = {}
+                for _, frame in ipairs(stack.frames) do
+                    table.insert(parts, frame.file .. ":" .. frame.line)
+                end
+                local fp = table.concat(parts, "\0")
+                if not stack_seen[fp] then
+                    stack_seen[fp] = true
+                    table.insert(all_stacks, stack)
+                end
+            end
+        end
+
+        if #all_stacks == 1 then
+            -- Single unique stack: flat display.
+            for _, frame in ipairs(all_stacks[1].frames) do
+                emit_frame("    ", frame)
+            end
+        else
+            -- Multiple stacks: find common prefix/suffix, build tree.
+            local prefix_count = find_common_prefix(all_stacks)
+            local suffix_count = find_common_suffix(all_stacks)
+            local min_len = math.huge
+            for _, s in ipairs(all_stacks) do
+                min_len = math.min(min_len, #s.frames)
+            end
+            -- Clamp so prefix and suffix don't overlap.
+            if prefix_count + suffix_count > min_len then
+                suffix_count = min_len - prefix_count
+            end
+
+            -- Check whether any stack has divergent (non-common) frames.
+            local has_divergent = false
+            for _, stack in ipairs(all_stacks) do
+                if #stack.frames > prefix_count + suffix_count then
+                    has_divergent = true
+                    break
+                end
+            end
+
+            if not has_divergent then
+                -- All stacks identical after dedup: flat display.
+                for _, frame in ipairs(all_stacks[1].frames) do
+                    emit_frame("    ", frame)
+                end
+            else
+                local ref = all_stacks[1]
+
+                -- Collect divergent frames tagged with their stack label,
+                -- then sort by (file, line) so navigation is sequential.
+                local div_frames = {}
+                for _, stack in ipairs(all_stacks) do
+                    for i = prefix_count + 1, #stack.frames - suffix_count do
+                        table.insert(div_frames, {
+                            frame = stack.frames[i],
+                            label = stack.label,
+                        })
+                    end
+                end
+                table.sort(div_frames, function(a, b)
+                    if a.frame.file ~= b.frame.file then
+                        return a.frame.file < b.frame.file
+                    end
+                    return a.frame.line < b.frame.line
+                end)
+
+                -- Indentation: each fork adds 1 character of depth.
+                local has_prefix = prefix_count > 0
+                local prefix_indent = "  "
+                local div_indent = has_prefix and "   " or "  "
+                local suffix_indent = div_indent .. " "
+
+                -- When suffix has 2+ frames, pop the first as a merge line
+                -- rendered at divergent indent with └┬. When suffix has
+                -- exactly 1 frame, the last divergent frame gets └┬ and the
+                -- sole suffix frame goes to suffix indent.
+                local merge_frame = nil
+                local suffix_start = #ref.frames - suffix_count + 1
+                if suffix_count > 1 then
+                    merge_frame = ref.frames[suffix_start]
+                    suffix_start = suffix_start + 1
+                end
+
+                -- UTF-8 tree-drawing characters.
+                local TOP    = "\xe2\x94\x8c" -- ┌
+                local MID    = "\xe2\x94\x82" -- │
+                local BRANCH = "\xe2\x94\x9c" -- ├
+                local BOT    = "\xe2\x94\x94" -- └
+                local MERGE  = "\xe2\x94\x94\xe2\x94\xac" -- └┬
+
+                -- Prefix zone: common deep callees.
+                for i = 1, prefix_count do
+                    local ch = (i == 1) and TOP or MID
+                    emit_frame(prefix_indent .. ch .. " ", ref.frames[i])
+                end
+                -- Transition label: └┬ closes the prefix rail and opens
+                -- the divergent rail. The label is non-navigable.
+                if has_prefix then
+                    table.insert(buf_lines, prefix_indent
+                        .. MERGE .. " " .. div_frames[1].label .. ":")
+                end
+
+                -- Divergent zone.
+                local labels_shown = {}
+                local last_label = nil
+                for di, df in ipairs(div_frames) do
+                    local is_last = di == #div_frames
+
+                    -- Emit a label line when a new label first appears.
+                    -- Skip the first label if already emitted as the
+                    -- prefix transition label above.
+                    local emitted_label = false
+                    if df.label ~= last_label then
+                        if not labels_shown[df.label] then
+                            if has_prefix and di == 1 then
+                                -- Already emitted as the prefix transition label.
+                            elseif di == 1 then
+                                -- No prefix: standalone label, no tree char.
+                                table.insert(buf_lines,
+                                    div_indent .. df.label .. ":")
+                                emitted_label = true
+                            else
+                                table.insert(buf_lines,
+                                    div_indent .. BRANCH .. " " .. df.label .. ":")
+                                emitted_label = true
+                            end
+                            labels_shown[df.label] = true
+                        end
+                        last_label = df.label
+                    end
+
+                    -- Tree character for this frame line.
+                    local ch
+                    if is_last and not merge_frame then
+                        ch = suffix_count > 0 and MERGE or BOT
+                    elseif di == 1 and not has_prefix then
+                        ch = TOP
+                    elseif emitted_label or (di == 1 and has_prefix) then
+                        -- Frame right after a label line or prefix transition.
+                        ch = MID
+                    else
+                        local prev_label = div_frames[di - 1].label
+                        if df.label ~= prev_label then
+                            -- Label changed but already shown (no label line
+                            -- emitted): branch on the frame itself.
+                            ch = BRANCH
+                        else
+                            ch = MID
                         end
                     end
+                    emit_frame(div_indent .. ch .. " ", df.frame)
+                end
+
+                -- Merge line: first suffix frame at divergent indent
+                -- when suffix has 2+ frames.
+                if merge_frame then
+                    emit_frame(div_indent .. MERGE .. " ", merge_frame)
+                end
+
+                -- Remaining suffix frames at suffix indent.
+                for i = suffix_start, #ref.frames do
+                    local ch = (i == #ref.frames) and BOT or MID
+                    emit_frame(suffix_indent .. ch .. " ", ref.frames[i])
                 end
             end
         end
     end
 
-    if #items == 0 then
-        vim.notify("No stacks at this line.", vim.log.levels.INFO)
-        return
+    cursor_line = cursor_line or 1
+
+    -- Remember the preview window (the window the user invoked the command from).
+    local preview_win = vim.api.nvim_get_current_win()
+
+    -- Create the stack buffer.
+    local buf = vim.api.nvim_create_buf(false, true)
+    stack_bufnr = buf
+    vim.bo[buf].buftype = "nofile"
+    vim.bo[buf].bufhidden = "wipe"
+    vim.bo[buf].swapfile = false
+    vim.bo[buf].filetype = "sanity_stack"
+
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, buf_lines)
+    vim.bo[buf].modifiable = false
+
+    -- Open a horizontal split at the bottom.
+    local height = math.min(15, #buf_lines)
+    vim.cmd("botright " .. height .. "split")
+    local stack_win = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(stack_win, buf)
+    vim.api.nvim_win_set_cursor(stack_win, { cursor_line, 0 })
+    vim.wo[stack_win].cursorline = true
+    vim.wo[stack_win].number = false
+    vim.wo[stack_win].relativenumber = false
+    vim.wo[stack_win].signcolumn = "no"
+    vim.wo[stack_win].winfixheight = true
+
+    -- Preview state to avoid redundant updates.
+    local last_preview = ""
+
+    local function preview_frame(frame_info)
+        local preview_key = frame_info.file .. ":" .. frame_info.line
+        if preview_key == last_preview then return end
+        last_preview = preview_key
+
+        if not vim.api.nvim_win_is_valid(preview_win) then return end
+
+        -- Open the file in the preview window.
+        local cur_buf = vim.api.nvim_win_get_buf(preview_win)
+        local cur_name = vim.api.nvim_buf_get_name(cur_buf)
+        if cur_name ~= frame_info.file then
+            vim.api.nvim_win_call(preview_win, function()
+                vim.cmd("edit " .. vim.fn.fnameescape(frame_info.file))
+            end)
+        end
+
+        -- Scroll to the line and centre it.
+        local target_buf = vim.api.nvim_win_get_buf(preview_win)
+        local line_count = vim.api.nvim_buf_line_count(target_buf)
+        local target_line = math.min(frame_info.line, line_count)
+        vim.api.nvim_win_set_cursor(preview_win, { target_line, 0 })
+        vim.api.nvim_win_call(preview_win, function() vim.cmd("normal! zz") end)
+
+        -- Highlight the previewed line.
+        vim.api.nvim_buf_clear_namespace(target_buf, stack_preview_ns, 0, -1)
+        vim.api.nvim_buf_add_highlight(target_buf, stack_preview_ns, "CursorLine",
+            target_line - 1, 0, -1)
     end
 
-    pick_stacks(items, function(item)
-        jump_to_frame(item)
-    end)
+    -- Preview the initial frame.
+    if frame_map[cursor_line] then
+        preview_frame(frame_map[cursor_line])
+    end
+
+    -- CursorMoved autocmd for live preview.
+    vim.api.nvim_create_autocmd("CursorMoved", {
+        buffer = buf,
+        callback = function()
+            local cur = vim.api.nvim_win_get_cursor(stack_win)[1]
+            local info = frame_map[cur]
+            if info then
+                preview_frame(info)
+            end
+        end,
+    })
+
+    -- Clean up preview highlight when the stack buffer is wiped.
+    vim.api.nvim_create_autocmd("BufWipeout", {
+        buffer = buf,
+        callback = function()
+            stack_bufnr = nil
+            -- Clear preview highlights from all buffers.
+            for _, b in ipairs(vim.api.nvim_list_bufs()) do
+                if vim.api.nvim_buf_is_valid(b) then
+                    vim.api.nvim_buf_clear_namespace(b, stack_preview_ns, 0, -1)
+                end
+            end
+        end,
+    })
+
+    -- Helper: find next/previous frame line.
+    local function jump_to_frame_line(direction)
+        local cur = vim.api.nvim_win_get_cursor(stack_win)[1]
+        local target = cur + direction
+        while target >= 1 and target <= #buf_lines do
+            if frame_map[target] then
+                vim.api.nvim_win_set_cursor(stack_win, { target, 0 })
+                return
+            end
+            target = target + direction
+        end
+    end
+
+    -- Keymaps.
+    local kopts = { buffer = buf, nowait = true, silent = true }
+
+    -- Close the split.
+    local function close()
+        close_stack_split()
+        if vim.api.nvim_win_is_valid(preview_win) then
+            vim.api.nvim_set_current_win(preview_win)
+        end
+    end
+    vim.keymap.set("n", "q", close, kopts)
+    vim.keymap.set("n", "<Esc>", close, kopts)
+
+    -- Jump to frame under cursor.
+    vim.keymap.set("n", "<CR>", function()
+        local cur = vim.api.nvim_win_get_cursor(stack_win)[1]
+        local info = frame_map[cur]
+        if not info then return end
+        close_stack_split()
+        if vim.api.nvim_win_is_valid(preview_win) then
+            vim.api.nvim_set_current_win(preview_win)
+            vim.cmd("edit " .. vim.fn.fnameescape(info.file))
+            vim.api.nvim_win_set_cursor(preview_win, { info.line, 0 })
+        end
+    end, kopts)
+
+    -- Navigate between frame lines.
+    vim.keymap.set("n", "]s", function() jump_to_frame_line(1) end, kopts)
+    vim.keymap.set("n", "[s", function() jump_to_frame_line(-1) end, kopts)
 end
 
 M.sanity_load_log = function(args)
