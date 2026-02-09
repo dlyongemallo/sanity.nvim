@@ -35,7 +35,7 @@ The `cmd` field makes lazy.nvim defer loading until one of those commands is fir
 ## Usage
 
 ```vim
-:Valgrind <command>
+:SanityRunValgrind <command>
 :SanityLoadLog [<file> ...]
 :SanityStack
 :SanityStackNext
@@ -56,14 +56,14 @@ vim program.c
 ```
 
 ```vim
-:Valgrind --tool=memcheck ./program
+:SanityRunValgrind --tool=memcheck ./program
 :copen
 ```
 
 Note that `--tool=memcheck` is optional as it is the default tool for valgrind.
 
 ```vim
-:Valgrind --tool=helgrind ./program
+:SanityRunValgrind --tool=helgrind ./program
 :copen
 ```
 

@@ -59,7 +59,7 @@ function M.setup(opts)
     config.picker = opts.picker
     config.diagnostics_enabled = true
 
-    vim.api.nvim_create_user_command("Valgrind", M.run_valgrind, { nargs = 1 })
+    vim.api.nvim_create_user_command("SanityRunValgrind", M.run_valgrind, { nargs = 1 })
     vim.api.nvim_create_user_command("SanityLoadLog", M.sanity_load_log, {
         nargs = "*",
         complete = function(arg_lead)
