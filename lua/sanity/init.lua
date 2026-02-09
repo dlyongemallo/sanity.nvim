@@ -1,5 +1,6 @@
 local M = {}
 local pickers = require("sanity.pickers")
+local explanations = require("sanity.explanations")
 
 local config = {}
 
@@ -58,7 +59,7 @@ function M.setup(opts)
     config.picker = opts.picker
     config.diagnostics_enabled = true
 
-    vim.api.nvim_create_user_command("Valgrind", M.run_valgrind, { nargs = 1 })
+    vim.api.nvim_create_user_command("SanityRunValgrind", M.run_valgrind, { nargs = 1 })
     vim.api.nvim_create_user_command("SanityLoadLog", M.sanity_load_log, {
         nargs = "*",
         complete = function(arg_lead)
@@ -79,6 +80,7 @@ function M.setup(opts)
         complete = function() return get_available_kinds() end,
     })
     vim.api.nvim_create_user_command("SanityClearFilter", M.clear_filter, { nargs = 0 })
+    vim.api.nvim_create_user_command("SanityExplain", M.explain_error, { nargs = 0 })
 
     -- Refresh diagnostic columns when a source file is opened.
     vim.api.nvim_create_autocmd("BufReadPost", {
@@ -90,22 +92,8 @@ function M.setup(opts)
         end,
     })
 
-    -- Set keymaps unless explicitly disabled with false.
-    local keymaps = opts.keymaps or {}
-    local next_key = keymaps.stack_next
-    if next_key == nil then next_key = "]s" end
-    if next_key then
-        vim.keymap.set("n", next_key, M.stack_next, { desc = "Next stack frame" })
-    end
-    local prev_key = keymaps.stack_prev
-    if prev_key == nil then prev_key = "[s" end
-    if prev_key then
-        vim.keymap.set("n", prev_key, M.stack_prev, { desc = "Previous stack frame" })
-    end
-    local show_key = keymaps.show_stack
-    if show_key then
-        vim.keymap.set("n", show_key, M.sanity_stack, { desc = "Show stack explorer" })
-    end
+    -- Store keymap config; keymaps are registered on first log load.
+    config.keymaps = opts.keymaps or {}
 end
 
 local function starts_with(str, start)
@@ -306,7 +294,11 @@ local function format_valgrind_group(kind, errs, links)
     end
 
     -- General errors.
-    return string.format("[%s] %s (%s)", kind, errs[1].message, links)
+    local msg = errs[1].message
+    if starts_with(msg, kind) then
+        msg = msg:sub(#kind + 1):match("^%s*(.*)")
+    end
+    return string.format("[%s] %s (%s)", kind, msg, links)
 end
 
 -- Merge a set-valued meta field from multiple errors into one set.
@@ -330,7 +322,8 @@ local function format_sanitizer_group(kind, errs, links)
         local size_set = merge_meta_sets(errs, "size")
         local addr_set = merge_meta_sets(errs, "addr")
         local thr_set = merge_meta_sets(errs, "thr")
-        return string.format("%s of size %s at %s by thread %s: (%s)",
+        return string.format("[%s] %s of size %s at %s by thread %s (%s)",
+            kind,
             summarize_table_keys(rw_op_set),
             summarize_table_keys(size_set, false, true),
             summarize_table_keys(addr_set, true),
@@ -341,7 +334,8 @@ local function format_sanitizer_group(kind, errs, links)
     -- Mutex creation.
     if errs[1].meta.mutex then
         local mutex_set = merge_meta_sets(errs, "mutex")
-        return string.format("Mutex %s created: (%s)",
+        return string.format("[%s] Mutex %s created (%s)",
+            kind,
             summarize_table_keys(mutex_set),
             links)
     end
@@ -351,7 +345,8 @@ local function format_sanitizer_group(kind, errs, links)
         local size_set = merge_meta_sets(errs, "size")
         local addr_set = merge_meta_sets(errs, "addr")
         local thr_set = merge_meta_sets(errs, "thr")
-        return string.format("Location is heap block of size %s at %s allocated by %s: (%s)",
+        return string.format("[%s] Location is heap block of size %s at %s allocated by %s (%s)",
+            kind,
             summarize_table_keys(size_set, false, true),
             summarize_table_keys(addr_set, true),
             summarize_table_keys(thr_set),
@@ -363,7 +358,8 @@ local function format_sanitizer_group(kind, errs, links)
         local leak_type_set = merge_meta_sets(errs, "leak_type")
         local size_set = merge_meta_sets(errs, "size")
         local num_objs_set = merge_meta_sets(errs, "num_objs")
-        return string.format("%s leak of %s byte(s) in %s object(s) allocated from: (%s)",
+        return string.format("[%s] %s leak of %s byte(s) in %s object(s) allocated from (%s)",
+            kind,
             summarize_table_keys(leak_type_set),
             summarize_table_keys(size_set, false, true),
             summarize_table_keys(num_objs_set, false, true),
@@ -371,7 +367,11 @@ local function format_sanitizer_group(kind, errs, links)
     end
 
     -- General errors.
-    return string.format("%s (%s)", errs[1].message, links)
+    local msg = errs[1].message
+    if starts_with(msg, kind) then
+        msg = msg:sub(#kind + 1):match("^%s*(.*)")
+    end
+    return string.format("[%s] %s (%s)", kind, msg, links)
 end
 
 -- Collect unique error kinds from all loaded errors.
@@ -934,7 +934,34 @@ M.run_valgrind = function(args)
     vim.fn.delete(xml_file)
 end
 
+-- Register keymaps on first log load.
+local keymaps_registered = false
+local function register_keymaps()
+    if keymaps_registered then return end
+    keymaps_registered = true
+    local keymaps = config.keymaps or {}
+    local next_key = keymaps.stack_next
+    if next_key == nil then next_key = "]s" end
+    if next_key then
+        vim.keymap.set("n", next_key, M.stack_next, { desc = "Next stack frame" })
+    end
+    local prev_key = keymaps.stack_prev
+    if prev_key == nil then prev_key = "[s" end
+    if prev_key then
+        vim.keymap.set("n", prev_key, M.stack_prev, { desc = "Previous stack frame" })
+    end
+    local show_key = keymaps.show_stack
+    if show_key then
+        vim.keymap.set("n", show_key, M.sanity_stack, { desc = "Show stack explorer" })
+    end
+    local explain_key = keymaps.explain
+    if explain_key then
+        vim.keymap.set("n", explain_key, M.explain_error, { desc = "Explain error at cursor" })
+    end
+end
+
 M.valgrind_load_xml = function(args)
+    register_keymaps()
     local xml_file = args.args
     reset_state()
     local num_errors = M.parse_valgrind_xml(xml_file)
@@ -945,6 +972,7 @@ M.valgrind_load_xml = function(args)
 end
 
 local function load_files(filepaths)
+    register_keymaps()
     reset_state()
     for _, filepath in ipairs(filepaths) do
         local format = detect_log_format(filepath)
@@ -968,6 +996,9 @@ local function get_error_by_id(id)
     return errors_by_id[id]
 end
 
+local stack_bufnr = nil       -- Track the stack split buffer for toggling.
+local stack_frame_map = nil   -- buf line number (1-based) -> { file, line }
+
 -- Get the current file and line from cursor position or quickfix entry.
 -- Returns (file, line, error_ids). The third value is non-nil only when
 -- called from the quickfix window — it carries the error IDs directly so
@@ -984,7 +1015,24 @@ local function get_current_position()
         if not entry or entry.bufnr == 0 then return nil, nil end
         return vim.api.nvim_buf_get_name(entry.bufnr), entry.lnum, ids
     end
+    if stack_bufnr and vim.api.nvim_get_current_buf() == stack_bufnr then
+        local info = stack_frame_map and stack_frame_map[vim.api.nvim_win_get_cursor(0)[1]]
+        if info then return info.file, info.line end
+        return nil, nil
+    end
     return vim.api.nvim_buf_get_name(0), vim.api.nvim_win_get_cursor(0)[1]
+end
+
+-- Return the first error at the cursor position, or nil.
+local function get_error_at_cursor()
+    local file, line, error_ids = get_current_position()
+    if not file or not line then return nil end
+    local ids = error_ids
+    if not ids or #ids == 0 then
+        ids = location_index[file .. ":" .. line]
+    end
+    if not ids or #ids == 0 then return nil end
+    return errors_by_id[ids[1]]
 end
 
 -- Find adjacent frames in the given direction from file:line.
@@ -1101,10 +1149,95 @@ M.stack_prev = function()
     navigate_stack(1)
 end
 
+-- Show a floating window with the given title and content lines.
+local function show_floating_window(title, lines)
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.bo[buf].modifiable = false
+    vim.bo[buf].bufhidden = "wipe"
+
+    local width = 0
+    for _, line in ipairs(lines) do
+        width = math.max(width, vim.fn.strdisplaywidth(line))
+    end
+    width = math.min(width + 2, vim.o.columns - 4)
+    local height = math.min(#lines, vim.o.lines - 4)
+
+    local win = vim.api.nvim_open_win(buf, true, {
+        relative = "cursor",
+        row = 1,
+        col = 0,
+        width = width,
+        height = height,
+        style = "minimal",
+        border = "rounded",
+        title = " " .. title .. " ",
+        title_pos = "center",
+    })
+
+    vim.keymap.set("n", "q", function() vim.api.nvim_win_close(win, true) end, { buffer = buf })
+    vim.keymap.set("n", "<Esc>", function() vim.api.nvim_win_close(win, true) end, { buffer = buf })
+end
+
+-- SanityExplain: show a floating window explaining the error type.
+M.explain_error = function()
+    local err = get_error_at_cursor()
+    if not err then
+        vim.notify("No error at cursor.", vim.log.levels.WARN)
+        return
+    end
+
+    -- Try exact match first, then prefix match.
+    local explanation = explanations[err.kind]
+    if not explanation then
+        for key, expl in pairs(explanations) do
+            if starts_with(err.kind, key) then
+                explanation = expl
+                break
+            end
+        end
+    end
+
+    if not explanation then
+        vim.notify("No explanation available for error type: " .. err.kind, vim.log.levels.INFO)
+        return
+    end
+
+    local lines = {
+        explanation.title,
+        string.rep("\xe2\x94\x80", vim.fn.strdisplaywidth(explanation.title)),
+        "",
+    }
+
+    -- Word-wrap description at 70 columns.
+    local current_line = ""
+    for word in explanation.description:gmatch("%S+") do
+        if current_line == "" then
+            current_line = word
+        elseif #current_line + #word + 1 > 70 then
+            table.insert(lines, current_line)
+            current_line = word
+        else
+            current_line = current_line .. " " .. word
+        end
+    end
+    if current_line ~= "" then
+        table.insert(lines, current_line)
+    end
+
+    if explanation.common_fixes and #explanation.common_fixes > 0 then
+        table.insert(lines, "")
+        table.insert(lines, "Common fixes:")
+        for _, fix in ipairs(explanation.common_fixes) do
+            table.insert(lines, "  - " .. fix)
+        end
+    end
+
+    show_floating_window("Error: " .. err.kind, lines)
+end
+
 -- SanityStack: interactive split showing all stacks at the cursor line.
 
-local stack_bufnr = nil       -- Track the stack split buffer for toggling.
-local stack_frame_map = nil   -- buf line number (1-based) -> { file, line }
 local stack_win = nil         -- The stack split window.
 local stack_preview_win = nil -- The source/preview window.
 local stack_last_key = nil    -- "file:line" key to avoid redundant refreshes.

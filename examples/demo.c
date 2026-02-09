@@ -21,6 +21,9 @@
  *   # ThreadSanitizer (setarch works around ASLR incompatibility on newer kernels)
  *   gcc -g -fsanitize=thread -pthread demo.c -o demo_tsan
  *   setarch $(uname -m) --addr-no-randomize ./demo_tsan 2> tsan.log
+ *
+ *   # Open Neovim with sanity.nvim to load and analyze the above logs:
+ *   nvim -c ":SanityLoadLog memcheck.xml helgrind.xml asan.log tsan.log"
  */
 
 #include <pthread.h>
@@ -115,6 +118,8 @@ void load_config(void) {
  *
  * Memory is freed and then accessed. This is undefined behavior.
  * Memcheck and AddressSanitizer will catch this.
+ *
+ * Use :SanityExplain to learn about InvalidRead errors.
  * ============================================================ */
 
 void demonstrate_use_after_free(void) {
@@ -162,6 +167,8 @@ void demonstrate_buffer_overflow(void) {
  *
  * Using a variable before it has been initialized.
  * Memcheck will report "Conditional jump depends on uninitialised value".
+ *
+ * Use :SanityExplain to understand UninitCondition errors.
  * ============================================================ */
 
 void demonstrate_uninitialized(void) {
