@@ -9,7 +9,7 @@
  *
  *   # Memcheck (memory errors and leaks)
  *   gcc -g -pthread demo.c -o demo
- *   valgrind --tool=memcheck --xml=yes --xml-file=memcheck.xml ./demo
+ *   valgrind --tool=memcheck --show-reachable=yes --xml=yes --xml-file=memcheck.xml ./demo
  *
  *   # Helgrind (thread errors)
  *   valgrind --tool=helgrind --xml=yes --xml-file=helgrind.xml ./demo
@@ -70,6 +70,8 @@ void demonstrate_data_race(void) {
  *
  * Memory is allocated but never freed, and no pointer remains.
  * Memcheck will report this as "definitely lost".
+ *
+ * Use :SanityFilter Leak_DefinitelyLost to focus on these.
  * ============================================================ */
 
 void allocate_and_lose(int size) {
@@ -93,6 +95,8 @@ void demonstrate_definitely_lost(void) {
  * Memory is allocated and a pointer still exists at exit,
  * but it was never freed. This is often intentional for
  * global data structures.
+ *
+ * Use :SanityFilter Leak_StillReachable to see these.
  * ============================================================ */
 
 char *global_config = NULL;
@@ -131,6 +135,8 @@ void demonstrate_use_after_free(void) {
  *
  * Writing beyond the allocated buffer size.
  * Memcheck and AddressSanitizer will detect this.
+ *
+ * Use :SanityStack to see the full call stack.
  * ============================================================ */
 
 void write_to_buffer(char *buf, int size) {
