@@ -59,7 +59,17 @@ function M.setup(opts)
     config.diagnostics_enabled = true
 
     vim.api.nvim_create_user_command("Valgrind", M.run_valgrind, { nargs = 1 })
-    vim.api.nvim_create_user_command("SanityLoadLog", M.sanity_load_log, { nargs = "*", complete = "file" })
+    vim.api.nvim_create_user_command("SanityLoadLog", M.sanity_load_log, {
+        nargs = "*",
+        complete = function(arg_lead)
+            local matches = vim.fn.getcompletion(arg_lead, "file")
+            return vim.tbl_filter(function(m)
+                -- Keep directories so the user can navigate into them.
+                if vim.fn.isdirectory(m) == 1 or m:sub(-1) == "/" then return true end
+                return m:match("%.txt$") or m:match("%.log$") or m:match("%.xml$")
+            end, matches)
+        end,
+    })
     vim.api.nvim_create_user_command("SanityStack", M.sanity_stack, { nargs = 0 })
     vim.api.nvim_create_user_command("SanityStackNext", function() M.stack_next() end, { nargs = 0 })
     vim.api.nvim_create_user_command("SanityStackPrev", function() M.stack_prev() end, { nargs = 0 })
