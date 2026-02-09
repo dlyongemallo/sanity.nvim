@@ -10,10 +10,12 @@ local error_id_counter = 0
 local location_index = {}  -- "file:line" -> { error_id, ... }
 local qf_error_ids = {}    -- qf index -> { error_id, ... }
 local qf_file_lines = {}   -- qf index -> { file, line } using original frame paths
+local current_filter = nil  -- Array of kind strings when active.
 
 local ns = vim.api.nvim_create_namespace("sanity")
 
-local set_diagnostics  -- Forward declaration; defined after populate_quickfix_from_errors.
+local set_diagnostics       -- Forward declaration; defined after populate_quickfix_from_errors.
+local get_available_kinds   -- Forward declaration; defined after format helpers.
 
 local function reset_state()
     errors = {}
@@ -22,6 +24,7 @@ local function reset_state()
     location_index = {}
     qf_error_ids = {}
     qf_file_lines = {}
+    current_filter = nil
     vim.diagnostic.reset(ns)
 end
 
@@ -61,6 +64,11 @@ function M.setup(opts)
     vim.api.nvim_create_user_command("SanityStackNext", function() M.stack_next() end, { nargs = 0 })
     vim.api.nvim_create_user_command("SanityStackPrev", function() M.stack_prev() end, { nargs = 0 })
     vim.api.nvim_create_user_command("SanityDiagnostics", M.toggle_diagnostics, { nargs = "?" })
+    vim.api.nvim_create_user_command("SanityFilter", M.filter_errors, {
+        nargs = "*",
+        complete = function() return get_available_kinds() end,
+    })
+    vim.api.nvim_create_user_command("SanityClearFilter", M.clear_filter, { nargs = 0 })
 
     -- Refresh diagnostic columns when a source file is opened.
     vim.api.nvim_create_autocmd("BufReadPost", {
@@ -356,6 +364,31 @@ local function format_sanitizer_group(kind, errs, links)
     return string.format("%s (%s)", errs[1].message, links)
 end
 
+-- Collect unique error kinds from all loaded errors.
+get_available_kinds = function()
+    local seen = {}
+    local kinds = {}
+    for _, err in ipairs(errors) do
+        if not seen[err.kind] then
+            seen[err.kind] = true
+            table.insert(kinds, err.kind)
+        end
+    end
+    table.sort(kinds)
+    return kinds
+end
+
+-- Check whether an error's kind matches any entry in the active filter.
+local function matches_filter(kind)
+    if not current_filter then return true end
+    for _, fk in ipairs(current_filter) do
+        if kind == fk or starts_with(kind, fk) then
+            return true
+        end
+    end
+    return false
+end
+
 -- Group error frames by (file, line, kind), collecting link sets.
 -- Each group tracks its errors, file/line, kind, and a link set showing where
 -- each frame points in the stack (END for the deepest, ->basename:line otherwise).
@@ -365,6 +398,7 @@ local function group_error_frames()
     local groups = {}
 
     for _, err in ipairs(errors) do
+        if not matches_filter(err.kind) then goto filter_skip end
         for _, stack in ipairs(err.stacks) do
             for fi, frame in ipairs(stack.frames) do
                 local padded = string.format("%06d", frame.line)
@@ -401,6 +435,7 @@ local function group_error_frames()
                 end
             end
         end
+        ::filter_skip::
     end
 
     table.sort(group_order)
@@ -445,7 +480,7 @@ local function populate_quickfix_from_errors()
         table.insert(qf_file_lines, { file = group.file, line = group.line })
     end
 
-    vim.fn.setqflist(qf_entries, " ")
+    vim.fn.setqflist(qf_entries, "r")
 
     -- Deduplicate quickfix entries (for multi-file loads).
     local qflist = vim.fn.getqflist()
@@ -471,6 +506,16 @@ local function populate_quickfix_from_errors()
         qf_error_ids = deduped_ids
         qf_file_lines = deduped_fl
     end
+
+    -- Set the quickfix title so the active filter is visible in the statusline.
+    local title = "sanity"
+    if current_filter then
+        title = title .. " (filter: " .. table.concat(current_filter, ", ") .. ")"
+    end
+    vim.fn.setqflist({}, "a", { title = title })
+
+    -- Notify plugins (e.g. trouble.nvim) that the quickfix list changed.
+    vim.api.nvim_exec_autocmds("QuickFixCmdPost", { pattern = "*" })
 end
 
 -- Map error kind to diagnostic severity.
@@ -524,6 +569,42 @@ set_diagnostics = function(only_bufnr)
     for bufnr, diags in pairs(buf_diags) do
         vim.diagnostic.set(ns, bufnr, diags)
     end
+end
+
+M.filter_errors = function(args)
+    if args.args == "" then
+        local kinds = get_available_kinds()
+        if #kinds == 0 then
+            vim.notify("No errors loaded.", vim.log.levels.INFO)
+            return
+        end
+        local msg = "Available kinds: " .. table.concat(kinds, ", ")
+        if current_filter then
+            msg = msg .. "\nCurrent filter: " .. table.concat(current_filter, ", ")
+        end
+        vim.notify(msg, vim.log.levels.INFO)
+        return
+    end
+
+    local filter_kinds = {}
+    for kind in args.args:gmatch("%S+") do
+        table.insert(filter_kinds, kind)
+    end
+    current_filter = filter_kinds
+    populate_quickfix_from_errors()
+    set_diagnostics()
+    vim.notify("Filter set: " .. table.concat(filter_kinds, ", "), vim.log.levels.INFO)
+end
+
+M.clear_filter = function()
+    if not current_filter then
+        vim.notify("No filter active.", vim.log.levels.INFO)
+        return
+    end
+    current_filter = nil
+    populate_quickfix_from_errors()
+    set_diagnostics()
+    vim.notify("Filter cleared.", vim.log.levels.INFO)
 end
 
 M.toggle_diagnostics = function(args)
