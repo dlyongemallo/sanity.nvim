@@ -1244,6 +1244,7 @@ local stack_last_key = nil    -- "file:line" key to avoid redundant refreshes.
 local stack_augroup = nil     -- Augroup for source-tracking autocmd.
 local stack_last_preview = "" -- Preview dedup key.
 local stack_preview_ns = vim.api.nvim_create_namespace("sanity_stack_preview")
+local stack_hl_ns = vim.api.nvim_create_namespace("sanity_stack_hl")
 
 local function close_stack_split()
     if stack_augroup then
@@ -1352,7 +1353,7 @@ local function build_stack_content(file, line, error_ids)
 
     local function emit_frame(prefix, frame)
         table.insert(buf_lines, format_frame(prefix, frame))
-        frame_map[#buf_lines] = { file = frame.file, line = frame.line }
+        frame_map[#buf_lines] = { file = frame.file, line = frame.line, prefix_bytes = #prefix }
         if not cursor_line and frame.file == file and frame.line == line then
             cursor_line = #buf_lines
         end
@@ -1596,6 +1597,73 @@ local function build_stack_content(file, line, error_ids)
     return buf_lines, frame_map, cursor_line or 1
 end
 
+-- Apply syntax highlights to the stack buffer via extmarks.
+local function highlight_stack_buf(buf, lines, fmap)
+    vim.api.nvim_buf_clear_namespace(buf, stack_hl_ns, 0, -1)
+    for i, line in ipairs(lines) do
+        local row = i - 1
+        local fi = fmap[i]
+        if fi then
+            -- Frame line: prefix (tree chars) | function name | file:line.
+            local pb = fi.prefix_bytes
+            if pb > 0 then
+                vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, 0, {
+                    end_col = pb, hl_group = "NonText",
+                })
+            end
+            -- Derive function field and location dynamically from the
+            -- rendered line so long names (%-28s does not truncate) work.
+            local loc_byte_idx1 = line:match("()%S+:%d+%s*$", pb + 1)
+            local func_end_1b
+            if loc_byte_idx1 and loc_byte_idx1 > (pb + 1) then
+                func_end_1b = loc_byte_idx1 - 2
+            else
+                func_end_1b = #line
+            end
+            if func_end_1b >= (pb + 1) then
+                local func_field = line:sub(pb + 1, func_end_1b)
+                local trimmed = func_field:match("^(.-)%s*$") or func_field
+                if #trimmed > 0 then
+                    vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, pb, {
+                        end_col = pb + #trimmed, hl_group = "Function",
+                    })
+                end
+            end
+            if loc_byte_idx1 then
+                local loc_start = loc_byte_idx1 - 1
+                if loc_start < #line then
+                    vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, loc_start, {
+                        end_col = #line, hl_group = "Directory",
+                    })
+                end
+            end
+        elseif line:match("^%[.-%]") then
+            -- Header line: [Kind] message.
+            vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, 0, {
+                end_col = #line, hl_group = "Title",
+            })
+        elseif line ~= "" then
+            -- Label or tree-only line: tree chars then label text.
+            local alpha_pos = line:find("[%a]")
+            if alpha_pos then
+                if alpha_pos > 1 then
+                    vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, 0, {
+                        end_col = alpha_pos - 1, hl_group = "NonText",
+                    })
+                end
+                vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, alpha_pos - 1, {
+                    end_col = #line, hl_group = "Comment",
+                })
+            else
+                -- Pure tree characters, no text.
+                vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, 0, {
+                    end_col = #line, hl_group = "NonText",
+                })
+            end
+        end
+    end
+end
+
 -- Refresh the stack buffer content for a new file:line position.
 -- When there are no errors at the new position, keeps the last stack visible.
 local function refresh_stack(file, line, error_ids)
@@ -1616,6 +1684,7 @@ local function refresh_stack(file, line, error_ids)
     vim.bo[stack_bufnr].modifiable = true
     vim.api.nvim_buf_set_lines(stack_bufnr, 0, -1, false, buf_lines)
     vim.bo[stack_bufnr].modifiable = false
+    highlight_stack_buf(stack_bufnr, buf_lines, frame_map)
 
     if stack_win and vim.api.nvim_win_is_valid(stack_win) then
         vim.api.nvim_win_set_height(stack_win, math.min(15, #buf_lines))
@@ -1676,6 +1745,7 @@ M.sanity_stack = function()
     stack_last_key = file .. ":" .. line
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, buf_lines)
     vim.bo[buf].modifiable = false
+    highlight_stack_buf(buf, buf_lines, frame_map)
     vim.api.nvim_win_set_cursor(stack_win, { cursor_line, 0 })
 
     -- Preview a frame in the source window.
