@@ -80,6 +80,7 @@ function M.setup(opts)
         complete = function() return get_available_kinds() end,
     })
     vim.api.nvim_create_user_command("SanityClearFilter", M.clear_filter, { nargs = 0 })
+    vim.api.nvim_create_user_command("SanityRelated", M.show_related, { nargs = 0 })
     vim.api.nvim_create_user_command("SanityExplain", M.explain_error, { nargs = 0 })
 
     -- Refresh diagnostic columns when a source file is opened.
@@ -958,6 +959,10 @@ local function register_keymaps()
     if explain_key then
         vim.keymap.set("n", explain_key, M.explain_error, { desc = "Explain error at cursor" })
     end
+    local related_key = keymaps.related
+    if related_key then
+        vim.keymap.set("n", related_key, M.show_related, { desc = "Jump to related error" })
+    end
 end
 
 M.valgrind_load_xml = function(args)
@@ -1034,6 +1039,22 @@ local function get_error_at_cursor()
     if not ids or #ids == 0 then return nil end
     return errors_by_id[ids[1]]
 end
+
+-- Extract addresses from an error's meta.addr field.
+-- Valgrind stores addr as a scalar string; sanitizers store it as a set.
+local function extract_addrs(err)
+    local addr = err.meta and err.meta.addr
+    if not addr then return {} end
+    if type(addr) == "table" then
+        local result = {}
+        for k, _ in pairs(addr) do
+            table.insert(result, k)
+        end
+        return result
+    end
+    return { addr }
+end
+
 
 -- Find adjacent frames in the given direction from file:line.
 -- direction = -1 for deeper (toward inner frames), +1 for shallower (toward main).
@@ -1234,6 +1255,93 @@ M.explain_error = function()
     end
 
     show_floating_window("Error: " .. err.kind, lines)
+end
+
+-- Find related targets sharing the same address as err.
+-- Includes other stacks within the same error (e.g. both sides of a
+-- data race) and other errors referencing the same memory address.
+-- file/line is the current position used to exclude the caller's location.
+-- all_errors is the full error list to search for cross-error matches.
+local function find_related_targets(err, file, line, all_errors)
+    local targets = {}
+    local seen_locs = {}
+
+    local function add_target(f, l, label)
+        local key = f .. ":" .. l
+        if seen_locs[key] then return end
+        seen_locs[key] = true
+        table.insert(targets, { file = f, line = l, label = label })
+    end
+
+    -- Other stacks within the same error at different locations.
+    if file and line then
+        for _, stack in ipairs(err.stacks) do
+            local frame = stack.frames[1]
+            if frame and (frame.file ~= file or frame.line ~= line) then
+                add_target(frame.file, frame.line, stack.label or err.message)
+            end
+        end
+    end
+
+    -- Other errors sharing any address.
+    local addrs = extract_addrs(err)
+    if #addrs > 0 then
+        local seen_ids = { [err.id] = true }
+        for _, other in ipairs(all_errors) do
+            if not seen_ids[other.id] then
+                local other_addrs = extract_addrs(other)
+                for _, a in ipairs(addrs) do
+                    for _, oa in ipairs(other_addrs) do
+                        if a == oa then
+                            seen_ids[other.id] = true
+                            local frame = other.stacks[1] and other.stacks[1].frames[1]
+                            if frame then
+                                add_target(frame.file, frame.line,
+                                    string.format("[%s] %s", other.kind, other.message))
+                            end
+                            goto next_error
+                        end
+                    end
+                end
+            end
+            ::next_error::
+        end
+    end
+
+    return targets
+end
+
+-- SanityRelated: jump to a related location sharing the same address.
+M.show_related = function()
+    local err = get_error_at_cursor()
+    if not err then
+        vim.notify("No error at cursor.", vim.log.levels.WARN)
+        return
+    end
+
+    local file, line = get_current_position()
+    local targets = find_related_targets(err, file, line, errors)
+
+    if #targets == 0 then
+        vim.notify("No related errors.", vim.log.levels.INFO)
+        return
+    end
+
+    if #targets == 1 then
+        jump_to_frame(targets[1])
+        vim.notify(targets[1].label, vim.log.levels.INFO)
+        return
+    end
+
+    vim.ui.select(targets, {
+        prompt = "Select related error:",
+        format_item = function(item) return item.label end,
+    }, function(choice)
+        if choice then
+            jump_to_frame(choice)
+            vim.notify(choice.label, vim.log.levels.INFO)
+        end
+    end)
 end
 
 -- SanityStack: interactive split showing all stacks at the cursor line.
@@ -1532,7 +1640,7 @@ end
 
 -- Render the call trie with tree-drawing characters.
 -- Output: deepest frames at top, shallowest at bottom.
-local function render_call_trie(root, common_leaves, emit_frame, buf_lines)
+local function render_call_trie(root, common_leaves, emit_frame, emit_label)
     -- UTF-8 tree-drawing characters.
     local TOP   = "\xe2\x94\x8c"  -- ┌
     local MID   = "\xe2\x94\x82"  -- │
@@ -1678,7 +1786,7 @@ local function render_call_trie(root, common_leaves, emit_frame, buf_lines)
                 else
                     ch = BRANCH
                 end
-                table.insert(buf_lines, make_label_prefix(ld, ch, nil) .. " " .. strip_label(lbl) .. ":")
+                emit_label(make_label_prefix(ld, ch, nil), strip_label(lbl))
             end
 
             -- 2. Recurse into subtree.
@@ -1694,7 +1802,7 @@ local function render_call_trie(root, common_leaves, emit_frame, buf_lines)
                 else
                     ch = BRANCH
                 end
-                table.insert(buf_lines, make_label_prefix(cd, ch, MERGE) .. " " .. strip_label(sl) .. ":")
+                emit_label(make_label_prefix(cd, ch, MERGE), strip_label(sl))
             end
 
             -- 4. Emit the child's frame.
@@ -1855,6 +1963,11 @@ local function build_stack_content(file, line, error_ids)
         end
     end
 
+    local function emit_label(prefix, text)
+        table.insert(buf_lines, prefix .. " " .. text .. ":")
+        frame_map[#buf_lines] = { prefix_bytes = #prefix + 1 }
+    end
+
     -- Emit a flat (single-stack) list of frames joined with tree chars.
     local function emit_flat(frames)
         local n = #frames
@@ -1915,7 +2028,7 @@ local function build_stack_content(file, line, error_ids)
             else
                 local trie_root = build_call_trie(deduped)
                 local common_leaves = factor_common_leaves(trie_root)
-                render_call_trie(trie_root, common_leaves, emit_frame, buf_lines)
+                render_call_trie(trie_root, common_leaves, emit_frame, emit_label)
             end
         end
     end
@@ -1929,7 +2042,7 @@ local function highlight_stack_buf(buf, lines, fmap)
     for i, line in ipairs(lines) do
         local row = i - 1
         local fi = fmap[i]
-        if fi then
+        if fi and fi.file then
             -- Frame line: prefix (tree chars) | function name | file:line.
             local pb = fi.prefix_bytes
             if pb > 0 then
@@ -1968,22 +2081,17 @@ local function highlight_stack_buf(buf, lines, fmap)
             vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, 0, {
                 end_col = #line, hl_group = "Title",
             })
-        elseif line ~= "" then
-            -- Label or tree-only line: tree chars then label text.
-            local alpha_pos = line:find("[%a]")
-            if alpha_pos then
-                if alpha_pos > 1 then
-                    vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, 0, {
-                        end_col = alpha_pos - 1, hl_group = "NonText",
-                    })
-                end
-                vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, alpha_pos - 1, {
-                    end_col = #line, hl_group = "Comment",
-                })
-            else
-                -- Pure tree characters, no text.
+        elseif fi then
+            -- Label line: tree prefix then label text.
+            local pb = fi.prefix_bytes
+            if pb > 0 then
                 vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, 0, {
-                    end_col = #line, hl_group = "NonText",
+                    end_col = pb, hl_group = "NonText",
+                })
+            end
+            if pb < #line then
+                vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, pb, {
+                    end_col = #line, hl_group = "Comment",
                 })
             end
         end
@@ -2109,7 +2217,7 @@ M.sanity_stack = function()
     end
 
     -- Preview the initial frame.
-    if stack_frame_map[cursor_line] then
+    if stack_frame_map[cursor_line] and stack_frame_map[cursor_line].file then
         preview_frame(stack_frame_map[cursor_line])
     end
 
@@ -2120,7 +2228,7 @@ M.sanity_stack = function()
             if not stack_win or not vim.api.nvim_win_is_valid(stack_win) then return end
             local cur = vim.api.nvim_win_get_cursor(stack_win)[1]
             local info = stack_frame_map and stack_frame_map[cur]
-            if info then
+            if info and info.file then
                 preview_frame(info)
             end
         end,
@@ -2156,7 +2264,7 @@ M.sanity_stack = function()
         local line_count = vim.api.nvim_buf_line_count(stack_bufnr)
         local target = cur + direction
         while target >= 1 and target <= line_count do
-            if stack_frame_map and stack_frame_map[target] then
+            if stack_frame_map and stack_frame_map[target] and stack_frame_map[target].file then
                 vim.api.nvim_win_set_cursor(stack_win, { target, 0 })
                 return
             end
@@ -2184,7 +2292,7 @@ M.sanity_stack = function()
         if not stack_win or not vim.api.nvim_win_is_valid(stack_win) then return end
         local cur = vim.api.nvim_win_get_cursor(stack_win)[1]
         local info = stack_frame_map and stack_frame_map[cur]
-        if not info then return end
+        if not info or not info.file then return end
         local pw = stack_preview_win
         close_stack_split()
         if pw and vim.api.nvim_win_is_valid(pw) then
@@ -2213,4 +2321,5 @@ M._new_error = new_error
 M._reset_state = reset_state
 M._build_stack_content = build_stack_content
 M._strip_label = strip_label
+M._find_related_targets = find_related_targets
 return M

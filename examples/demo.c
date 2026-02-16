@@ -37,6 +37,8 @@
  *
  * Two threads access 'shared_counter' without synchronization.
  * Helgrind and ThreadSanitizer will detect this.
+ *
+ * Use :SanityRelated to jump between the two racing accesses.
  * ============================================================ */
 
 int shared_counter = 0;

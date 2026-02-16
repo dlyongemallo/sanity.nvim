@@ -17,6 +17,7 @@ This plugin depends on [xml2lua](https://github.com/manoelcampos/xml2lua). The i
     --   stack_prev = "[s",   -- set to false to disable
     --   show_stack = false,  -- set to a key (e.g., "<a-s>") to enable
     --   explain    = false,  -- set to a key (e.g., "<a-e>") to enable
+    --   related    = false,  -- set to a key (e.g., "<a-r>") to enable
     -- },
   },
   dependencies = {
@@ -41,10 +42,20 @@ The `cmd` field makes lazy.nvim defer loading until one of those commands is fir
 :SanityStackNext
 :SanityStackPrev
 :SanityDiagnostics [on|off]
+:SanityFilter [<kind> ...]
+:SanityClearFilter
+:SanityRelated
+:SanityExplain
 ```
 The output will be populated into the quickfix list. `:SanityLoadLog` auto-detects the file format (valgrind XML or sanitizer log) and accepts multiple files. When called with no arguments, a file picker opens with multi-select support, filtered to `*.xml`, `*.log`, and `*.txt` files (requires [fzf-lua](https://github.com/ibhagwan/fzf-lua), [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim), [mini.pick](https://github.com/echasnovski/mini.pick), or [snacks.nvim](https://github.com/folke/snacks.nvim)).
 
 `:SanityStack` opens an interactive split showing all error stacks at the current cursor line with live source preview. Navigate frames with `]s`/`[s`, jump to a frame with `<CR>`, or close with `q`. `:SanityStackNext` and `:SanityStackPrev` navigate deeper into or out of a stack from the current position. By default these are also mapped to `]s` and `[s` respectively (configurable via `opts.keymaps`, or set to `false` to disable).
+
+`:SanityRelated` jumps to a related location sharing the same memory address. This includes other stacks within the same error (e.g. both sides of a data race) and other errors referencing the same address.
+
+`:SanityExplain` shows a floating window explaining the error kind at the cursor.
+
+`:SanityFilter [<kind> ...]` narrows the quickfix list to errors matching the given kinds (e.g. `Leak_DefinitelyLost`, `Race`). Called with no arguments, it lists the available kinds. `:SanityClearFilter` restores the full list.
 
 `:SanityDiagnostics` toggles diagnostic virtual text on source lines involved in errors. Pass `on` or `off` to set explicitly.
 
