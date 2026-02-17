@@ -14,13 +14,18 @@ local qf_file_lines = {}   -- qf index -> { file, line } using original frame pa
 local current_filter = nil  -- Array of kind strings when active.
 local suppressions = {}     -- Queued suppression entries: { text, tool }.
 local valgrind_job_id = nil  -- Active async valgrind job.
+local last_valgrind_args = nil  -- Raw args string from last :SanityRunValgrind.
 local valgrind_xml_file = nil -- Temp XML file for the active job.
 local valgrind_generation = 0 -- Counter to detect stale async callbacks.
+local suppression_counts = {}  -- name -> count from last valgrind XML run.
+local prev_error_fingerprints = {}  -- Fingerprint bag from previous load for diff summary.
 
 local ns = vim.api.nvim_create_namespace("sanity")
 
 local set_diagnostics       -- Forward declaration; defined after populate_quickfix_from_errors.
 local get_available_kinds   -- Forward declaration; defined after format helpers.
+local filter_presets        -- Forward declaration; defined after get_available_kinds.
+local get_priority          -- Forward declaration; defined after populate_quickfix_from_errors.
 
 local function reset_state()
     errors = {}
@@ -31,6 +36,7 @@ local function reset_state()
     qf_file_lines = {}
     current_filter = nil
     suppressions = {}
+    suppression_counts = {}
     if valgrind_job_id then
         vim.fn.jobstop(valgrind_job_id)
         valgrind_job_id = nil
@@ -41,6 +47,51 @@ local function reset_state()
     end
     valgrind_generation = valgrind_generation + 1
     vim.diagnostic.reset(ns)
+end
+
+-- Build a fingerprint for an error: kind + source + first frame location.
+local function error_fingerprint(err)
+    local ff = ""
+    if err.stacks and err.stacks[1] and err.stacks[1].frames and err.stacks[1].frames[1] then
+        local f = err.stacks[1].frames[1]
+        ff = f.file .. ":" .. f.line
+    end
+    return err.kind .. "\0" .. err.source .. "\0" .. ff
+end
+
+-- Snapshot the current error list as a fingerprint bag (multiset).
+-- Each fingerprint maps to its occurrence count so that duplicate errors
+-- are tracked individually rather than collapsed into a set.
+local function snapshot_fingerprints()
+    local fps = {}
+    for _, err in ipairs(errors) do
+        local fp = error_fingerprint(err)
+        fps[fp] = (fps[fp] or 0) + 1
+    end
+    return fps
+end
+
+-- Compare current errors against the previous fingerprint bag.
+-- Returns a summary string or nil if there was no previous load.
+local function compute_diff_summary()
+    if not next(prev_error_fingerprints) then return nil end
+    local new_fps = snapshot_fingerprints()
+    local new_count = 0
+    local fixed_count = 0
+    local unchanged_count = 0
+    -- Collect all fingerprints from both bags.
+    local all_fps = {}
+    for fp in pairs(new_fps) do all_fps[fp] = true end
+    for fp in pairs(prev_error_fingerprints) do all_fps[fp] = true end
+    for fp in pairs(all_fps) do
+        local cur = new_fps[fp] or 0
+        local prev = prev_error_fingerprints[fp] or 0
+        local common = math.min(cur, prev)
+        unchanged_count = unchanged_count + common
+        new_count = new_count + (cur - common)
+        fixed_count = fixed_count + (prev - common)
+    end
+    return string.format(" (%d new, %d fixed, %d unchanged)", new_count, fixed_count, unchanged_count)
 end
 
 -- Create an error object, register it, and update location_index.
@@ -77,6 +128,8 @@ function M.setup(opts)
         lsan = ".lsan.supp",
         tsan = ".tsan.supp",
     }, opts.suppression_files or {})
+    config.valgrind_suppressions = opts.valgrind_suppressions or {}
+    config.track_origins = opts.track_origins == nil and "ask" or opts.track_origins
 
     vim.api.nvim_create_user_command("SanityRunValgrind", M.run_valgrind, { nargs = 1 })
     vim.api.nvim_create_user_command("SanityLoadLog", M.sanity_load_log, {
@@ -96,7 +149,14 @@ function M.setup(opts)
     vim.api.nvim_create_user_command("SanityDiagnostics", M.toggle_diagnostics, { nargs = "?" })
     vim.api.nvim_create_user_command("SanityFilter", M.filter_errors, {
         nargs = "*",
-        complete = function() return get_available_kinds() end,
+        complete = function()
+            local items = get_available_kinds()
+            for name, _ in pairs(filter_presets) do
+                table.insert(items, name)
+            end
+            table.sort(items)
+            return items
+        end,
     })
     vim.api.nvim_create_user_command("SanityClearFilter", M.clear_filter, { nargs = 0 })
     vim.api.nvim_create_user_command("SanityRelated", M.show_related, { nargs = 0 })
@@ -106,6 +166,12 @@ function M.setup(opts)
         nargs = "?",
         complete = "file",
     })
+    vim.api.nvim_create_user_command("SanityAuditSuppressions", M.audit_suppressions, { nargs = 0 })
+    vim.api.nvim_create_user_command("SanityExport", M.export_errors, {
+        nargs = "?",
+        complete = "file",
+    })
+    vim.api.nvim_create_user_command("SanityDebug", M.debug_error, { nargs = 0 })
 
     -- Refresh diagnostic columns when a source file is opened.
     vim.api.nvim_create_autocmd("BufReadPost", {
@@ -413,6 +479,42 @@ get_available_kinds = function()
     return kinds
 end
 
+-- Preset filter groups that expand to sets of kind prefixes/names.
+filter_presets = {
+    errors = {
+        "InvalidRead", "InvalidWrite", "InvalidFree",
+        "UninitCondition", "UninitValue", "Overlap",
+        "heap-use-after-free", "heap-buffer-overflow", "stack-buffer-overflow",
+    },
+    leaks = {
+        "Leak_",
+    },
+    races = {
+        "Race", "data-race",
+    },
+    threading = {
+        "Race", "data-race", "UnlockUnlocked", "LockOrder",
+        "lock-order-inversion", "signal-unsafe-call",
+    },
+}
+
+-- Expand a list of filter arguments, resolving any preset names.
+local function expand_filter_args(args_list)
+    local result = {}
+    local seen = {}
+    for _, arg in ipairs(args_list) do
+        local preset = filter_presets[arg]
+        local items = preset or { arg }
+        for _, kind in ipairs(items) do
+            if not seen[kind] then
+                seen[kind] = true
+                table.insert(result, kind)
+            end
+        end
+    end
+    return result
+end
+
 -- Check whether an error's kind matches any entry in the active filter.
 local function matches_filter(kind)
     if not current_filter then return true end
@@ -473,7 +575,12 @@ local function group_error_frames()
         ::filter_skip::
     end
 
-    table.sort(group_order)
+    table.sort(group_order, function(a, b)
+        local pa = get_priority(groups[a].kind)
+        local pb = get_priority(groups[b].kind)
+        if pa ~= pb then return pa < pb end
+        return a < b
+    end)
     return groups, group_order
 end
 
@@ -553,6 +660,22 @@ local function populate_quickfix_from_errors()
     vim.api.nvim_exec_autocmds("QuickFixCmdPost", { pattern = "*" })
 end
 
+-- Map error kind to sort priority (lower = more urgent).
+local priority_map = {
+    InvalidRead = 1, InvalidWrite = 1, InvalidFree = 1,
+    ["heap-use-after-free"] = 1, ["heap-buffer-overflow"] = 1, ["stack-buffer-overflow"] = 1,
+    UninitCondition = 2, UninitValue = 2, Overlap = 2,
+    Race = 3, ["data-race"] = 3, UnlockUnlocked = 3, LockOrder = 3,
+    ["lock-order-inversion"] = 3, ["signal-unsafe-call"] = 3,
+    Leak_DefinitelyLost = 4,
+    Leak_PossiblyLost = 5, Leak_IndirectlyLost = 5,
+    Leak_StillReachable = 6,
+}
+
+get_priority = function(kind)
+    return priority_map[kind] or 3
+end
+
 -- Map error kind to diagnostic severity.
 local function get_severity(kind)
     if kind:match("^Leak_StillReachable") then
@@ -613,7 +736,13 @@ M.filter_errors = function(args)
             vim.notify("No errors loaded.", vim.log.levels.INFO)
             return
         end
+        local preset_names = {}
+        for name, _ in pairs(filter_presets) do
+            table.insert(preset_names, name)
+        end
+        table.sort(preset_names)
         local msg = "Available kinds: " .. table.concat(kinds, ", ")
+            .. "\nPresets: " .. table.concat(preset_names, ", ")
         if current_filter then
             msg = msg .. "\nCurrent filter: " .. table.concat(current_filter, ", ")
         end
@@ -621,14 +750,11 @@ M.filter_errors = function(args)
         return
     end
 
-    local filter_kinds = {}
-    local seen = {}
-    for kind in args.args:gmatch("%S+") do
-        if not seen[kind] then
-            seen[kind] = true
-            table.insert(filter_kinds, kind)
-        end
+    local raw_args = {}
+    for token in args.args:gmatch("%S+") do
+        table.insert(raw_args, token)
     end
+    local filter_kinds = expand_filter_args(raw_args)
     if #filter_kinds == 0 then return end
     current_filter = filter_kinds
     populate_quickfix_from_errors()
@@ -780,6 +906,20 @@ M.parse_valgrind_xml = function(xml_file)
             num_errors = num_errors + 1
         end
         ::not_error_continue::
+    end
+
+    -- Extract suppression usage counts from XML.
+    local supp_counts_list = output.suppcounts and output.suppcounts.pair
+    if supp_counts_list then
+        if supp_counts_list.name then
+            -- Single pair — xml2lua doesn't wrap it in an array.
+            supp_counts_list = { supp_counts_list }
+        end
+        for _, pair in ipairs_safe(supp_counts_list) do
+            if pair.name and pair.count then
+                suppression_counts[pair.name] = tonumber(pair.count) or 0
+            end
+        end
     end
 
     return num_errors
@@ -958,9 +1098,13 @@ M.run_valgrind = function(args)
     end
     valgrind_generation = valgrind_generation + 1
     local generation = valgrind_generation
+    last_valgrind_args = args.args
     local xml_file = vim.fn.tempname()
     valgrind_xml_file = xml_file
     local cmd = { "valgrind", "--num-callers=500", "--xml=yes", "--xml-file=" .. xml_file }
+    for _, supp_path in ipairs(config.valgrind_suppressions) do
+        table.insert(cmd, "--suppressions=" .. supp_path)
+    end
     for _, a in ipairs(vim.split(args.args, "%s+", { trimempty = true })) do
         table.insert(cmd, a)
     end
@@ -983,6 +1127,30 @@ M.run_valgrind = function(args)
                 end
                 vim.fn.delete(xml_file)
                 valgrind_xml_file = nil
+
+                -- Offer to re-run with --track-origins=yes for uninitialised value errors.
+                if config.track_origins == false then return end
+                if last_valgrind_args and last_valgrind_args:find("%-%-track%-origins") then return end
+                local has_uninit = false
+                for _, err in ipairs(errors) do
+                    if err.kind == "UninitCondition" or err.kind == "UninitValue" then
+                        has_uninit = true
+                        break
+                    end
+                end
+                if not has_uninit then return end
+                local rerun_args = "--track-origins=yes " .. last_valgrind_args
+                if config.track_origins == true then
+                    M.run_valgrind({ args = rerun_args })
+                else
+                    vim.ui.select({ "Yes", "No" }, {
+                        prompt = "Uninitialised value errors found. Re-run with --track-origins=yes?",
+                    }, function(choice)
+                        if choice == "Yes" then
+                            M.run_valgrind({ args = rerun_args })
+                        end
+                    end)
+                end
             end)
         end,
     })
@@ -1028,21 +1196,30 @@ local function register_keymaps()
     if suppress_key then
         vim.keymap.set("n", suppress_key, M.suppress_error, { desc = "Suppress error at cursor" })
     end
+    local debug_key = keymaps.debug
+    if debug_key then
+        vim.keymap.set("n", debug_key, M.debug_error, { desc = "Debug error at cursor" })
+    end
 end
 
 M.valgrind_load_xml = function(args)
     register_keymaps()
     local xml_file = args.args
+    prev_error_fingerprints = snapshot_fingerprints()
     reset_state()
     local num_errors = M.parse_valgrind_xml(xml_file)
     populate_quickfix_from_errors()
     set_diagnostics()
     if #qf_error_ids > 0 then vim.cmd("cfirst") end
-    vim.notify("Processed " .. num_errors .. " errors from '" .. xml_file .. "' into " .. #qf_error_ids .. " locations.")
+    local msg = "Processed " .. num_errors .. " errors from '" .. xml_file .. "' into " .. #qf_error_ids .. " locations."
+    local diff = compute_diff_summary()
+    if diff then msg = msg .. diff end
+    vim.notify(msg)
 end
 
 local function load_files(filepaths)
     register_keymaps()
+    prev_error_fingerprints = snapshot_fingerprints()
     reset_state()
     for _, filepath in ipairs(filepaths) do
         local format = detect_log_format(filepath)
@@ -1057,7 +1234,10 @@ local function load_files(filepaths)
     populate_quickfix_from_errors()
     set_diagnostics()
     if #qf_error_ids > 0 then vim.cmd("cfirst") end
-    vim.notify("Loaded " .. #errors .. " errors into " .. #qf_error_ids .. " quickfix entries.")
+    local msg = "Loaded " .. #errors .. " errors into " .. #qf_error_ids .. " quickfix entries."
+    local diff = compute_diff_summary()
+    if diff then msg = msg .. diff end
+    vim.notify(msg)
 end
 
 -- Stack frame navigation.
@@ -1445,6 +1625,126 @@ M.save_suppressions = function(args)
     end
 end
 
+-- Parse suppression names from a valgrind .supp file.
+-- Returns an array of { name = string, line = number, file = string }.
+local function parse_suppression_names(filepath)
+    local fh = io.open(filepath, "r")
+    if not fh then return nil end
+    local result = {}
+    local in_block = false
+    local line_num = 0
+    for line in fh:lines() do
+        line_num = line_num + 1
+        local trimmed = line:match("^%s*(.-)%s*$")
+        if trimmed == "{" then
+            in_block = true
+        elseif in_block then
+            -- Skip blank lines and comments; first real line is the name.
+            if trimmed ~= "" and not trimmed:match("^#") then
+                table.insert(result, { name = trimmed, line = line_num, file = filepath })
+                in_block = false
+            end
+        end
+    end
+    fh:close()
+    return result
+end
+
+-- SanityAuditSuppressions: report which suppressions were used/unused in the last run.
+M.audit_suppressions = function()
+    if vim.tbl_isempty(suppression_counts) then
+        vim.notify("No suppression data available. Run :SanityRunValgrind or load a valgrind XML log first.",
+            vim.log.levels.WARN)
+        return
+    end
+
+    -- Collect suppression files to audit.
+    local files = {}
+    for _, path in ipairs(config.valgrind_suppressions) do
+        table.insert(files, path)
+    end
+    local default_vg = config.suppression_files.valgrind
+    if default_vg and vim.fn.filereadable(default_vg) == 1 then
+        -- Avoid duplicates.
+        local already = false
+        for _, f in ipairs(files) do
+            if f == default_vg then already = true; break end
+        end
+        if not already then
+            table.insert(files, default_vg)
+        end
+    end
+
+    if #files == 0 then
+        vim.notify("No suppression files configured or found.", vim.log.levels.INFO)
+        return
+    end
+
+    local lines = {}
+    local total_used = 0
+    local total_unused = 0
+    for _, filepath in ipairs(files) do
+        local entries = parse_suppression_names(filepath)
+        if not entries then
+            table.insert(lines, "Could not read: " .. filepath)
+            goto audit_continue
+        end
+        table.insert(lines, filepath .. ":")
+        for _, entry in ipairs(entries) do
+            local count = suppression_counts[entry.name]
+            if count and count > 0 then
+                table.insert(lines, string.format("  %s  (used %d time%s)",
+                    entry.name, count, count == 1 and "" or "s"))
+                total_used = total_used + 1
+            else
+                table.insert(lines, string.format("  %s  (unused)", entry.name))
+                total_unused = total_unused + 1
+            end
+        end
+        ::audit_continue::
+    end
+
+    table.insert(lines, "")
+    table.insert(lines, string.format("Total: %d used, %d unused", total_used, total_unused))
+
+    show_floating_window("Suppression Audit", lines)
+end
+
+-- SanityExport: serialize the current error set to a JSON file.
+M.export_errors = function(args)
+    if #errors == 0 then
+        vim.notify("No errors to export.", vim.log.levels.INFO)
+        return
+    end
+
+    local filename = args and args.args and args.args ~= "" and args.args or "sanity-export.json"
+
+    -- Build a serializable representation of the error set.
+    local export = {}
+    for _, err in ipairs(errors) do
+        if not matches_filter(err.kind) then goto export_continue end
+        table.insert(export, {
+            id = err.id,
+            kind = err.kind,
+            message = err.message,
+            source = err.source,
+            meta = err.meta,
+            stacks = err.stacks,
+        })
+        ::export_continue::
+    end
+
+    local json = vim.fn.json_encode(export)
+    local fh = io.open(filename, "w")
+    if not fh then
+        vim.notify("Failed to open " .. filename .. " for writing.", vim.log.levels.ERROR)
+        return
+    end
+    fh:write(json .. "\n")
+    fh:close()
+    vim.notify("Exported " .. #export .. " error(s) to " .. filename .. ".")
+end
+
 -- SanityExplain: show a floating window explaining the error type.
 M.explain_error = function()
     local err = get_error_at_cursor()
@@ -1500,6 +1800,31 @@ M.explain_error = function()
     end
 
     show_floating_window("Error: " .. err.kind, lines)
+end
+
+-- SanityDebug: set a breakpoint at the error's location via nvim-dap or GDB clipboard.
+M.debug_error = function()
+    local err = get_error_at_cursor()
+    if not err then
+        vim.notify("No error at cursor.", vim.log.levels.WARN)
+        return
+    end
+    if not err.stacks or #err.stacks == 0 or not err.stacks[1].frames or #err.stacks[1].frames == 0 then
+        vim.notify("No stack frames available for this error.", vim.log.levels.WARN)
+        return
+    end
+    local frame = err.stacks[1].frames[1]
+    local ok, dap = pcall(require, "dap")
+    if ok then
+        vim.cmd("edit " .. vim.fn.fnameescape(frame.file))
+        vim.api.nvim_win_set_cursor(0, { frame.line, 0 })
+        dap.toggle_breakpoint()
+        vim.notify("Breakpoint set at " .. frame.file .. ":" .. frame.line)
+    else
+        local gdb_cmd = "break " .. frame.file .. ":" .. frame.line
+        vim.fn.setreg("+", gdb_cmd)
+        vim.notify("GDB command copied to clipboard: " .. gdb_cmd)
+    end
 end
 
 -- Find related targets sharing the same address as err.

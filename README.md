@@ -9,7 +9,7 @@ This plugin depends on [xml2lua](https://github.com/manoelcampos/xml2lua). The i
 ```lua
 {
   'dlyongemallo/sanity.nvim',
-  cmd = { "SanityLoadLog", "SanityRunValgrind" },
+  cmd = { "SanityLoadLog", "SanityRunValgrind", "SanityDebug" },
   opts = {
     -- picker = "fzf-lua",  -- "telescope", "mini.pick", "snacks"; nil to auto-detect
     -- keymaps = {
@@ -19,7 +19,10 @@ This plugin depends on [xml2lua](https://github.com/manoelcampos/xml2lua). The i
     --   explain    = false,  -- set to a key (e.g., "<a-e>") to enable
     --   related    = false,  -- set to a key (e.g., "<a-r>") to enable
     --   suppress   = false,  -- set to a key (e.g., "<a-x>") to enable
+    --   debug      = false,  -- set to a key (e.g., "<a-d>") to enable
     -- },
+    -- track_origins = "ask",  -- true (always), false (never), "ask" (prompt on uninit errors)
+    -- valgrind_suppressions = { ".valgrind.supp" },  -- passed as --suppressions= to valgrind
   },
   dependencies = {
     {
@@ -49,6 +52,9 @@ The `cmd` field makes lazy.nvim defer loading until one of those commands is fir
 :SanityExplain
 :SanitySuppress
 :SanitySaveSuppressions [<file>]
+:SanityAuditSuppressions
+:SanityExport [<file>]
+:SanityDebug
 ```
 
 To populate the plugin with data, either run `:SanityRunValgrind` (which starts valgrind asynchronously), or load an existing log file with `:SanityLoadLog`. Either way, the output will be populated into the quickfix list. `:SanityLoadLog` auto-detects the file format (valgrind XML or sanitizer log) and accepts multiple files. When called with no arguments, a file picker opens with multi-select support, filtered to `*.xml`, `*.log`, and `*.txt` files (requires [fzf-lua](https://github.com/ibhagwan/fzf-lua), [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim), [mini.pick](https://github.com/echasnovski/mini.pick), or [snacks.nvim](https://github.com/folke/snacks.nvim)).
@@ -59,11 +65,23 @@ To populate the plugin with data, either run `:SanityRunValgrind` (which starts 
 
 `:SanityExplain` shows a floating window explaining the error kind at the cursor.
 
-`:SanitySuppress` queues a suppression entry for the error at the cursor. `:SanitySaveSuppressions` writes all queued suppressions to disk. When given a filename, the suppressions are appended to that single file. Otherwise, they are partitioned by tool and written to the default files (`.valgrind.supp`, `.lsan.supp`, `.tsan.supp`, configurable via `opts.suppression_files`). Valgrind suppressions are full `{ ... }` blocks with `fun:` entries; sanitizer suppressions use the `type:function` format accepted by LSan and TSan. ASan memory errors (e.g. heap-use-after-free) have no runtime suppression mechanism and are reported as unsuppressible.
+`:SanitySuppress` queues a suppression entry for the error at the cursor. `:SanitySaveSuppressions` writes all queued suppressions to disk. When given a filename, the suppressions are appended to that single file. Otherwise, they are partitioned by tool and written to the default files (`.valgrind.supp`, `.lsan.supp`, `.tsan.supp`, configurable via `opts.suppression_files`). Valgrind suppressions are full `{ ... }` blocks with `fun:` entries; sanitizer suppressions use the `type:function` format accepted by LSan and TSan. ASan memory errors (e.g. heap-use-after-free) have no runtime suppression mechanism and are reported as unsuppressible. Existing suppression files can be passed to valgrind automatically via `opts.valgrind_suppressions` (a list of file paths).
 
-`:SanityFilter [<kind> ...]` narrows the quickfix list to errors matching the given kinds (e.g. `Leak_DefinitelyLost`, `Race`). Called with no arguments, it lists the available kinds. `:SanityClearFilter` restores the full list.
+`:SanityAuditSuppressions` shows which suppressions from your configured files were used or unused in the last valgrind run. This helps identify stale suppressions that can be removed.
+
+`:SanityFilter [<kind> ...]` narrows the quickfix list to errors matching the given kinds (e.g. `Leak_DefinitelyLost`, `Race`). Called with no arguments, it lists the available kinds and presets. `:SanityClearFilter` restores the full list. Built-in presets: `errors` (invalid access, uninitialised values, overflows), `leaks` (all leak types), `races` (data races), `threading` (all threading-related kinds).
 
 `:SanityDiagnostics` toggles diagnostic virtual text on source lines involved in errors. Pass `on` or `off` to set explicitly.
+
+`:SanityExport [<file>]` writes the current error set to a JSON file (default: `sanity-export.json`). Respects the active filter, so you can export a subset of errors.
+
+When reloading errors (running valgrind again or loading a new log), the notification summary includes a run-to-run diff showing how many errors are new, fixed, or unchanged compared to the previous load.
+
+Quickfix entries are sorted by severity so critical errors (invalid accesses, buffer overflows) appear first, followed by uninitialised value errors, threading issues, and leaks.
+
+`:SanityDebug` helps debug the error at the cursor. When [nvim-dap](https://github.com/mfussenegger/nvim-dap) is available, it jumps to the error location and sets a breakpoint. Otherwise, it copies a GDB `break` command to the system clipboard.
+
+When `:SanityRunValgrind` finds uninitialised value errors and `--track-origins` was not already specified, the plugin can automatically re-run with `--track-origins=yes` to get more detailed origin tracking. Set `track_origins` in setup options to `true` (always re-run), `false` (never), or `"ask"` (prompt; the default).
 
 ### Examples
 
