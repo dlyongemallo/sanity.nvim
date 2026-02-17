@@ -168,6 +168,7 @@ function M.setup(opts)
         nargs = "?",
         complete = "file",
     })
+    vim.api.nvim_create_user_command("SanityDebug", M.debug_error, { nargs = 0 })
 
     -- Refresh diagnostic columns when a source file is opened.
     vim.api.nvim_create_autocmd("BufReadPost", {
@@ -1192,6 +1193,10 @@ local function register_keymaps()
     if suppress_key then
         vim.keymap.set("n", suppress_key, M.suppress_error, { desc = "Suppress error at cursor" })
     end
+    local debug_key = keymaps.debug
+    if debug_key then
+        vim.keymap.set("n", debug_key, M.debug_error, { desc = "Debug error at cursor" })
+    end
 end
 
 M.valgrind_load_xml = function(args)
@@ -1792,6 +1797,31 @@ M.explain_error = function()
     end
 
     show_floating_window("Error: " .. err.kind, lines)
+end
+
+-- SanityDebug: set a breakpoint at the error's location via nvim-dap or GDB clipboard.
+M.debug_error = function()
+    local err = get_error_at_cursor()
+    if not err then
+        vim.notify("No error at cursor.", vim.log.levels.WARN)
+        return
+    end
+    if not err.stacks or #err.stacks == 0 or not err.stacks[1].frames or #err.stacks[1].frames == 0 then
+        vim.notify("No stack frames available for this error.", vim.log.levels.WARN)
+        return
+    end
+    local frame = err.stacks[1].frames[1]
+    local ok, dap = pcall(require, "dap")
+    if ok then
+        vim.cmd("edit " .. vim.fn.fnameescape(frame.file))
+        vim.api.nvim_win_set_cursor(0, { frame.line, 0 })
+        dap.toggle_breakpoint()
+        vim.notify("Breakpoint set at " .. frame.file .. ":" .. frame.line)
+    else
+        local gdb_cmd = "break " .. frame.file .. ":" .. frame.line
+        vim.fn.setreg("+", gdb_cmd)
+        vim.notify("GDB command copied to clipboard: " .. gdb_cmd)
+    end
 end
 
 -- Find related targets sharing the same address as err.

@@ -9,7 +9,7 @@ This plugin depends on [xml2lua](https://github.com/manoelcampos/xml2lua). The i
 ```lua
 {
   'dlyongemallo/sanity.nvim',
-  cmd = { "SanityLoadLog", "SanityRunValgrind" },
+  cmd = { "SanityLoadLog", "SanityRunValgrind", "SanityDebug" },
   opts = {
     -- picker = "fzf-lua",  -- "telescope", "mini.pick", "snacks"; nil to auto-detect
     -- keymaps = {
@@ -19,6 +19,7 @@ This plugin depends on [xml2lua](https://github.com/manoelcampos/xml2lua). The i
     --   explain    = false,  -- set to a key (e.g., "<a-e>") to enable
     --   related    = false,  -- set to a key (e.g., "<a-r>") to enable
     --   suppress   = false,  -- set to a key (e.g., "<a-x>") to enable
+    --   debug      = false,  -- set to a key (e.g., "<a-d>") to enable
     -- },
     -- track_origins = "ask",  -- true (always), false (never), "ask" (prompt on uninit errors)
     -- valgrind_suppressions = { ".valgrind.supp" },  -- passed as --suppressions= to valgrind
@@ -53,6 +54,7 @@ The `cmd` field makes lazy.nvim defer loading until one of those commands is fir
 :SanitySaveSuppressions [<file>]
 :SanityAuditSuppressions
 :SanityExport [<file>]
+:SanityDebug
 ```
 
 To populate the plugin with data, either run `:SanityRunValgrind` (which starts valgrind asynchronously), or load an existing log file with `:SanityLoadLog`. Either way, the output will be populated into the quickfix list. `:SanityLoadLog` auto-detects the file format (valgrind XML or sanitizer log) and accepts multiple files. When called with no arguments, a file picker opens with multi-select support, filtered to `*.xml`, `*.log`, and `*.txt` files (requires [fzf-lua](https://github.com/ibhagwan/fzf-lua), [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim), [mini.pick](https://github.com/echasnovski/mini.pick), or [snacks.nvim](https://github.com/folke/snacks.nvim)).
@@ -76,6 +78,8 @@ To populate the plugin with data, either run `:SanityRunValgrind` (which starts 
 When reloading errors (running valgrind again or loading a new log), the notification summary includes a run-to-run diff showing how many errors are new, fixed, or unchanged compared to the previous load.
 
 Quickfix entries are sorted by severity so critical errors (invalid accesses, buffer overflows) appear first, followed by uninitialised value errors, threading issues, and leaks.
+
+`:SanityDebug` helps debug the error at the cursor. When [nvim-dap](https://github.com/mfussenegger/nvim-dap) is available, it jumps to the error location and sets a breakpoint. Otherwise, it copies a GDB `break` command to the system clipboard.
 
 When `:SanityRunValgrind` finds uninitialised value errors and `--track-origins` was not already specified, the plugin can automatically re-run with `--track-origins=yes` to get more detailed origin tracking. Set `track_origins` in setup options to `true` (always re-run), `false` (never), or `"ask"` (prompt; the default).
 
