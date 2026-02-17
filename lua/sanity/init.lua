@@ -1290,6 +1290,499 @@ local function find_preview_win()
     return vim.api.nvim_get_current_win()
 end
 
+-- Strip leading whitespace and trailing colon from a stack label.
+local function strip_label(label)
+    if not label then return "" end
+    local s = label:match("^%s*(.-)%s*$") or label
+    s = s:gsub(":$", "")
+    return s
+end
+
+-- Return a dedup key for a frame.
+local function frame_key(frame)
+    return frame.file .. ":" .. frame.line
+end
+
+-- Deduplicate stacks by frame sequence.
+local function dedup_stacks(stacks)
+    local seen = {}
+    local out = {}
+    for _, stack in ipairs(stacks) do
+        local parts = {}
+        for _, frame in ipairs(stack.frames) do
+            table.insert(parts, frame_key(frame))
+        end
+        local fp = table.concat(parts, "\0")
+        if not seen[fp] then
+            seen[fp] = true
+            table.insert(out, stack)
+        end
+    end
+    return out
+end
+
+-- Compose thread-aware stacks for sanitizer errors.  Operation stacks
+-- ("by thread T1") are concatenated with the corresponding creation stacks
+-- ("Thread T1 ... created") so the trie can merge shared callers.
+local function compose_thread_stacks(all_stacks)
+    -- Index creation stacks by thread ID.
+    local creation_by_tid = {}  -- tid -> stack
+    for _, stack in ipairs(all_stacks) do
+        local tid = stack.label and stack.label:match("^%s*Thread (T%d+).*created")
+        if tid then
+            creation_by_tid[tid] = stack
+        end
+    end
+    if not next(creation_by_tid) then return all_stacks end
+
+    local used_creation = {}
+    local out = {}
+    for _, stack in ipairs(all_stacks) do
+        -- Skip creation stacks; they'll be inlined.
+        if stack.label and stack.label:match("^%s*Thread T%d+.*created") then
+            goto compose_continue
+        end
+
+        -- Check if this operation stack references a thread.
+        local tid = stack.label and (
+            stack.label:match("[Bb]y thread (T%d+)")
+            or stack.label:match("[Ii]n thread (T%d+)")
+        )
+        local creation = tid and creation_by_tid[tid]
+        if creation then
+            used_creation[tid] = true
+            -- Compose: operation frames ++ creation frames.
+            local composed_frames = {}
+            for _, f in ipairs(stack.frames) do
+                table.insert(composed_frames, f)
+            end
+            local transition_idx = #composed_frames + 1
+            for _, f in ipairs(creation.frames) do
+                table.insert(composed_frames, f)
+            end
+            table.insert(out, {
+                label = stack.label,
+                frames = composed_frames,
+                sub_labels = { [transition_idx] = creation.label },
+            })
+        else
+            table.insert(out, stack)
+        end
+        ::compose_continue::
+    end
+
+    -- Pass through any creation stacks that were never consumed.
+    for _, stack in ipairs(all_stacks) do
+        local tid = stack.label and stack.label:match("^%s*Thread (T%d+).*created")
+        if tid and not used_creation[tid] then
+            table.insert(out, stack)
+        end
+    end
+
+    return out
+end
+
+-- Build a trie from stacks reversed so shallowest frames (callers) come first.
+-- Returns root node and a parallel structure for label/sub_label assignment.
+local function build_call_trie(all_stacks)
+    local root = { frame = nil, children = {}, children_by_key = {}, labels = {}, sub_labels = {} }
+
+    -- Per-stack reversed frames and sub_label maps, used for label assignment.
+    local stack_paths = {}
+
+    for si, stack in ipairs(all_stacks) do
+        local reversed = {}
+        for i = #stack.frames, 1, -1 do
+            table.insert(reversed, stack.frames[i])
+        end
+
+        -- Map sub_labels from original indices to reversed indices.
+        local reversed_sub_labels = {}
+        if stack.sub_labels then
+            for idx, lbl in pairs(stack.sub_labels) do
+                local rev_idx = #stack.frames - idx + 1
+                reversed_sub_labels[rev_idx] = lbl
+            end
+        end
+
+        local node = root
+        local path_nodes = {}
+        for i, frame in ipairs(reversed) do
+            local key = frame_key(frame)
+            local child = node.children_by_key[key]
+            if not child then
+                child = { frame = frame, children = {}, children_by_key = {}, labels = {}, sub_labels = {} }
+                node.children_by_key[key] = child
+                table.insert(node.children, child)
+            end
+            -- Attach sub_labels at the correct trie node, skipping duplicates.
+            if reversed_sub_labels[i] then
+                local dup = false
+                for _, existing in ipairs(child.sub_labels) do
+                    if existing == reversed_sub_labels[i] then dup = true; break end
+                end
+                if not dup then
+                    table.insert(child.sub_labels, reversed_sub_labels[i])
+                end
+            end
+            table.insert(path_nodes, child)
+            node = child
+        end
+        stack_paths[si] = { reversed = reversed, nodes = path_nodes, label = stack.label }
+    end
+
+    -- Assign labels at divergence points: the first node whose parent has
+    -- multiple children.  This places labels where branches split.
+    for _, sp in ipairs(stack_paths) do
+        local placed = false
+        local parent = root
+        for _, tnode in ipairs(sp.nodes) do
+            if #parent.children > 1 then
+                table.insert(tnode.labels, sp.label)
+                placed = true
+                break
+            end
+            parent = tnode
+        end
+        if not placed and #sp.nodes > 0 then
+            -- No branching found; place label on the leaf.
+            table.insert(sp.nodes[#sp.nodes].labels, sp.label)
+        end
+    end
+
+    return root
+end
+
+local function factor_common_leaves(node)
+    -- Walk past single-child prefix to reach the branching point.
+    while #node.children == 1 do
+        node = node.children[1]
+    end
+    if #node.children < 2 then return {} end
+
+    -- Collect all leaf frame_keys from a subtree.
+    local function collect_leaf_keys(n)
+        if #n.children == 0 then
+            return { [frame_key(n.frame)] = n.frame }
+        end
+        local keys = {}
+        for _, c in ipairs(n.children) do
+            for k, f in pairs(collect_leaf_keys(c)) do
+                keys[k] = f
+            end
+        end
+        return keys
+    end
+
+    -- Remove the first leaf matching key from a subtree.
+    local function remove_leaf(n, key)
+        for i, c in ipairs(n.children) do
+            if #c.children == 0 and frame_key(c.frame) == key then
+                table.remove(n.children, i)
+                n.children_by_key[key] = nil
+                return true
+            end
+            if remove_leaf(c, key) then return true end
+        end
+        return false
+    end
+
+    -- Iteratively extract leaf frames common to every non-leaf child.
+    -- Each pass finds the current leaves, intersects across children that
+    -- still have sub-trees, removes matches, and repeats.  Children that
+    -- are themselves leaves (all callees already factored) are skipped so
+    -- they don't block factoring of leaves shared by the remaining branches.
+    local common_frames = {}
+    while true do
+        local leaf_sets = {}
+        for _, child in ipairs(node.children) do
+            if #child.children > 0 then
+                table.insert(leaf_sets, collect_leaf_keys(child))
+            end
+        end
+        if #leaf_sets < 2 then break end
+
+        local batch = {}
+        for key, frm in pairs(leaf_sets[1]) do
+            local all_have = true
+            for i = 2, #leaf_sets do
+                if not leaf_sets[i][key] then
+                    all_have = false
+                    break
+                end
+            end
+            if all_have then
+                table.insert(batch, { key = key, frame = frm })
+            end
+        end
+
+        if #batch == 0 then break end
+        table.sort(batch, function(a, b) return a.key < b.key end)
+
+        for _, entry in ipairs(batch) do
+            table.insert(common_frames, entry.frame)
+            for _, child in ipairs(node.children) do
+                remove_leaf(child, entry.key)
+            end
+        end
+    end
+
+    return common_frames
+end
+
+-- Render the call trie with tree-drawing characters.
+-- Output: deepest frames at top, shallowest at bottom.
+local function render_call_trie(root, common_leaves, emit_frame, buf_lines)
+    -- UTF-8 tree-drawing characters.
+    local TOP   = "\xe2\x94\x8c"  -- ┌
+    local MID   = "\xe2\x94\x82"  -- │
+    local BRANCH = "\xe2\x94\x9c" -- ├
+    local BOT   = "\xe2\x94\x94"  -- └
+    local CLOSE = "\xe2\x94\x98"  -- ┘
+    local MERGE = "\xe2\x94\xb4"  -- ┴
+    local HORIZ = "\xe2\x94\x80"  -- ─
+
+    -- rails[d] = true when column d has an active vertical line.
+    local rails = {}
+    local max_depth = 0
+
+    -- Compute max depth for common-leaf rendering.
+    local function find_max_depth(node, depth)
+        if depth > max_depth then max_depth = depth end
+        for _, child in ipairs(node.children) do
+            find_max_depth(child, depth + 1)
+        end
+    end
+    find_max_depth(root, -1)
+
+    -- Build prefix string from rails state plus a character at each column.
+    -- Pads to max_depth so labels with closing characters at deeper columns
+    -- render correctly.  Frame callers rstrip the result to avoid excess
+    -- trailing spaces when deeper rails are inactive.
+    local function make_prefix(depth, self_char, closing)
+        local parts = {}
+        for d = 0, depth - 1 do
+            table.insert(parts, rails[d] and MID or " ")
+        end
+        table.insert(parts, self_char)
+        for d = depth + 1, max_depth do
+            if closing and rails[d] then
+                table.insert(parts, closing)
+                rails[d] = false
+            else
+                table.insert(parts, rails[d] and MID or " ")
+            end
+        end
+        return table.concat(parts)
+    end
+
+    -- Strip trailing spaces so frames at shallow depths are not padded
+    -- out to max_depth when all deeper rails are inactive.
+    local function rstrip(s)
+        return (s:gsub(" +$", ""))
+    end
+
+    -- Depth of the deepest non-branching descendant from a node.
+    local function get_leaf_depth(node, depth)
+        if #node.children == 0 then return depth end
+        if #node.children == 1 then return get_leaf_depth(node.children[1], depth + 1) end
+        return depth
+    end
+
+    -- Render common leaves at the top with ┌─ cap.
+    -- common_leaf_rail tracks whether the visual rail from the cap is still
+    -- active so that the first label line can close it with ┴ and subsequent
+    -- labels use ─ as a horizontal connector.
+    local common_leaf_rail = false
+    if #common_leaves > 0 then
+        local ld = max_depth + 1
+        for i, frame in ipairs(common_leaves) do
+            local parts = {}
+            for _ = 1, ld do
+                table.insert(parts, " ")
+            end
+            table.insert(parts, i == 1 and (TOP .. HORIZ) or (BRANCH .. HORIZ))
+            emit_frame(table.concat(parts) .. " ", frame)
+        end
+        common_leaf_rail = true
+    end
+
+    -- Build prefix for label/sub_label lines.  When common leaves exist,
+    -- inactive rail positions between the label column and the common-leaf
+    -- column are filled with ─ so the line connects visually.
+    local function make_label_prefix(depth, ch, closing)
+        if #common_leaves == 0 then
+            return make_prefix(depth, ch, closing)
+        end
+        local parts = {}
+        for d = 0, depth - 1 do
+            table.insert(parts, rails[d] and MID or " ")
+        end
+        table.insert(parts, ch)
+        for d = depth + 1, max_depth do
+            if closing and rails[d] then
+                table.insert(parts, closing)
+                rails[d] = false
+            else
+                table.insert(parts, rails[d] and MID or HORIZ)
+            end
+        end
+        if common_leaf_rail then
+            table.insert(parts, MERGE)
+            common_leaf_rail = false
+        else
+            table.insert(parts, HORIZ)
+        end
+        return table.concat(parts)
+    end
+
+    -- Inline DFS rendering.  For each child of a node:
+    --   1. Emit labels (introduce the section) at the child's leaf depth.
+    --   2. Recurse into subtree (deeper content).
+    --   3. Emit sub_labels (transition from subtree) at the child's depth.
+    --   4. Emit the child's frame at the child's depth.
+    local function render_node(node, depth)
+        local n = #node.children
+        for ci, child in ipairs(node.children) do
+            local cd = depth + 1  -- child depth
+            local is_last = (ci == n)
+            -- Labels are emitted at the leaf depth so they sit next to the
+            -- deepest callee frame rather than at the branch point.
+            local ld = get_leaf_depth(child, cd)
+
+            -- Determine whether this child is the effective last (final
+            -- child and the parent has no sub_labels that would keep the
+            -- rail open after it).
+            local effective_last = is_last and #node.sub_labels == 0
+            local label_closed_rail = false
+
+            -- 1. Labels: introduce this branch's section.
+            for li, lbl in ipairs(child.labels) do
+                local ch
+                -- When the last child is a leaf at root level (depth < 0),
+                -- close the rail so the frame underneath gets plain
+                -- indentation.  At deeper levels the frame itself closes
+                -- the rail with ┌┘ to connect to the parent.
+                if effective_last and depth < 0 and li == #child.labels
+                   and #child.children == 0 then
+                    if rails[ld] then
+                        ch = BOT
+                        rails[ld] = false
+                    else
+                        ch = BOT
+                    end
+                    label_closed_rail = true
+                elseif not rails[ld] then
+                    ch = TOP
+                    rails[ld] = true
+                else
+                    ch = BRANCH
+                end
+                table.insert(buf_lines, make_label_prefix(ld, ch, nil) .. " " .. strip_label(lbl) .. ":")
+            end
+
+            -- 2. Recurse into subtree.
+            render_node(child, cd)
+
+            -- 3. Sub_labels: transition from deeper subtree.
+            --    Close any deeper rails with ┴.
+            for _, sl in ipairs(child.sub_labels) do
+                local ch
+                if not rails[cd] then
+                    ch = TOP
+                    rails[cd] = true
+                else
+                    ch = BRANCH
+                end
+                table.insert(buf_lines, make_label_prefix(cd, ch, MERGE) .. " " .. strip_label(sl) .. ":")
+            end
+
+            -- 4. Emit the child's frame.
+            if effective_last and label_closed_rail then
+                -- Rail was closed by the label.  Emit frame with plain
+                -- indent, opening the parent rail if needed.
+                local open_parent = depth >= 0 and not rails[depth]
+                if open_parent then rails[depth] = true end
+                local parts = {}
+                for d = 0, max_depth do
+                    if d == depth and open_parent then
+                        table.insert(parts, TOP)
+                    else
+                        table.insert(parts, rails[d] and MID or " ")
+                    end
+                end
+                emit_frame(table.concat(parts) .. "  ", child.frame)
+            elseif effective_last then
+                -- Last child: close this depth's rail and connect to parent.
+                local is_pass_through_branch =
+                    (n == 1)
+                    and (#child.children > 1)
+                    and (#child.labels == 0)
+                    and (#child.sub_labels == 0)
+                if depth >= 0 and not rails[depth] and not is_pass_through_branch then
+                    rails[depth] = true
+                    local parts = {}
+                    for d = 0, depth - 1 do
+                        table.insert(parts, rails[d] and MID or " ")
+                    end
+                    table.insert(parts, TOP)    -- ┌ at parent depth
+                    table.insert(parts, CLOSE)  -- ┘ at child depth
+                    rails[cd] = false
+                    for d = cd + 1, max_depth do
+                        table.insert(parts, rails[d] and MID or " ")
+                    end
+                    emit_frame(table.concat(parts) .. "  ", child.frame)
+                else
+                    if is_pass_through_branch and depth >= 0 then
+                        -- Show an explicit merge into the shared tail:
+                        -- parent column uses ┌ and child column uses ┴.
+                        local parts = {}
+                        for d = 0, depth - 1 do
+                            table.insert(parts, rails[d] and MID or " ")
+                        end
+                        table.insert(parts, TOP)
+                        table.insert(parts, MERGE)
+                        rails[depth] = true
+                        rails[cd] = false
+                        for d = cd + 1, max_depth do
+                            table.insert(parts, rails[d] and MID or " ")
+                        end
+                        emit_frame(rstrip(table.concat(parts)) .. "  ", child.frame)
+                    else
+                        rails[cd] = false
+                        emit_frame(rstrip(make_prefix(cd, BOT, CLOSE)) .. "  ", child.frame)
+                    end
+                end
+            else
+                -- Middle child or deferred close: rail continues.
+                local ch
+                if not rails[cd] then
+                    ch = TOP
+                    rails[cd] = true
+                else
+                    ch = MID
+                end
+                -- Close any leftover deeper rails from the subtree.
+                local has_deeper = false
+                for d = cd + 1, max_depth do
+                    if rails[d] then has_deeper = true; break end
+                end
+                if has_deeper then
+                    local pfx = make_prefix(cd, ch, CLOSE)
+                    if depth < 0 then pfx = rstrip(pfx) end
+                    emit_frame(pfx .. "  ", child.frame)
+                else
+                    local pfx = make_prefix(cd, ch, nil)
+                    if depth < 0 then pfx = rstrip(pfx) end
+                    emit_frame(pfx .. "  ", child.frame)
+                end
+            end
+        end
+    end
+
+    render_node(root, -1)
+end
+
 -- Build the stack content lines and frame map for a given file:line.
 -- When error_ids is provided (from quickfix), uses those directly instead of
 -- looking up location_index, which avoids path-normalisation mismatches.
@@ -1340,6 +1833,9 @@ local function build_stack_content(file, line, error_ids)
         if err then table.insert(err_list, err) end
     end
     if #err_list == 0 then return nil end
+    -- Sort by ID so the tree structure is stable regardless of which
+    -- quickfix entry triggered the expansion.
+    table.sort(err_list, function(a, b) return a.id < b.id end)
 
     local buf_lines = {}
     local frame_map = {}
@@ -1359,46 +1855,20 @@ local function build_stack_content(file, line, error_ids)
         end
     end
 
-    local function find_common_prefix(stacks)
-        if #stacks < 2 then return 0 end
-        local min_len = math.huge
-        for _, s in ipairs(stacks) do min_len = math.min(min_len, #s.frames) end
-        local common = 0
-        for i = 1, min_len do
-            local ref = stacks[1].frames[i]
-            local all_match = true
-            for si = 2, #stacks do
-                local f = stacks[si].frames[i]
-                if f.file ~= ref.file or f.line ~= ref.line then
-                    all_match = false
-                    break
-                end
+    -- Emit a flat (single-stack) list of frames joined with tree chars.
+    local function emit_flat(frames)
+        local n = #frames
+        for i, frame in ipairs(frames) do
+            if i == 1 and n > 1 then
+                emit_frame("\xe2\x94\x8c  ", frame)  -- ┌
+            elseif i == n and n > 1 then
+                emit_frame("\xe2\x94\x94  ", frame)  -- └
+            elseif n > 1 then
+                emit_frame("\xe2\x94\x9c  ", frame)  -- ├
+            else
+                emit_frame("   ", frame)
             end
-            if not all_match then break end
-            common = common + 1
         end
-        return common
-    end
-
-    local function find_common_suffix(stacks)
-        if #stacks < 2 then return 0 end
-        local min_len = math.huge
-        for _, s in ipairs(stacks) do min_len = math.min(min_len, #s.frames) end
-        local common = 0
-        for offset = 1, min_len do
-            local ref = stacks[1].frames[#stacks[1].frames - offset + 1]
-            local all_match = true
-            for si = 2, #stacks do
-                local f = stacks[si].frames[#stacks[si].frames - offset + 1]
-                if f.file ~= ref.file or f.line ~= ref.line then
-                    all_match = false
-                    break
-                end
-            end
-            if not all_match then break end
-            common = common + 1
-        end
-        return common
     end
 
     -- Group errors by kind so same-kind errors are merged into one tree.
@@ -1423,173 +1893,29 @@ local function build_stack_content(file, line, error_ids)
         table.insert(buf_lines, header)
 
         -- Pool all stacks, deduplicating by frame sequence.
-        local all_stacks = {}
-        local stack_seen = {}
+        local raw_stacks = {}
         for _, err in ipairs(group_errs) do
             for _, stack in ipairs(err.stacks) do
-                local parts = {}
-                for _, frame in ipairs(stack.frames) do
-                    table.insert(parts, frame.file .. ":" .. frame.line)
-                end
-                local fp = table.concat(parts, "\0")
-                if not stack_seen[fp] then
-                    stack_seen[fp] = true
-                    table.insert(all_stacks, stack)
-                end
+                table.insert(raw_stacks, stack)
             end
         end
+        local all_stacks = dedup_stacks(raw_stacks)
 
         if #all_stacks == 1 then
             -- Single unique stack: flat display.
-            for _, frame in ipairs(all_stacks[1].frames) do
-                emit_frame("    ", frame)
-            end
+            emit_flat(all_stacks[1].frames)
         else
-            -- Multiple stacks: find common prefix/suffix, build tree.
-            local prefix_count = find_common_prefix(all_stacks)
-            local suffix_count = find_common_suffix(all_stacks)
-            local min_len = math.huge
-            for _, s in ipairs(all_stacks) do
-                min_len = math.min(min_len, #s.frames)
-            end
-            -- Clamp so prefix and suffix don't overlap.
-            if prefix_count + suffix_count > min_len then
-                suffix_count = min_len - prefix_count
-            end
+            -- Compose thread-aware stacks, then dedup again.
+            local composed = compose_thread_stacks(all_stacks)
+            local deduped = dedup_stacks(composed)
 
-            -- Check whether any stack has divergent (non-common) frames.
-            local has_divergent = false
-            for _, stack in ipairs(all_stacks) do
-                if #stack.frames > prefix_count + suffix_count then
-                    has_divergent = true
-                    break
-                end
-            end
-
-            if not has_divergent then
-                -- All stacks identical after dedup: flat display.
-                for _, frame in ipairs(all_stacks[1].frames) do
-                    emit_frame("    ", frame)
-                end
+            if #deduped == 1 then
+                -- All stacks collapsed after composition: flat display.
+                emit_flat(deduped[1].frames)
             else
-                local ref = all_stacks[1]
-
-                -- Collect divergent frames tagged with their stack label,
-                -- then sort by (file, line) so navigation is sequential.
-                local div_frames = {}
-                for _, stack in ipairs(all_stacks) do
-                    for i = prefix_count + 1, #stack.frames - suffix_count do
-                        table.insert(div_frames, {
-                            frame = stack.frames[i],
-                            label = stack.label,
-                        })
-                    end
-                end
-                table.sort(div_frames, function(a, b)
-                    if a.frame.file ~= b.frame.file then
-                        return a.frame.file < b.frame.file
-                    end
-                    return a.frame.line < b.frame.line
-                end)
-
-                -- Indentation: each fork adds 1 character of depth.
-                local has_prefix = prefix_count > 0
-                local prefix_indent = "  "
-                local div_indent = has_prefix and "   " or "  "
-                local suffix_indent = div_indent .. " "
-
-                -- When suffix has 2+ frames, pop the first as a merge line
-                -- rendered at divergent indent with └┬. When suffix has
-                -- exactly 1 frame, the last divergent frame gets └┬ and the
-                -- sole suffix frame goes to suffix indent.
-                local merge_frame = nil
-                local suffix_start = #ref.frames - suffix_count + 1
-                if suffix_count > 1 then
-                    merge_frame = ref.frames[suffix_start]
-                    suffix_start = suffix_start + 1
-                end
-
-                -- UTF-8 tree-drawing characters.
-                local TOP    = "\xe2\x94\x8c" -- ┌
-                local MID    = "\xe2\x94\x82" -- │
-                local BRANCH = "\xe2\x94\x9c" -- ├
-                local BOT    = "\xe2\x94\x94" -- └
-                local MERGE  = "\xe2\x94\x94\xe2\x94\xac" -- └┬
-
-                -- Prefix zone: common deep callees.
-                for i = 1, prefix_count do
-                    local ch = (i == 1) and TOP or MID
-                    emit_frame(prefix_indent .. ch .. " ", ref.frames[i])
-                end
-                -- Transition label: └┬ closes the prefix rail and opens
-                -- the divergent rail. The label is non-navigable.
-                if has_prefix then
-                    table.insert(buf_lines, prefix_indent
-                        .. MERGE .. " " .. div_frames[1].label .. ":")
-                end
-
-                -- Divergent zone.
-                local labels_shown = {}
-                local last_label = nil
-                for di, df in ipairs(div_frames) do
-                    local is_last = di == #div_frames
-
-                    -- Emit a label line when a new label first appears.
-                    -- Skip the first label if already emitted as the
-                    -- prefix transition label above.
-                    local emitted_label = false
-                    if df.label ~= last_label then
-                        if not labels_shown[df.label] then
-                            if has_prefix and di == 1 then
-                                -- Already emitted as the prefix transition label.
-                            elseif di == 1 then
-                                -- No prefix: standalone label, no tree char.
-                                table.insert(buf_lines,
-                                    div_indent .. df.label .. ":")
-                                emitted_label = true
-                            else
-                                table.insert(buf_lines,
-                                    div_indent .. BRANCH .. " " .. df.label .. ":")
-                                emitted_label = true
-                            end
-                            labels_shown[df.label] = true
-                        end
-                        last_label = df.label
-                    end
-
-                    -- Tree character for this frame line.
-                    local ch
-                    if is_last and not merge_frame then
-                        ch = suffix_count > 0 and MERGE or BOT
-                    elseif di == 1 and not has_prefix then
-                        ch = TOP
-                    elseif emitted_label or (di == 1 and has_prefix) then
-                        -- Frame right after a label line or prefix transition.
-                        ch = MID
-                    else
-                        local prev_label = div_frames[di - 1].label
-                        if df.label ~= prev_label then
-                            -- Label changed but already shown (no label line
-                            -- emitted): branch on the frame itself.
-                            ch = BRANCH
-                        else
-                            ch = MID
-                        end
-                    end
-                    emit_frame(div_indent .. ch .. " ", df.frame)
-                end
-
-                -- Merge line: first suffix frame at divergent indent
-                -- when suffix has 2+ frames.
-                if merge_frame then
-                    emit_frame(div_indent .. MERGE .. " ", merge_frame)
-                end
-
-                -- Remaining suffix frames at suffix indent.
-                for i = suffix_start, #ref.frames do
-                    local ch = (i == #ref.frames) and BOT or MID
-                    emit_frame(suffix_indent .. ch .. " ", ref.frames[i])
-                end
+                local trie_root = build_call_trie(deduped)
+                local common_leaves = factor_common_leaves(trie_root)
+                render_call_trie(trie_root, common_leaves, emit_frame, buf_lines)
             end
         end
     end
@@ -1883,7 +2209,8 @@ M.sanity_load_log = function(args)
 end
 
 -- Expose internals for testing.
-M._errors = function() return errors end
-M._location_index = function() return location_index end
-M._qf_error_ids = function() return qf_error_ids end
+M._new_error = new_error
+M._reset_state = reset_state
+M._build_stack_content = build_stack_content
+M._strip_label = strip_label
 return M
