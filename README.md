@@ -18,6 +18,7 @@ This plugin depends on [xml2lua](https://github.com/manoelcampos/xml2lua). The i
     --   show_stack = false,  -- set to a key (e.g., "<a-s>") to enable
     --   explain    = false,  -- set to a key (e.g., "<a-e>") to enable
     --   related    = false,  -- set to a key (e.g., "<a-r>") to enable
+    --   suppress   = false,  -- set to a key (e.g., "<a-x>") to enable
     -- },
   },
   dependencies = {
@@ -46,6 +47,8 @@ The `cmd` field makes lazy.nvim defer loading until one of those commands is fir
 :SanityClearFilter
 :SanityRelated
 :SanityExplain
+:SanitySuppress
+:SanitySaveSuppressions [<file>]
 ```
 The output will be populated into the quickfix list. `:SanityLoadLog` auto-detects the file format (valgrind XML or sanitizer log) and accepts multiple files. When called with no arguments, a file picker opens with multi-select support, filtered to `*.xml`, `*.log`, and `*.txt` files (requires [fzf-lua](https://github.com/ibhagwan/fzf-lua), [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim), [mini.pick](https://github.com/echasnovski/mini.pick), or [snacks.nvim](https://github.com/folke/snacks.nvim)).
 
@@ -54,6 +57,8 @@ The output will be populated into the quickfix list. `:SanityLoadLog` auto-detec
 `:SanityRelated` jumps to a related location sharing the same memory address. This includes other stacks within the same error (e.g. both sides of a data race) and other errors referencing the same address.
 
 `:SanityExplain` shows a floating window explaining the error kind at the cursor.
+
+`:SanitySuppress` queues a suppression entry for the error at the cursor. `:SanitySaveSuppressions` writes all queued suppressions to disk. When given a filename, the suppressions are appended to that single file. Otherwise, they are partitioned by tool and written to the default files (`.valgrind.supp`, `.lsan.supp`, `.tsan.supp`, configurable via `opts.suppression_files`). Valgrind suppressions are full `{ ... }` blocks with `fun:` entries; sanitizer suppressions use the `type:function` format accepted by LSan and TSan. ASan memory errors (e.g. heap-use-after-free) have no runtime suppression mechanism and are reported as unsuppressible.
 
 `:SanityFilter [<kind> ...]` narrows the quickfix list to errors matching the given kinds (e.g. `Leak_DefinitelyLost`, `Race`). Called with no arguments, it lists the available kinds. `:SanityClearFilter` restores the full list.
 
