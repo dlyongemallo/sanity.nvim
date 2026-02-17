@@ -1,5 +1,6 @@
 vim.opt.rtp:prepend(vim.fn.fnamemodify(debug.getinfo(1, "S").source:match("@?(.*/)"), ":p") .. "/..")
 local M = require("sanity")
+local T = M._test
 
 local function fmt(prefix, func_name, basename, line)
   return string.format("%s%-28s %s:%d", prefix, func_name, basename, line)
@@ -14,20 +15,20 @@ local function frame(func_name, file, line)
 end
 
 local function render(kind, message, stacks, query_file, query_line)
-  M._reset_state()
-  local err = M._new_error(kind, message, "test", stacks, {})
-  local buf_lines = M._build_stack_content(query_file, query_line, { err.id })
+  T.reset_state()
+  local err = T.new_error(kind, message, "test", stacks, {})
+  local buf_lines = T.build_stack_content(query_file, query_line, { err.id })
   return buf_lines
 end
 
 local function render_multi(errs_spec, query_file, query_line)
-  M._reset_state()
+  T.reset_state()
   local ids = {}
   for _, spec in ipairs(errs_spec) do
-    local err = M._new_error(spec.kind, spec.message, "test", spec.stacks, {})
+    local err = T.new_error(spec.kind, spec.message, "test", spec.stacks, {})
     table.insert(ids, err.id)
   end
-  local buf_lines = M._build_stack_content(query_file, query_line, ids)
+  local buf_lines = T.build_stack_content(query_file, query_line, ids)
   return buf_lines
 end
 

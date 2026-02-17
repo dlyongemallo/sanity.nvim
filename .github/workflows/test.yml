@@ -9,4 +9,5 @@ jobs:
         with:
           neovim: true
           version: stable
+      - run: sudo apt-get install -y luarocks && sudo luarocks install xml2lua
       - run: make test

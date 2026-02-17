@@ -3,7 +3,5 @@ demo
 demo_asan
 demo_tsan
 
-# Valgrind/sanitizer output files
-*.xml
-*.log
+# Valgrind/sanitizer output files (not the checked-in examples)
 *.supp

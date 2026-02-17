@@ -1,0 +1,62 @@
+==================
+WARNING: ThreadSanitizer: data race (pid=289188)
+  Read of size 4 at 0x555555558100 by thread T2:
+    #0 read_counter /home/user/project/examples/demo.c:58 (demo_tsan+0x1338)
+
+  Previous write of size 4 at 0x555555558100 by thread T1:
+    #0 increment_counter /home/user/project/examples/demo.c:49 (demo_tsan+0x12e1)
+
+  Location is global 'shared_counter' of size 4 at 0x555555558100 (demo_tsan+0x4100)
+
+  Thread T2 (tid=289221, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1001 (libtsan.so.2+0x5e686)
+    #1 demonstrate_data_race /home/user/project/examples/demo.c:67 (demo_tsan+0x13c8)
+    #2 main /home/user/project/examples/demo.c:304 (demo_tsan+0x1bc2)
+
+  Thread T1 (tid=289218, finished) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1001 (libtsan.so.2+0x5e686)
+    #1 demonstrate_data_race /home/user/project/examples/demo.c:66 (demo_tsan+0x13ab)
+    #2 main /home/user/project/examples/demo.c:304 (demo_tsan+0x1bc2)
+
+SUMMARY: ThreadSanitizer: data race /home/user/project/examples/demo.c:58 in read_counter
+==================
+==================
+WARNING: ThreadSanitizer: heap-use-after-free (pid=289188)
+  Read of size 1 at 0x7b0800000020 by main thread:
+    #0 demonstrate_use_after_free /home/user/project/examples/demo.c:137 (demo_tsan+0x1615)
+    #1 main /home/user/project/examples/demo.c:322 (demo_tsan+0x1c40)
+
+  Previous write of size 8 at 0x7b0800000020 by main thread:
+    #0 free ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:706 (libtsan.so.2+0x47e82)
+    #1 demonstrate_use_after_free /home/user/project/examples/demo.c:134 (demo_tsan+0x1609)
+    #2 main /home/user/project/examples/demo.c:322 (demo_tsan+0x1c40)
+
+SUMMARY: ThreadSanitizer: heap-use-after-free /home/user/project/examples/demo.c:137 in demonstrate_use_after_free
+==================
+==================
+WARNING: ThreadSanitizer: lock-order-inversion (potential deadlock) (pid=289188)
+  Cycle in lock order graph: M0 (0x555555558120) => M1 (0x555555558160) => M0
+
+  Mutex M1 acquired here while holding mutex M0 in thread T3:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/sanitizer_common/sanitizer_common_interceptors.inc:4324 (libtsan.so.2+0x558e1)
+    #1 thread_order_ab /home/user/project/examples/demo.c:261 (demo_tsan+0x19fb)
+
+    Hint: use TSAN_OPTIONS=second_deadlock_stack=1 to get more informative warning message
+
+  Mutex M0 acquired here while holding mutex M1 in thread T4:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/sanitizer_common/sanitizer_common_interceptors.inc:4324 (libtsan.so.2+0x558e1)
+    #1 thread_order_ba /home/user/project/examples/demo.c:272 (demo_tsan+0x1a7c)
+
+  Thread T3 (tid=289513, finished) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1001 (libtsan.so.2+0x5e686)
+    #1 demonstrate_lock_order /home/user/project/examples/demo.c:283 (demo_tsan+0x1aed)
+    #2 main /home/user/project/examples/demo.c:352 (demo_tsan+0x1d12)
+
+  Thread T4 (tid=289515, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1001 (libtsan.so.2+0x5e686)
+    #1 demonstrate_lock_order /home/user/project/examples/demo.c:288 (demo_tsan+0x1b27)
+    #2 main /home/user/project/examples/demo.c:352 (demo_tsan+0x1d12)
+
+SUMMARY: ThreadSanitizer: lock-order-inversion (potential deadlock) /home/user/project/examples/demo.c:261 in thread_order_ab
+==================
+ThreadSanitizer: reported 3 warnings

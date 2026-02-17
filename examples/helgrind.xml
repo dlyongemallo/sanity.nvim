@@ -1,0 +1,614 @@
+<?xml version="1.0"?>
+
+<valgrindoutput>
+
+<protocolversion>4</protocolversion>
+<protocoltool>helgrind</protocoltool>
+
+<preamble>
+  <line>Helgrind, a thread error detector</line>
+  <line>Copyright (C) 2007-2024, and GNU GPL'd, by OpenWorks LLP et al.</line>
+  <line>Using Valgrind-3.24.0.GIT and LibVEX; rerun with -h for copyright info</line>
+  <line>Command: ./demo</line>
+</preamble>
+
+<pid>288084</pid>
+<ppid>1080084</ppid>
+<tool>helgrind</tool>
+
+<args>
+  <vargv>
+    <exe>/usr/local/bin/valgrind</exe>
+    <arg>--tool=helgrind</arg>
+    <arg>--xml=yes</arg>
+    <arg>--xml-file=helgrind.xml</arg>
+  </vargv>
+  <argv>
+    <exe>./demo</exe>
+  </argv>
+</args>
+
+<status>
+  <state>RUNNING</state>
+  <time>00:00:00:00.020 </time>
+</status>
+
+<announcethread>
+  <hthreadid>3</hthreadid>
+  <stack>
+    <frame>
+      <ip>0x4987B2F</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>clone</fn>
+      <dir>./misc/../sysdeps/unix/sysv/linux/x86_64</dir>
+      <file>clone.S</file>
+      <line>76</line>
+    </frame>
+    <frame>
+      <ip>0x4988978</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>__clone_internal</fn>
+      <dir>./misc/../sysdeps/unix/sysv/linux</dir>
+      <file>clone-internal.c</file>
+      <line>83</line>
+    </frame>
+    <frame>
+      <ip>0x4907DEF</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>create_thread</fn>
+      <dir>./nptl/./nptl</dir>
+      <file>pthread_create.c</file>
+      <line>295</line>
+    </frame>
+    <frame>
+      <ip>0x49088EC</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>pthread_create@@GLIBC_2.34</fn>
+      <dir>./nptl/./nptl</dir>
+      <file>pthread_create.c</file>
+      <line>831</line>
+    </frame>
+    <frame>
+      <ip>0x484FEC1</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>pthread_create_WRK</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>445</line>
+    </frame>
+    <frame>
+      <ip>0x48517C9</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>pthread_create@*</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>478</line>
+    </frame>
+    <frame>
+      <ip>0x1092C9</ip>
+      <obj>/home/user/project/examples/demo</obj>
+      <fn>demonstrate_data_race</fn>
+      <dir>/home/user/project/examples</dir>
+      <file>demo.c</file>
+      <line>67</line>
+    </frame>
+    <frame>
+      <ip>0x109832</ip>
+      <obj>/home/user/project/examples/demo</obj>
+      <fn>main</fn>
+      <dir>/home/user/project/examples</dir>
+      <file>demo.c</file>
+      <line>304</line>
+    </frame>
+  </stack>
+</announcethread>
+
+<announcethread>
+  <hthreadid>2</hthreadid>
+  <stack>
+    <frame>
+      <ip>0x4987B2F</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>clone</fn>
+      <dir>./misc/../sysdeps/unix/sysv/linux/x86_64</dir>
+      <file>clone.S</file>
+      <line>76</line>
+    </frame>
+    <frame>
+      <ip>0x4988978</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>__clone_internal</fn>
+      <dir>./misc/../sysdeps/unix/sysv/linux</dir>
+      <file>clone-internal.c</file>
+      <line>83</line>
+    </frame>
+    <frame>
+      <ip>0x4907DEF</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>create_thread</fn>
+      <dir>./nptl/./nptl</dir>
+      <file>pthread_create.c</file>
+      <line>295</line>
+    </frame>
+    <frame>
+      <ip>0x49088EC</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>pthread_create@@GLIBC_2.34</fn>
+      <dir>./nptl/./nptl</dir>
+      <file>pthread_create.c</file>
+      <line>831</line>
+    </frame>
+    <frame>
+      <ip>0x484FEC1</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>pthread_create_WRK</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>445</line>
+    </frame>
+    <frame>
+      <ip>0x48517C9</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>pthread_create@*</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>478</line>
+    </frame>
+    <frame>
+      <ip>0x1092AC</ip>
+      <obj>/home/user/project/examples/demo</obj>
+      <fn>demonstrate_data_race</fn>
+      <dir>/home/user/project/examples</dir>
+      <file>demo.c</file>
+      <line>66</line>
+    </frame>
+    <frame>
+      <ip>0x109832</ip>
+      <obj>/home/user/project/examples/demo</obj>
+      <fn>main</fn>
+      <dir>/home/user/project/examples</dir>
+      <file>demo.c</file>
+      <line>304</line>
+    </frame>
+  </stack>
+</announcethread>
+
+<error>
+  <unique>0x0</unique>
+  <tid>3</tid>
+  <kind>Race</kind>
+  <xwhat>
+    <text>Possible data race during read of size 4 at 0x10C0A0 by thread #3</text>
+    <hthreadid>3</hthreadid>
+  </xwhat>
+  <stack>
+    <frame>
+      <ip>0x109252</ip>
+      <obj>/home/user/project/examples/demo</obj>
+      <fn>read_counter</fn>
+      <dir>/home/user/project/examples</dir>
+      <file>demo.c</file>
+      <line>58</line>
+    </frame>
+    <frame>
+      <ip>0x48500B7</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>mythread_wrapper</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>406</line>
+    </frame>
+    <frame>
+      <ip>0x49081F4</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>start_thread</fn>
+      <dir>./nptl/./nptl</dir>
+      <file>pthread_create.c</file>
+      <line>442</line>
+    </frame>
+    <frame>
+      <ip>0x4987B3F</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>clone</fn>
+      <dir>./misc/../sysdeps/unix/sysv/linux/x86_64</dir>
+      <file>clone.S</file>
+      <line>100</line>
+    </frame>
+  </stack>
+  <xauxwhat>
+    <text>This conflicts with a previous write of size 4 by thread #2</text>
+    <hthreadid>2</hthreadid>
+  </xauxwhat>
+  <stack>
+    <frame>
+      <ip>0x109223</ip>
+      <obj>/home/user/project/examples/demo</obj>
+      <fn>increment_counter</fn>
+      <dir>/home/user/project/examples</dir>
+      <file>demo.c</file>
+      <line>49</line>
+    </frame>
+    <frame>
+      <ip>0x48500B7</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>mythread_wrapper</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>406</line>
+    </frame>
+    <frame>
+      <ip>0x49081F4</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>start_thread</fn>
+      <dir>./nptl/./nptl</dir>
+      <file>pthread_create.c</file>
+      <line>442</line>
+    </frame>
+    <frame>
+      <ip>0x4987B3F</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>clone</fn>
+      <dir>./misc/../sysdeps/unix/sysv/linux/x86_64</dir>
+      <file>clone.S</file>
+      <line>100</line>
+    </frame>
+  </stack>
+  <auxwhat>Address 0x10c0a0 is 0 bytes inside data symbol "shared_counter"</auxwhat>
+</error>
+
+<announcethread>
+  <hthreadid>5</hthreadid>
+  <stack>
+    <frame>
+      <ip>0x4987B2F</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>clone</fn>
+      <dir>./misc/../sysdeps/unix/sysv/linux/x86_64</dir>
+      <file>clone.S</file>
+      <line>76</line>
+    </frame>
+    <frame>
+      <ip>0x4988978</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>__clone_internal</fn>
+      <dir>./misc/../sysdeps/unix/sysv/linux</dir>
+      <file>clone-internal.c</file>
+      <line>83</line>
+    </frame>
+    <frame>
+      <ip>0x4907DEF</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>create_thread</fn>
+      <dir>./nptl/./nptl</dir>
+      <file>pthread_create.c</file>
+      <line>295</line>
+    </frame>
+    <frame>
+      <ip>0x49088EC</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>pthread_create@@GLIBC_2.34</fn>
+      <dir>./nptl/./nptl</dir>
+      <file>pthread_create.c</file>
+      <line>831</line>
+    </frame>
+    <frame>
+      <ip>0x484FEC1</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>pthread_create_WRK</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>445</line>
+    </frame>
+    <frame>
+      <ip>0x48517C9</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>pthread_create@*</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>478</line>
+    </frame>
+    <frame>
+      <ip>0x1097BD</ip>
+      <obj>/home/user/project/examples/demo</obj>
+      <fn>demonstrate_lock_order</fn>
+      <dir>/home/user/project/examples</dir>
+      <file>demo.c</file>
+      <line>288</line>
+    </frame>
+    <frame>
+      <ip>0x109982</ip>
+      <obj>/home/user/project/examples/demo</obj>
+      <fn>main</fn>
+      <dir>/home/user/project/examples</dir>
+      <file>demo.c</file>
+      <line>352</line>
+    </frame>
+  </stack>
+</announcethread>
+
+<error>
+  <unique>0x1</unique>
+  <tid>2</tid>
+  <kind>LockOrder</kind>
+  <xwhat>
+    <text>Thread #5: lock order "0x10C0C0 before 0x10C100" violated</text>
+    <hthreadid>5</hthreadid>
+  </xwhat>
+  <stack>
+    <frame>
+      <ip>0x484C9BC</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>mutex_lock_WRK</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>944</line>
+    </frame>
+    <frame>
+      <ip>0x4851BBE</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>pthread_mutex_lock</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>960</line>
+    </frame>
+    <frame>
+      <ip>0x109736</ip>
+      <obj>/home/user/project/examples/demo</obj>
+      <fn>thread_order_ba</fn>
+      <dir>/home/user/project/examples</dir>
+      <file>demo.c</file>
+      <line>272</line>
+    </frame>
+    <frame>
+      <ip>0x48500B7</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>mythread_wrapper</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>406</line>
+    </frame>
+    <frame>
+      <ip>0x49081F4</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>start_thread</fn>
+      <dir>./nptl/./nptl</dir>
+      <file>pthread_create.c</file>
+      <line>442</line>
+    </frame>
+    <frame>
+      <ip>0x4987B3F</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>clone</fn>
+      <dir>./misc/../sysdeps/unix/sysv/linux/x86_64</dir>
+      <file>clone.S</file>
+      <line>100</line>
+    </frame>
+  </stack>
+  <auxwhat>Required order was established by acquisition of lock at 0x10C0C0</auxwhat>
+  <stack>
+    <frame>
+      <ip>0x484C9BC</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>mutex_lock_WRK</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>944</line>
+    </frame>
+    <frame>
+      <ip>0x4851BBE</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>pthread_mutex_lock</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>960</line>
+    </frame>
+    <frame>
+      <ip>0x1096B5</ip>
+      <obj>/home/user/project/examples/demo</obj>
+      <fn>thread_order_ab</fn>
+      <dir>/home/user/project/examples</dir>
+      <file>demo.c</file>
+      <line>259</line>
+    </frame>
+    <frame>
+      <ip>0x48500B7</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>mythread_wrapper</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>406</line>
+    </frame>
+    <frame>
+      <ip>0x49081F4</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>start_thread</fn>
+      <dir>./nptl/./nptl</dir>
+      <file>pthread_create.c</file>
+      <line>442</line>
+    </frame>
+    <frame>
+      <ip>0x4987B3F</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>clone</fn>
+      <dir>./misc/../sysdeps/unix/sysv/linux/x86_64</dir>
+      <file>clone.S</file>
+      <line>100</line>
+    </frame>
+  </stack>
+  <auxwhat>followed by a later acquisition of lock at 0x10C100</auxwhat>
+  <stack>
+    <frame>
+      <ip>0x484C9BC</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>mutex_lock_WRK</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>944</line>
+    </frame>
+    <frame>
+      <ip>0x4851BBE</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>pthread_mutex_lock</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>960</line>
+    </frame>
+    <frame>
+      <ip>0x1096CE</ip>
+      <obj>/home/user/project/examples/demo</obj>
+      <fn>thread_order_ab</fn>
+      <dir>/home/user/project/examples</dir>
+      <file>demo.c</file>
+      <line>261</line>
+    </frame>
+    <frame>
+      <ip>0x48500B7</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>mythread_wrapper</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>406</line>
+    </frame>
+    <frame>
+      <ip>0x49081F4</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>start_thread</fn>
+      <dir>./nptl/./nptl</dir>
+      <file>pthread_create.c</file>
+      <line>442</line>
+    </frame>
+    <frame>
+      <ip>0x4987B3F</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>clone</fn>
+      <dir>./misc/../sysdeps/unix/sysv/linux/x86_64</dir>
+      <file>clone.S</file>
+      <line>100</line>
+    </frame>
+  </stack>
+  <auxwhat>Lock at 0x1002384800 was first observed</auxwhat>
+  <stack>
+    <frame>
+      <ip>0x484C9BC</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>mutex_lock_WRK</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>944</line>
+    </frame>
+    <frame>
+      <ip>0x4851BBE</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>pthread_mutex_lock</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>960</line>
+    </frame>
+    <frame>
+      <ip>0x1096B5</ip>
+      <obj>/home/user/project/examples/demo</obj>
+      <fn>thread_order_ab</fn>
+      <dir>/home/user/project/examples</dir>
+      <file>demo.c</file>
+      <line>259</line>
+    </frame>
+    <frame>
+      <ip>0x48500B7</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>mythread_wrapper</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>406</line>
+    </frame>
+    <frame>
+      <ip>0x49081F4</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>start_thread</fn>
+      <dir>./nptl/./nptl</dir>
+      <file>pthread_create.c</file>
+      <line>442</line>
+    </frame>
+    <frame>
+      <ip>0x4987B3F</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>clone</fn>
+      <dir>./misc/../sysdeps/unix/sysv/linux/x86_64</dir>
+      <file>clone.S</file>
+      <line>100</line>
+    </frame>
+  </stack>
+  <auxwhat>Lock at 0x10023848C0 was first observed</auxwhat>
+  <stack>
+    <frame>
+      <ip>0x484C9BC</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>mutex_lock_WRK</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>944</line>
+    </frame>
+    <frame>
+      <ip>0x4851BBE</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>pthread_mutex_lock</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>960</line>
+    </frame>
+    <frame>
+      <ip>0x1096CE</ip>
+      <obj>/home/user/project/examples/demo</obj>
+      <fn>thread_order_ab</fn>
+      <dir>/home/user/project/examples</dir>
+      <file>demo.c</file>
+      <line>261</line>
+    </frame>
+    <frame>
+      <ip>0x48500B7</ip>
+      <obj>/usr/local/libexec/valgrind/vgpreload_helgrind-amd64-linux.so</obj>
+      <fn>mythread_wrapper</fn>
+      <dir>/home/user/valgrind/helgrind</dir>
+      <file>hg_intercepts.c</file>
+      <line>406</line>
+    </frame>
+    <frame>
+      <ip>0x49081F4</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>start_thread</fn>
+      <dir>./nptl/./nptl</dir>
+      <file>pthread_create.c</file>
+      <line>442</line>
+    </frame>
+    <frame>
+      <ip>0x4987B3F</ip>
+      <obj>/usr/lib/x86_64-linux-gnu/libc.so.6</obj>
+      <fn>clone</fn>
+      <dir>./misc/../sysdeps/unix/sysv/linux/x86_64</dir>
+      <file>clone.S</file>
+      <line>100</line>
+    </frame>
+  </stack>
+</error>
+
+
+<status>
+  <state>FINISHED</state>
+  <time>00:00:00:00.493 </time>
+</status>
+
+<errorcounts>
+  <pair>
+    <count>1</count>
+    <unique>0x1</unique>
+  </pair>
+  <pair>
+    <count>1</count>
+    <unique>0x0</unique>
+  </pair>
+</errorcounts>
+
+<suppcounts>
+</suppcounts>
+
+</valgrindoutput>
+
