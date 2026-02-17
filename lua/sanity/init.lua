@@ -17,6 +17,7 @@ local valgrind_job_id = nil  -- Active async valgrind job.
 local valgrind_xml_file = nil -- Temp XML file for the active job.
 local valgrind_generation = 0 -- Counter to detect stale async callbacks.
 local suppression_counts = {}  -- name -> count from last valgrind XML run.
+local prev_error_fingerprints = {}  -- Fingerprint set from previous load for diff summary.
 
 local ns = vim.api.nvim_create_namespace("sanity")
 
@@ -44,6 +45,48 @@ local function reset_state()
     end
     valgrind_generation = valgrind_generation + 1
     vim.diagnostic.reset(ns)
+end
+
+-- Build a fingerprint for an error: kind + source + first frame location.
+local function error_fingerprint(err)
+    local ff = ""
+    if err.stacks and err.stacks[1] and err.stacks[1].frames and err.stacks[1].frames[1] then
+        local f = err.stacks[1].frames[1]
+        ff = f.file .. ":" .. f.line
+    end
+    return err.kind .. "\0" .. err.source .. "\0" .. ff
+end
+
+-- Snapshot the current error set as a fingerprint set.
+local function snapshot_fingerprints()
+    local fps = {}
+    for _, err in ipairs(errors) do
+        fps[error_fingerprint(err)] = true
+    end
+    return fps
+end
+
+-- Compare current errors against the previous fingerprint set.
+-- Returns a summary string or nil if there was no previous load.
+local function compute_diff_summary()
+    if not next(prev_error_fingerprints) then return nil end
+    local new_fps = snapshot_fingerprints()
+    local new_count = 0
+    local fixed_count = 0
+    local unchanged_count = 0
+    for fp, _ in pairs(new_fps) do
+        if prev_error_fingerprints[fp] then
+            unchanged_count = unchanged_count + 1
+        else
+            new_count = new_count + 1
+        end
+    end
+    for fp, _ in pairs(prev_error_fingerprints) do
+        if not new_fps[fp] then
+            fixed_count = fixed_count + 1
+        end
+    end
+    return string.format(" (%d new, %d fixed, %d unchanged)", new_count, fixed_count, unchanged_count)
 end
 
 -- Create an error object, register it, and update location_index.
@@ -1105,16 +1148,21 @@ end
 M.valgrind_load_xml = function(args)
     register_keymaps()
     local xml_file = args.args
+    prev_error_fingerprints = snapshot_fingerprints()
     reset_state()
     local num_errors = M.parse_valgrind_xml(xml_file)
     populate_quickfix_from_errors()
     set_diagnostics()
     if #qf_error_ids > 0 then vim.cmd("cfirst") end
-    vim.notify("Processed " .. num_errors .. " errors from '" .. xml_file .. "' into " .. #qf_error_ids .. " locations.")
+    local msg = "Processed " .. num_errors .. " errors from '" .. xml_file .. "' into " .. #qf_error_ids .. " locations."
+    local diff = compute_diff_summary()
+    if diff then msg = msg .. diff end
+    vim.notify(msg)
 end
 
 local function load_files(filepaths)
     register_keymaps()
+    prev_error_fingerprints = snapshot_fingerprints()
     reset_state()
     for _, filepath in ipairs(filepaths) do
         local format = detect_log_format(filepath)
@@ -1129,7 +1177,10 @@ local function load_files(filepaths)
     populate_quickfix_from_errors()
     set_diagnostics()
     if #qf_error_ids > 0 then vim.cmd("cfirst") end
-    vim.notify("Loaded " .. #errors .. " errors into " .. #qf_error_ids .. " quickfix entries.")
+    local msg = "Loaded " .. #errors .. " errors into " .. #qf_error_ids .. " quickfix entries."
+    local diff = compute_diff_summary()
+    if diff then msg = msg .. diff end
+    vim.notify(msg)
 end
 
 -- Stack frame navigation.

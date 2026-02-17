@@ -72,6 +72,8 @@ To populate the plugin with data, either run `:SanityRunValgrind` (which starts 
 
 `:SanityExport [<file>]` writes the current error set to a JSON file (default: `sanity-export.json`). Respects the active filter, so you can export a subset of errors.
 
+When reloading errors (running valgrind again or loading a new log), the notification summary includes a run-to-run diff showing how many errors are new, fixed, or unchanged compared to the previous load.
+
 ### Examples
 
 ```bash
