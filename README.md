@@ -50,7 +50,8 @@ The `cmd` field makes lazy.nvim defer loading until one of those commands is fir
 :SanitySuppress
 :SanitySaveSuppressions [<file>]
 ```
-The output will be populated into the quickfix list. `:SanityLoadLog` auto-detects the file format (valgrind XML or sanitizer log) and accepts multiple files. When called with no arguments, a file picker opens with multi-select support, filtered to `*.xml`, `*.log`, and `*.txt` files (requires [fzf-lua](https://github.com/ibhagwan/fzf-lua), [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim), [mini.pick](https://github.com/echasnovski/mini.pick), or [snacks.nvim](https://github.com/folke/snacks.nvim)).
+
+To populate the plugin with data, either run `:SanityRunValgrind` (which starts valgrind asynchronously), or load an existing log file with `:SanityLoadLog`. Either way, the output will be populated into the quickfix list. `:SanityLoadLog` auto-detects the file format (valgrind XML or sanitizer log) and accepts multiple files. When called with no arguments, a file picker opens with multi-select support, filtered to `*.xml`, `*.log`, and `*.txt` files (requires [fzf-lua](https://github.com/ibhagwan/fzf-lua), [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim), [mini.pick](https://github.com/echasnovski/mini.pick), or [snacks.nvim](https://github.com/folke/snacks.nvim)).
 
 `:SanityStack` opens an interactive split showing all error stacks at the current cursor line with live source preview. Navigate frames with `]s`/`[s`, jump to a frame with `<CR>`, or close with `q`. `:SanityStackNext` and `:SanityStackPrev` navigate deeper into or out of a stack from the current position. By default these are also mapped to `]s` and `[s` respectively (configurable via `opts.keymaps`, or set to `false` to disable).
 
