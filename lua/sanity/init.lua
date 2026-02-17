@@ -118,6 +118,10 @@ function M.setup(opts)
         complete = "file",
     })
     vim.api.nvim_create_user_command("SanityAuditSuppressions", M.audit_suppressions, { nargs = 0 })
+    vim.api.nvim_create_user_command("SanityExport", M.export_errors, {
+        nargs = "?",
+        complete = "file",
+    })
 
     -- Refresh diagnostic columns when a source file is opened.
     vim.api.nvim_create_autocmd("BufReadPost", {
@@ -1596,6 +1600,41 @@ M.audit_suppressions = function()
     table.insert(lines, string.format("Total: %d used, %d unused", total_used, total_unused))
 
     show_floating_window("Suppression Audit", lines)
+end
+
+-- SanityExport: serialize the current error set to a JSON file.
+M.export_errors = function(args)
+    if #errors == 0 then
+        vim.notify("No errors to export.", vim.log.levels.INFO)
+        return
+    end
+
+    local filename = args and args.args and args.args ~= "" and args.args or "sanity-export.json"
+
+    -- Build a serializable representation of the error set.
+    local export = {}
+    for _, err in ipairs(errors) do
+        if not matches_filter(err.kind) then goto export_continue end
+        table.insert(export, {
+            id = err.id,
+            kind = err.kind,
+            message = err.message,
+            source = err.source,
+            meta = err.meta,
+            stacks = err.stacks,
+        })
+        ::export_continue::
+    end
+
+    local json = vim.fn.json_encode(export)
+    local fh = io.open(filename, "w")
+    if not fh then
+        vim.notify("Failed to open " .. filename .. " for writing.", vim.log.levels.ERROR)
+        return
+    end
+    fh:write(json .. "\n")
+    fh:close()
+    vim.notify("Exported " .. #export .. " error(s) to " .. filename .. ".")
 end
 
 -- SanityExplain: show a floating window explaining the error type.

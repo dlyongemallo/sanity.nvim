@@ -51,6 +51,7 @@ The `cmd` field makes lazy.nvim defer loading until one of those commands is fir
 :SanitySuppress
 :SanitySaveSuppressions [<file>]
 :SanityAuditSuppressions
+:SanityExport [<file>]
 ```
 
 To populate the plugin with data, either run `:SanityRunValgrind` (which starts valgrind asynchronously), or load an existing log file with `:SanityLoadLog`. Either way, the output will be populated into the quickfix list. `:SanityLoadLog` auto-detects the file format (valgrind XML or sanitizer log) and accepts multiple files. When called with no arguments, a file picker opens with multi-select support, filtered to `*.xml`, `*.log`, and `*.txt` files (requires [fzf-lua](https://github.com/ibhagwan/fzf-lua), [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim), [mini.pick](https://github.com/echasnovski/mini.pick), or [snacks.nvim](https://github.com/folke/snacks.nvim)).
@@ -68,6 +69,8 @@ To populate the plugin with data, either run `:SanityRunValgrind` (which starts 
 `:SanityFilter [<kind> ...]` narrows the quickfix list to errors matching the given kinds (e.g. `Leak_DefinitelyLost`, `Race`). Called with no arguments, it lists the available kinds and presets. `:SanityClearFilter` restores the full list. Built-in presets: `errors` (invalid access, uninitialised values, overflows), `leaks` (all leak types), `races` (data races), `threading` (all threading-related kinds).
 
 `:SanityDiagnostics` toggles diagnostic virtual text on source lines involved in errors. Pass `on` or `off` to set explicitly.
+
+`:SanityExport [<file>]` writes the current error set to a JSON file (default: `sanity-export.json`). Respects the active filter, so you can export a subset of errors.
 
 ### Examples
 
