@@ -13,6 +13,9 @@ local qf_error_ids = {}    -- qf index -> { error_id, ... }
 local qf_file_lines = {}   -- qf index -> { file, line } using original frame paths
 local current_filter = nil  -- Array of kind strings when active.
 local suppressions = {}     -- Queued suppression entries: { text, tool }.
+local valgrind_job_id = nil  -- Active async valgrind job.
+local valgrind_xml_file = nil -- Temp XML file for the active job.
+local valgrind_generation = 0 -- Counter to detect stale async callbacks.
 
 local ns = vim.api.nvim_create_namespace("sanity")
 
@@ -28,6 +31,15 @@ local function reset_state()
     qf_file_lines = {}
     current_filter = nil
     suppressions = {}
+    if valgrind_job_id then
+        vim.fn.jobstop(valgrind_job_id)
+        valgrind_job_id = nil
+    end
+    if valgrind_xml_file then
+        vim.fn.delete(valgrind_xml_file)
+        valgrind_xml_file = nil
+    end
+    valgrind_generation = valgrind_generation + 1
     vim.diagnostic.reset(ns)
 end
 
@@ -936,15 +948,52 @@ M.parse_sanitizer_log = function(log_file)
 end
 
 M.run_valgrind = function(args)
+    if valgrind_job_id then
+        vim.fn.jobstop(valgrind_job_id)
+        valgrind_job_id = nil
+    end
+    if valgrind_xml_file then
+        vim.fn.delete(valgrind_xml_file)
+        valgrind_xml_file = nil
+    end
+    valgrind_generation = valgrind_generation + 1
+    local generation = valgrind_generation
     local xml_file = vim.fn.tempname()
-
-    local valgrind_cmd_line = "!valgrind --num-callers=500 --xml=yes --xml-file="
-        .. vim.fn.shellescape(xml_file) .. " " .. args.args
-
-    vim.cmd(valgrind_cmd_line)
-    M.valgrind_load_xml({args = xml_file})
-
-    vim.fn.delete(xml_file)
+    valgrind_xml_file = xml_file
+    local cmd = { "valgrind", "--num-callers=500", "--xml=yes", "--xml-file=" .. xml_file }
+    for _, a in ipairs(vim.split(args.args, "%s+", { trimempty = true })) do
+        table.insert(cmd, a)
+    end
+    vim.notify("Running valgrind...", vim.log.levels.INFO)
+    local job_id = vim.fn.jobstart(cmd, {
+        on_exit = function(_, code)
+            valgrind_job_id = nil
+            vim.schedule(function()
+                -- Discard result if a newer run or reset has occurred.
+                if generation ~= valgrind_generation then
+                    return
+                end
+                if code ~= 0 then
+                    vim.notify("Valgrind exited with code " .. code, vim.log.levels.WARN)
+                end
+                vim.notify("Valgrind completed, loading results...", vim.log.levels.INFO)
+                local ok, err = pcall(M.valgrind_load_xml, { args = xml_file })
+                if not ok then
+                    vim.notify("Failed to load valgrind XML: " .. tostring(err), vim.log.levels.ERROR)
+                end
+                vim.fn.delete(xml_file)
+                valgrind_xml_file = nil
+            end)
+        end,
+    })
+    if job_id <= 0 then
+        vim.notify("Failed to start valgrind.", vim.log.levels.ERROR)
+        vim.fn.delete(xml_file)
+        valgrind_xml_file = nil
+        valgrind_generation = valgrind_generation + 1
+    else
+        valgrind_job_id = job_id
+    end
 end
 
 -- Register keymaps on first log load.
