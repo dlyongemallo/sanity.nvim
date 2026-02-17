@@ -191,6 +191,9 @@ void demonstrate_uninitialized(void) {
  *
  * Freeing the same memory twice causes undefined behavior.
  * Memcheck and AddressSanitizer will catch this.
+ *
+ * Use :SanitySuppress to create a suppression if this is
+ * a known issue you want to ignore temporarily.
  * ============================================================ */
 
 void demonstrate_double_free(void) {

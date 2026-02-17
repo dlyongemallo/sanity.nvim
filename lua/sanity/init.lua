@@ -12,6 +12,7 @@ local location_index = {}  -- "file:line" -> { error_id, ... }
 local qf_error_ids = {}    -- qf index -> { error_id, ... }
 local qf_file_lines = {}   -- qf index -> { file, line } using original frame paths
 local current_filter = nil  -- Array of kind strings when active.
+local suppressions = {}     -- Queued suppression entries: { text, tool }.
 
 local ns = vim.api.nvim_create_namespace("sanity")
 
@@ -26,6 +27,7 @@ local function reset_state()
     qf_error_ids = {}
     qf_file_lines = {}
     current_filter = nil
+    suppressions = {}
     vim.diagnostic.reset(ns)
 end
 
@@ -58,6 +60,11 @@ function M.setup(opts)
     opts = opts or {}
     config.picker = opts.picker
     config.diagnostics_enabled = true
+    config.suppression_files = vim.tbl_extend("force", {
+        valgrind = ".valgrind.supp",
+        lsan = ".lsan.supp",
+        tsan = ".tsan.supp",
+    }, opts.suppression_files or {})
 
     vim.api.nvim_create_user_command("SanityRunValgrind", M.run_valgrind, { nargs = 1 })
     vim.api.nvim_create_user_command("SanityLoadLog", M.sanity_load_log, {
@@ -82,6 +89,11 @@ function M.setup(opts)
     vim.api.nvim_create_user_command("SanityClearFilter", M.clear_filter, { nargs = 0 })
     vim.api.nvim_create_user_command("SanityRelated", M.show_related, { nargs = 0 })
     vim.api.nvim_create_user_command("SanityExplain", M.explain_error, { nargs = 0 })
+    vim.api.nvim_create_user_command("SanitySuppress", M.suppress_error, { nargs = 0 })
+    vim.api.nvim_create_user_command("SanitySaveSuppressions", M.save_suppressions, {
+        nargs = "?",
+        complete = "file",
+    })
 
     -- Refresh diagnostic columns when a source file is opened.
     vim.api.nvim_create_autocmd("BufReadPost", {
@@ -963,6 +975,10 @@ local function register_keymaps()
     if related_key then
         vim.keymap.set("n", related_key, M.show_related, { desc = "Jump to related error" })
     end
+    local suppress_key = keymaps.suppress
+    if suppress_key then
+        vim.keymap.set("n", suppress_key, M.suppress_error, { desc = "Suppress error at cursor" })
+    end
 end
 
 M.valgrind_load_xml = function(args)
@@ -1198,6 +1214,186 @@ local function show_floating_window(title, lines)
 
     vim.keymap.set("n", "q", function() vim.api.nvim_win_close(win, true) end, { buffer = buf })
     vim.keymap.set("n", "<Esc>", function() vim.api.nvim_win_close(win, true) end, { buffer = buf })
+end
+
+-- Generate a suppression entry for an error.
+-- Returns (text, tool_key) on success, or (nil, reason) on failure.
+local function generate_suppression(err)
+    if not err.stacks or #err.stacks == 0 or not err.stacks[1].frames or #err.stacks[1].frames == 0 then
+        return nil, "No stack frames available for suppression."
+    end
+
+    if err.source == "valgrind" then
+        -- Map kind to suppression tool:type.
+        local supp_type
+        local extra_line
+        local kind = err.kind
+        if kind == "Race" then
+            supp_type = "Helgrind:Race"
+        elseif kind == "UnlockUnlocked" or kind == "LockOrder" then
+            supp_type = "Helgrind:Misc"
+        elseif kind == "InvalidRead" or kind == "InvalidWrite" then
+            supp_type = "Memcheck:Addr"
+        elseif kind == "InvalidFree" then
+            supp_type = "Memcheck:Free"
+        elseif kind == "UninitCondition" or kind == "UninitValue" then
+            supp_type = "Memcheck:Cond"
+        elseif kind == "Overlap" then
+            supp_type = "Memcheck:Overlap"
+        elseif starts_with(kind, "Leak_") then
+            supp_type = "Memcheck:Leak"
+            local leak_map = {
+                Leak_DefinitelyLost = "definite",
+                Leak_PossiblyLost = "possible",
+                Leak_IndirectlyLost = "indirect",
+                Leak_StillReachable = "reachable",
+            }
+            local leak_kind = leak_map[kind]
+            if leak_kind then
+                extra_line = "   match-leak-kinds: " .. leak_kind
+            end
+        end
+
+        if not supp_type then
+            return nil, "Suppression not available for " .. kind .. " errors."
+        end
+
+        local lines = { "{", "   <sanity_generated>", "   " .. supp_type }
+        if extra_line then
+            table.insert(lines, extra_line)
+        end
+        local has_func = false
+        for _, frame in ipairs(err.stacks[1].frames) do
+            if frame.func then
+                table.insert(lines, "   fun:" .. frame.func)
+                has_func = true
+            end
+        end
+        if not has_func then
+            return nil, "No function name available for suppression."
+        end
+        table.insert(lines, "}")
+        return table.concat(lines, "\n"), "valgrind"
+    end
+
+    if err.source == "sanitizer" then
+        -- Find deepest in-project frame with a function name.
+        local func
+        for _, frame in ipairs(err.stacks[1].frames) do
+            if frame.func then
+                func = frame.func
+                break
+            end
+        end
+        if not func then
+            return nil, "No function name available for suppression."
+        end
+
+        local kind = err.kind
+        if err.meta and err.meta.leak_type then
+            return "leak:" .. func, "lsan"
+        elseif kind == "data-race" then
+            return "race:" .. func, "tsan"
+        elseif kind:match("^signal%-unsafe") then
+            return "signal:" .. func, "tsan"
+        elseif kind == "lock-order-inversion" then
+            return "deadlock:" .. func, "tsan"
+        else
+            return nil, "Suppression not available for " .. kind .. " errors."
+        end
+    end
+
+    return nil, "Unknown error source: " .. tostring(err.source) .. "."
+end
+
+-- SanitySuppress: queue a suppression for the error at cursor.
+M.suppress_error = function()
+    local err = get_error_at_cursor()
+    if not err then
+        vim.notify("No error at cursor.", vim.log.levels.WARN)
+        return
+    end
+    local text, tool_or_reason = generate_suppression(err)
+    if not text then
+        vim.notify(tool_or_reason, vim.log.levels.WARN)
+        return
+    end
+    table.insert(suppressions, { text = text, tool = tool_or_reason })
+    vim.notify("Suppression queued (" .. #suppressions .. " total).")
+end
+
+-- SanitySaveSuppressions: write queued suppressions to file(s).
+M.save_suppressions = function(args)
+    if #suppressions == 0 then
+        vim.notify("No suppressions to save.", vim.log.levels.INFO)
+        return
+    end
+
+    local filename = args and args.args and args.args ~= "" and args.args or nil
+
+    if filename then
+        -- Write all suppressions to a single file.
+        local fh, open_err = io.open(filename, "a")
+        if not fh then
+            vim.notify("Failed to open " .. filename .. ": " .. (open_err or "unknown error"), vim.log.levels.ERROR)
+            return
+        end
+        local ok, write_err
+        for _, s in ipairs(suppressions) do
+            ok, write_err = fh:write(s.text .. "\n")
+            if not ok then break end
+        end
+        fh:close()
+        if not ok then
+            vim.notify("Write failed for " .. filename .. ": " .. (write_err or "unknown error"), vim.log.levels.ERROR)
+            return
+        end
+        vim.notify("Wrote " .. #suppressions .. " suppression(s) to " .. filename .. ".")
+        suppressions = {}
+    else
+        -- Partition by tool and write to default files.
+        local by_tool = {}
+        for _, s in ipairs(suppressions) do
+            if not by_tool[s.tool] then
+                by_tool[s.tool] = {}
+            end
+            table.insert(by_tool[s.tool], s.text)
+        end
+        local saved_tools = {}
+        for tool, entries in pairs(by_tool) do
+            local path = config.suppression_files[tool]
+            if not path then
+                vim.notify("No default file configured for tool: " .. tool, vim.log.levels.WARN)
+                goto save_continue
+            end
+            local fh, open_err = io.open(path, "a")
+            if not fh then
+                vim.notify("Failed to open " .. path .. ": " .. (open_err or "unknown error"), vim.log.levels.ERROR)
+                goto save_continue
+            end
+            local ok, write_err
+            for _, text in ipairs(entries) do
+                ok, write_err = fh:write(text .. "\n")
+                if not ok then break end
+            end
+            fh:close()
+            if not ok then
+                vim.notify("Write failed for " .. path .. ": " .. (write_err or "unknown error"), vim.log.levels.ERROR)
+                goto save_continue
+            end
+            vim.notify("Wrote " .. #entries .. " suppression(s) to " .. path .. ".")
+            saved_tools[tool] = true
+            ::save_continue::
+        end
+        -- Only remove suppressions that were successfully written.
+        local remaining = {}
+        for _, s in ipairs(suppressions) do
+            if not saved_tools[s.tool] then
+                table.insert(remaining, s)
+            end
+        end
+        suppressions = remaining
+    end
 end
 
 -- SanityExplain: show a floating window explaining the error type.
@@ -2322,4 +2518,5 @@ M._reset_state = reset_state
 M._build_stack_content = build_stack_content
 M._strip_label = strip_label
 M._find_related_targets = find_related_targets
+M._generate_suppression = generate_suppression
 return M
