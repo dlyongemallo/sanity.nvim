@@ -14,6 +14,7 @@ local qf_file_lines = {}   -- qf index -> { file, line } using original frame pa
 local current_filter = nil  -- Array of kind strings when active.
 local suppressions = {}     -- Queued suppression entries: { text, tool }.
 local valgrind_job_id = nil  -- Active async valgrind job.
+local last_valgrind_args = nil  -- Raw args string from last :SanityRunValgrind.
 local valgrind_xml_file = nil -- Temp XML file for the active job.
 local valgrind_generation = 0 -- Counter to detect stale async callbacks.
 local suppression_counts = {}  -- name -> count from last valgrind XML run.
@@ -125,6 +126,7 @@ function M.setup(opts)
         tsan = ".tsan.supp",
     }, opts.suppression_files or {})
     config.valgrind_suppressions = opts.valgrind_suppressions or {}
+    config.track_origins = opts.track_origins == nil and "ask" or opts.track_origins
 
     vim.api.nvim_create_user_command("SanityRunValgrind", M.run_valgrind, { nargs = 1 })
     vim.api.nvim_create_user_command("SanityLoadLog", M.sanity_load_log, {
@@ -1092,6 +1094,7 @@ M.run_valgrind = function(args)
     end
     valgrind_generation = valgrind_generation + 1
     local generation = valgrind_generation
+    last_valgrind_args = args.args
     local xml_file = vim.fn.tempname()
     valgrind_xml_file = xml_file
     local cmd = { "valgrind", "--num-callers=500", "--xml=yes", "--xml-file=" .. xml_file }
@@ -1120,6 +1123,30 @@ M.run_valgrind = function(args)
                 end
                 vim.fn.delete(xml_file)
                 valgrind_xml_file = nil
+
+                -- Offer to re-run with --track-origins=yes for uninitialised value errors.
+                if config.track_origins == false then return end
+                if last_valgrind_args and last_valgrind_args:find("%-%-track%-origins") then return end
+                local has_uninit = false
+                for _, err in ipairs(errors) do
+                    if err.kind == "UninitCondition" or err.kind == "UninitValue" then
+                        has_uninit = true
+                        break
+                    end
+                end
+                if not has_uninit then return end
+                local rerun_args = "--track-origins=yes " .. last_valgrind_args
+                if config.track_origins == true then
+                    M.run_valgrind({ args = rerun_args })
+                else
+                    vim.ui.select({ "Yes", "No" }, {
+                        prompt = "Uninitialised value errors found. Re-run with --track-origins=yes?",
+                    }, function(choice)
+                        if choice == "Yes" then
+                            M.run_valgrind({ args = rerun_args })
+                        end
+                    end)
+                end
             end)
         end,
     })

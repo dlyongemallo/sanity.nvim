@@ -20,6 +20,7 @@ This plugin depends on [xml2lua](https://github.com/manoelcampos/xml2lua). The i
     --   related    = false,  -- set to a key (e.g., "<a-r>") to enable
     --   suppress   = false,  -- set to a key (e.g., "<a-x>") to enable
     -- },
+    -- track_origins = "ask",  -- true (always), false (never), "ask" (prompt on uninit errors)
     -- valgrind_suppressions = { ".valgrind.supp" },  -- passed as --suppressions= to valgrind
   },
   dependencies = {
@@ -75,6 +76,8 @@ To populate the plugin with data, either run `:SanityRunValgrind` (which starts 
 When reloading errors (running valgrind again or loading a new log), the notification summary includes a run-to-run diff showing how many errors are new, fixed, or unchanged compared to the previous load.
 
 Quickfix entries are sorted by severity so critical errors (invalid accesses, buffer overflows) appear first, followed by uninitialised value errors, threading issues, and leaks.
+
+When `:SanityRunValgrind` finds uninitialised value errors and `--track-origins` was not already specified, the plugin can automatically re-run with `--track-origins=yes` to get more detailed origin tracking. Set `track_origins` in setup options to `true` (always re-run), `false` (never), or `"ask"` (prompt; the default).
 
 ### Examples
 
