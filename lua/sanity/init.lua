@@ -2886,11 +2886,34 @@ M.sanity_load_log = function(args)
     load_files(filepaths)
 end
 
--- Expose internals for testing.
-M._new_error = new_error
-M._reset_state = reset_state
-M._build_stack_content = build_stack_content
-M._strip_label = strip_label
-M._find_related_targets = find_related_targets
-M._generate_suppression = generate_suppression
+-- Expose internals for testing behind a single table.
+M._test = {
+  new_error = new_error,
+  reset_state = reset_state,
+  build_stack_content = build_stack_content,
+  strip_label = strip_label,
+  find_related_targets = find_related_targets,
+  generate_suppression = generate_suppression,
+  errors = function() return errors end,
+  error_fingerprint = error_fingerprint,
+  snapshot_fingerprints = snapshot_fingerprints,
+  compute_diff_summary = function() return compute_diff_summary() end,
+  set_prev_fingerprints = function(fps) prev_error_fingerprints = fps end,
+  detect_log_format = detect_log_format,
+  parse_suppression_names = parse_suppression_names,
+  get_priority = get_priority,
+  get_available_kinds = get_available_kinds,
+  expand_filter_args = expand_filter_args,
+  matches_filter = matches_filter,
+  set_filter = function(f) current_filter = f end,
+  format_link_set = format_link_set,
+  format_valgrind_group = format_valgrind_group,
+  format_sanitizer_group = format_sanitizer_group,
+  ipairs_safe = ipairs_safe,
+  starts_with = starts_with,
+  summarize_rw = summarize_rw,
+  summarize_table_keys = summarize_table_keys,
+  merge_meta_sets = merge_meta_sets,
+  load_files = load_files,
+}
 return M
