@@ -24,6 +24,7 @@ local ns = vim.api.nvim_create_namespace("sanity")
 local set_diagnostics       -- Forward declaration; defined after populate_quickfix_from_errors.
 local get_available_kinds   -- Forward declaration; defined after format helpers.
 local filter_presets        -- Forward declaration; defined after get_available_kinds.
+local get_priority          -- Forward declaration; defined after populate_quickfix_from_errors.
 
 local function reset_state()
     errors = {}
@@ -568,7 +569,12 @@ local function group_error_frames()
         ::filter_skip::
     end
 
-    table.sort(group_order)
+    table.sort(group_order, function(a, b)
+        local pa = get_priority(groups[a].kind)
+        local pb = get_priority(groups[b].kind)
+        if pa ~= pb then return pa < pb end
+        return a < b
+    end)
     return groups, group_order
 end
 
@@ -646,6 +652,22 @@ local function populate_quickfix_from_errors()
 
     -- Notify plugins (e.g. trouble.nvim) that the quickfix list changed.
     vim.api.nvim_exec_autocmds("QuickFixCmdPost", { pattern = "*" })
+end
+
+-- Map error kind to sort priority (lower = more urgent).
+local priority_map = {
+    InvalidRead = 1, InvalidWrite = 1, InvalidFree = 1,
+    ["heap-use-after-free"] = 1, ["heap-buffer-overflow"] = 1, ["stack-buffer-overflow"] = 1,
+    UninitCondition = 2, UninitValue = 2, Overlap = 2,
+    Race = 3, ["data-race"] = 3, UnlockUnlocked = 3, LockOrder = 3,
+    ["lock-order-inversion"] = 3, ["signal-unsafe-call"] = 3,
+    Leak_DefinitelyLost = 4,
+    Leak_PossiblyLost = 5, Leak_IndirectlyLost = 5,
+    Leak_StillReachable = 6,
+}
+
+get_priority = function(kind)
+    return priority_map[kind] or 3
 end
 
 -- Map error kind to diagnostic severity.

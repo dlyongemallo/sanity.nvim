@@ -74,6 +74,8 @@ To populate the plugin with data, either run `:SanityRunValgrind` (which starts 
 
 When reloading errors (running valgrind again or loading a new log), the notification summary includes a run-to-run diff showing how many errors are new, fixed, or unchanged compared to the previous load.
 
+Quickfix entries are sorted by severity so critical errors (invalid accesses, buffer overflows) appear first, followed by uninitialised value errors, threading issues, and leaks.
+
 ### Examples
 
 ```bash
