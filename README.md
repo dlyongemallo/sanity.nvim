@@ -20,6 +20,7 @@ This plugin depends on [xml2lua](https://github.com/manoelcampos/xml2lua). The i
     --   related    = false,  -- set to a key (e.g., "<a-r>") to enable
     --   suppress   = false,  -- set to a key (e.g., "<a-x>") to enable
     -- },
+    -- valgrind_suppressions = { ".valgrind.supp" },  -- passed as --suppressions= to valgrind
   },
   dependencies = {
     {
@@ -49,6 +50,7 @@ The `cmd` field makes lazy.nvim defer loading until one of those commands is fir
 :SanityExplain
 :SanitySuppress
 :SanitySaveSuppressions [<file>]
+:SanityAuditSuppressions
 ```
 
 To populate the plugin with data, either run `:SanityRunValgrind` (which starts valgrind asynchronously), or load an existing log file with `:SanityLoadLog`. Either way, the output will be populated into the quickfix list. `:SanityLoadLog` auto-detects the file format (valgrind XML or sanitizer log) and accepts multiple files. When called with no arguments, a file picker opens with multi-select support, filtered to `*.xml`, `*.log`, and `*.txt` files (requires [fzf-lua](https://github.com/ibhagwan/fzf-lua), [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim), [mini.pick](https://github.com/echasnovski/mini.pick), or [snacks.nvim](https://github.com/folke/snacks.nvim)).
@@ -59,7 +61,9 @@ To populate the plugin with data, either run `:SanityRunValgrind` (which starts 
 
 `:SanityExplain` shows a floating window explaining the error kind at the cursor.
 
-`:SanitySuppress` queues a suppression entry for the error at the cursor. `:SanitySaveSuppressions` writes all queued suppressions to disk. When given a filename, the suppressions are appended to that single file. Otherwise, they are partitioned by tool and written to the default files (`.valgrind.supp`, `.lsan.supp`, `.tsan.supp`, configurable via `opts.suppression_files`). Valgrind suppressions are full `{ ... }` blocks with `fun:` entries; sanitizer suppressions use the `type:function` format accepted by LSan and TSan. ASan memory errors (e.g. heap-use-after-free) have no runtime suppression mechanism and are reported as unsuppressible.
+`:SanitySuppress` queues a suppression entry for the error at the cursor. `:SanitySaveSuppressions` writes all queued suppressions to disk. When given a filename, the suppressions are appended to that single file. Otherwise, they are partitioned by tool and written to the default files (`.valgrind.supp`, `.lsan.supp`, `.tsan.supp`, configurable via `opts.suppression_files`). Valgrind suppressions are full `{ ... }` blocks with `fun:` entries; sanitizer suppressions use the `type:function` format accepted by LSan and TSan. ASan memory errors (e.g. heap-use-after-free) have no runtime suppression mechanism and are reported as unsuppressible. Existing suppression files can be passed to valgrind automatically via `opts.valgrind_suppressions` (a list of file paths).
+
+`:SanityAuditSuppressions` shows which suppressions from your configured files were used or unused in the last valgrind run. This helps identify stale suppressions that can be removed.
 
 `:SanityFilter [<kind> ...]` narrows the quickfix list to errors matching the given kinds (e.g. `Leak_DefinitelyLost`, `Race`). Called with no arguments, it lists the available kinds and presets. `:SanityClearFilter` restores the full list. Built-in presets: `errors` (invalid access, uninitialised values, overflows), `leaks` (all leak types), `races` (data races), `threading` (all threading-related kinds).
 

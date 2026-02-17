@@ -16,6 +16,7 @@ local suppressions = {}     -- Queued suppression entries: { text, tool }.
 local valgrind_job_id = nil  -- Active async valgrind job.
 local valgrind_xml_file = nil -- Temp XML file for the active job.
 local valgrind_generation = 0 -- Counter to detect stale async callbacks.
+local suppression_counts = {}  -- name -> count from last valgrind XML run.
 
 local ns = vim.api.nvim_create_namespace("sanity")
 
@@ -32,6 +33,7 @@ local function reset_state()
     qf_file_lines = {}
     current_filter = nil
     suppressions = {}
+    suppression_counts = {}
     if valgrind_job_id then
         vim.fn.jobstop(valgrind_job_id)
         valgrind_job_id = nil
@@ -78,6 +80,7 @@ function M.setup(opts)
         lsan = ".lsan.supp",
         tsan = ".tsan.supp",
     }, opts.suppression_files or {})
+    config.valgrind_suppressions = opts.valgrind_suppressions or {}
 
     vim.api.nvim_create_user_command("SanityRunValgrind", M.run_valgrind, { nargs = 1 })
     vim.api.nvim_create_user_command("SanityLoadLog", M.sanity_load_log, {
@@ -114,6 +117,7 @@ function M.setup(opts)
         nargs = "?",
         complete = "file",
     })
+    vim.api.nvim_create_user_command("SanityAuditSuppressions", M.audit_suppressions, { nargs = 0 })
 
     -- Refresh diagnostic columns when a source file is opened.
     vim.api.nvim_create_autocmd("BufReadPost", {
@@ -829,6 +833,20 @@ M.parse_valgrind_xml = function(xml_file)
         ::not_error_continue::
     end
 
+    -- Extract suppression usage counts from XML.
+    local supp_counts_list = output.suppcounts and output.suppcounts.pair
+    if supp_counts_list then
+        if supp_counts_list.name then
+            -- Single pair — xml2lua doesn't wrap it in an array.
+            supp_counts_list = { supp_counts_list }
+        end
+        for _, pair in ipairs_safe(supp_counts_list) do
+            if pair.name and pair.count then
+                suppression_counts[pair.name] = tonumber(pair.count) or 0
+            end
+        end
+    end
+
     return num_errors
 end
 
@@ -1008,6 +1026,9 @@ M.run_valgrind = function(args)
     local xml_file = vim.fn.tempname()
     valgrind_xml_file = xml_file
     local cmd = { "valgrind", "--num-callers=500", "--xml=yes", "--xml-file=" .. xml_file }
+    for _, supp_path in ipairs(config.valgrind_suppressions) do
+        table.insert(cmd, "--suppressions=" .. supp_path)
+    end
     for _, a in ipairs(vim.split(args.args, "%s+", { trimempty = true })) do
         table.insert(cmd, a)
     end
@@ -1490,6 +1511,91 @@ M.save_suppressions = function(args)
         end
         suppressions = remaining
     end
+end
+
+-- Parse suppression names from a valgrind .supp file.
+-- Returns an array of { name = string, line = number, file = string }.
+local function parse_suppression_names(filepath)
+    local fh = io.open(filepath, "r")
+    if not fh then return nil end
+    local result = {}
+    local in_block = false
+    local line_num = 0
+    for line in fh:lines() do
+        line_num = line_num + 1
+        local trimmed = line:match("^%s*(.-)%s*$")
+        if trimmed == "{" then
+            in_block = true
+        elseif in_block then
+            -- First non-empty line after '{' is the suppression name.
+            if trimmed ~= "" then
+                table.insert(result, { name = trimmed, line = line_num, file = filepath })
+            end
+            in_block = false
+        end
+    end
+    fh:close()
+    return result
+end
+
+-- SanityAuditSuppressions: report which suppressions were used/unused in the last run.
+M.audit_suppressions = function()
+    if vim.tbl_isempty(suppression_counts) then
+        vim.notify("No suppression data available. Run :SanityRunValgrind or load a valgrind XML log first.",
+            vim.log.levels.WARN)
+        return
+    end
+
+    -- Collect suppression files to audit.
+    local files = {}
+    for _, path in ipairs(config.valgrind_suppressions) do
+        table.insert(files, path)
+    end
+    local default_vg = config.suppression_files.valgrind
+    if default_vg and vim.fn.filereadable(default_vg) == 1 then
+        -- Avoid duplicates.
+        local already = false
+        for _, f in ipairs(files) do
+            if f == default_vg then already = true; break end
+        end
+        if not already then
+            table.insert(files, default_vg)
+        end
+    end
+
+    if #files == 0 then
+        vim.notify("No suppression files configured or found.", vim.log.levels.INFO)
+        return
+    end
+
+    local lines = {}
+    local total_used = 0
+    local total_unused = 0
+    for _, filepath in ipairs(files) do
+        local entries = parse_suppression_names(filepath)
+        if not entries then
+            table.insert(lines, "Could not read: " .. filepath)
+            goto audit_continue
+        end
+        table.insert(lines, filepath .. ":")
+        for _, entry in ipairs(entries) do
+            local count = suppression_counts[entry.name]
+            if count and count > 0 then
+                table.insert(lines, string.format("  %s  (used %d time%s)",
+                    entry.name, count, count == 1 and "" or "s"))
+                total_used = total_used + 1
+            else
+                table.insert(lines, string.format("  %s  (unused)", entry.name))
+                total_unused = total_unused + 1
+            end
+        end
+        ::audit_continue::
+    end
+
+    table.insert(lines, "")
+    table.insert(lines, string.format("Total: %d used, %d unused", total_used, total_unused))
+
+    show_floating_window("Suppression Audit", lines)
 end
 
 -- SanityExplain: show a floating window explaining the error type.
