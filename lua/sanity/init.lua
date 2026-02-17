@@ -18,7 +18,7 @@ local last_valgrind_args = nil  -- Raw args string from last :SanityRunValgrind.
 local valgrind_xml_file = nil -- Temp XML file for the active job.
 local valgrind_generation = 0 -- Counter to detect stale async callbacks.
 local suppression_counts = {}  -- name -> count from last valgrind XML run.
-local prev_error_fingerprints = {}  -- Fingerprint set from previous load for diff summary.
+local prev_error_fingerprints = {}  -- Fingerprint bag from previous load for diff summary.
 
 local ns = vim.api.nvim_create_namespace("sanity")
 
@@ -59,16 +59,19 @@ local function error_fingerprint(err)
     return err.kind .. "\0" .. err.source .. "\0" .. ff
 end
 
--- Snapshot the current error set as a fingerprint set.
+-- Snapshot the current error list as a fingerprint bag (multiset).
+-- Each fingerprint maps to its occurrence count so that duplicate errors
+-- are tracked individually rather than collapsed into a set.
 local function snapshot_fingerprints()
     local fps = {}
     for _, err in ipairs(errors) do
-        fps[error_fingerprint(err)] = true
+        local fp = error_fingerprint(err)
+        fps[fp] = (fps[fp] or 0) + 1
     end
     return fps
 end
 
--- Compare current errors against the previous fingerprint set.
+-- Compare current errors against the previous fingerprint bag.
 -- Returns a summary string or nil if there was no previous load.
 local function compute_diff_summary()
     if not next(prev_error_fingerprints) then return nil end
@@ -76,17 +79,17 @@ local function compute_diff_summary()
     local new_count = 0
     local fixed_count = 0
     local unchanged_count = 0
-    for fp, _ in pairs(new_fps) do
-        if prev_error_fingerprints[fp] then
-            unchanged_count = unchanged_count + 1
-        else
-            new_count = new_count + 1
-        end
-    end
-    for fp, _ in pairs(prev_error_fingerprints) do
-        if not new_fps[fp] then
-            fixed_count = fixed_count + 1
-        end
+    -- Collect all fingerprints from both bags.
+    local all_fps = {}
+    for fp in pairs(new_fps) do all_fps[fp] = true end
+    for fp in pairs(prev_error_fingerprints) do all_fps[fp] = true end
+    for fp in pairs(all_fps) do
+        local cur = new_fps[fp] or 0
+        local prev = prev_error_fingerprints[fp] or 0
+        local common = math.min(cur, prev)
+        unchanged_count = unchanged_count + common
+        new_count = new_count + (cur - common)
+        fixed_count = fixed_count + (prev - common)
     end
     return string.format(" (%d new, %d fixed, %d unchanged)", new_count, fixed_count, unchanged_count)
 end
@@ -1636,11 +1639,11 @@ local function parse_suppression_names(filepath)
         if trimmed == "{" then
             in_block = true
         elseif in_block then
-            -- First non-empty line after '{' is the suppression name.
-            if trimmed ~= "" then
+            -- Skip blank lines and comments; first real line is the name.
+            if trimmed ~= "" and not trimmed:match("^#") then
                 table.insert(result, { name = trimmed, line = line_num, file = filepath })
+                in_block = false
             end
-            in_block = false
         end
     end
     fh:close()
