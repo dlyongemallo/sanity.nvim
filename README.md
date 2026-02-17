@@ -61,7 +61,7 @@ To populate the plugin with data, either run `:SanityRunValgrind` (which starts 
 
 `:SanitySuppress` queues a suppression entry for the error at the cursor. `:SanitySaveSuppressions` writes all queued suppressions to disk. When given a filename, the suppressions are appended to that single file. Otherwise, they are partitioned by tool and written to the default files (`.valgrind.supp`, `.lsan.supp`, `.tsan.supp`, configurable via `opts.suppression_files`). Valgrind suppressions are full `{ ... }` blocks with `fun:` entries; sanitizer suppressions use the `type:function` format accepted by LSan and TSan. ASan memory errors (e.g. heap-use-after-free) have no runtime suppression mechanism and are reported as unsuppressible.
 
-`:SanityFilter [<kind> ...]` narrows the quickfix list to errors matching the given kinds (e.g. `Leak_DefinitelyLost`, `Race`). Called with no arguments, it lists the available kinds. `:SanityClearFilter` restores the full list.
+`:SanityFilter [<kind> ...]` narrows the quickfix list to errors matching the given kinds (e.g. `Leak_DefinitelyLost`, `Race`). Called with no arguments, it lists the available kinds and presets. `:SanityClearFilter` restores the full list. Built-in presets: `errors` (invalid access, uninitialised values, overflows), `leaks` (all leak types), `races` (data races), `threading` (all threading-related kinds).
 
 `:SanityDiagnostics` toggles diagnostic virtual text on source lines involved in errors. Pass `on` or `off` to set explicitly.
 

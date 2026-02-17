@@ -21,6 +21,7 @@ local ns = vim.api.nvim_create_namespace("sanity")
 
 local set_diagnostics       -- Forward declaration; defined after populate_quickfix_from_errors.
 local get_available_kinds   -- Forward declaration; defined after format helpers.
+local filter_presets        -- Forward declaration; defined after get_available_kinds.
 
 local function reset_state()
     errors = {}
@@ -96,7 +97,14 @@ function M.setup(opts)
     vim.api.nvim_create_user_command("SanityDiagnostics", M.toggle_diagnostics, { nargs = "?" })
     vim.api.nvim_create_user_command("SanityFilter", M.filter_errors, {
         nargs = "*",
-        complete = function() return get_available_kinds() end,
+        complete = function()
+            local items = get_available_kinds()
+            for name, _ in pairs(filter_presets) do
+                table.insert(items, name)
+            end
+            table.sort(items)
+            return items
+        end,
     })
     vim.api.nvim_create_user_command("SanityClearFilter", M.clear_filter, { nargs = 0 })
     vim.api.nvim_create_user_command("SanityRelated", M.show_related, { nargs = 0 })
@@ -413,6 +421,42 @@ get_available_kinds = function()
     return kinds
 end
 
+-- Preset filter groups that expand to sets of kind prefixes/names.
+filter_presets = {
+    errors = {
+        "InvalidRead", "InvalidWrite", "InvalidFree",
+        "UninitCondition", "UninitValue", "Overlap",
+        "heap-use-after-free", "heap-buffer-overflow", "stack-buffer-overflow",
+    },
+    leaks = {
+        "Leak_",
+    },
+    races = {
+        "Race", "data-race",
+    },
+    threading = {
+        "Race", "data-race", "UnlockUnlocked", "LockOrder",
+        "lock-order-inversion", "signal-unsafe-call",
+    },
+}
+
+-- Expand a list of filter arguments, resolving any preset names.
+local function expand_filter_args(args_list)
+    local result = {}
+    local seen = {}
+    for _, arg in ipairs(args_list) do
+        local preset = filter_presets[arg]
+        local items = preset or { arg }
+        for _, kind in ipairs(items) do
+            if not seen[kind] then
+                seen[kind] = true
+                table.insert(result, kind)
+            end
+        end
+    end
+    return result
+end
+
 -- Check whether an error's kind matches any entry in the active filter.
 local function matches_filter(kind)
     if not current_filter then return true end
@@ -613,7 +657,13 @@ M.filter_errors = function(args)
             vim.notify("No errors loaded.", vim.log.levels.INFO)
             return
         end
+        local preset_names = {}
+        for name, _ in pairs(filter_presets) do
+            table.insert(preset_names, name)
+        end
+        table.sort(preset_names)
         local msg = "Available kinds: " .. table.concat(kinds, ", ")
+            .. "\nPresets: " .. table.concat(preset_names, ", ")
         if current_filter then
             msg = msg .. "\nCurrent filter: " .. table.concat(current_filter, ", ")
         end
@@ -621,14 +671,11 @@ M.filter_errors = function(args)
         return
     end
 
-    local filter_kinds = {}
-    local seen = {}
-    for kind in args.args:gmatch("%S+") do
-        if not seen[kind] then
-            seen[kind] = true
-            table.insert(filter_kinds, kind)
-        end
+    local raw_args = {}
+    for token in args.args:gmatch("%S+") do
+        table.insert(raw_args, token)
     end
+    local filter_kinds = expand_filter_args(raw_args)
     if #filter_kinds == 0 then return end
     current_filter = filter_kinds
     populate_quickfix_from_errors()
