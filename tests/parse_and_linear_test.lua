@@ -13,7 +13,7 @@ describe("stack capture and linear rendering", function()
       return
     end
     T.reset_state()
-    local xml = H.localize_log("examples/memcheck.xml")
+    local xml = H.localize_log("tests/memcheck.xml")
     local count = M.parse_valgrind_xml(xml)
     assert(count and count > 0, "expected parsed errors")
 

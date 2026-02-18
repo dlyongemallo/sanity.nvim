@@ -5,15 +5,15 @@ local H = dofile("tests/helpers.lua")
 
 describe("detect_log_format", function()
   it("identifies valgrind XML", function()
-    assert_eq(T.detect_log_format("examples/memcheck.xml"), "valgrind_xml")
+    assert_eq(T.detect_log_format("tests/memcheck.xml"), "valgrind_xml")
   end)
 
   it("identifies ASAN sanitizer log", function()
-    assert_eq(T.detect_log_format("examples/asan.log"), "sanitizer_log")
+    assert_eq(T.detect_log_format("tests/asan.log"), "sanitizer_log")
   end)
 
   it("identifies TSAN sanitizer log", function()
-    assert_eq(T.detect_log_format("examples/tsan.log"), "sanitizer_log")
+    assert_eq(T.detect_log_format("tests/tsan.log"), "sanitizer_log")
   end)
 
   it("returns nil for unrecognised format", function()
@@ -24,7 +24,7 @@ end)
 describe("parse ASAN log", function()
   it("parses heap-use-after-free from asan.log", function()
     T.reset_state()
-    local log = H.localize_log("examples/asan.log")
+    local log = H.localize_log("tests/asan.log")
     local count = M.parse_sanitizer_log(log)
     assert(count and count > 0, "expected processed lines")
 
@@ -47,7 +47,7 @@ end)
 describe("parse TSAN log", function()
   it("parses three errors from tsan.log", function()
     T.reset_state()
-    local log = H.localize_log("examples/tsan.log")
+    local log = H.localize_log("tests/tsan.log")
     local count = M.parse_sanitizer_log(log)
     assert(count and count > 0, "expected processed lines")
 
@@ -57,7 +57,7 @@ describe("parse TSAN log", function()
 
   it("identifies data-race kind and metadata", function()
     T.reset_state()
-    M.parse_sanitizer_log(H.localize_log("examples/tsan.log"))
+    M.parse_sanitizer_log(H.localize_log("tests/tsan.log"))
 
     local errs = T.errors()
     local race = nil
@@ -77,7 +77,7 @@ describe("parse TSAN log", function()
 
   it("identifies lock-order-inversion kind", function()
     T.reset_state()
-    M.parse_sanitizer_log(H.localize_log("examples/tsan.log"))
+    M.parse_sanitizer_log(H.localize_log("tests/tsan.log"))
 
     local errs = T.errors()
     local lock = nil
@@ -90,7 +90,7 @@ describe("parse TSAN log", function()
 
   it("identifies heap-use-after-free kind", function()
     T.reset_state()
-    M.parse_sanitizer_log(H.localize_log("examples/tsan.log"))
+    M.parse_sanitizer_log(H.localize_log("tests/tsan.log"))
 
     local errs = T.errors()
     local uaf = nil
