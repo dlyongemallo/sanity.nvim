@@ -26,7 +26,6 @@ local ns = vim.api.nvim_create_namespace("sanity")
 local set_diagnostics       -- Forward declaration; defined after populate_quickfix_from_errors.
 local get_available_kinds   -- Forward declaration; defined after format helpers.
 local filter_presets        -- Forward declaration; defined after get_available_kinds.
-local get_priority          -- Forward declaration; defined after populate_quickfix_from_errors.
 
 local function reset_state()
     errors = {}
@@ -576,12 +575,7 @@ local function group_error_frames()
         ::filter_skip::
     end
 
-    table.sort(group_order, function(a, b)
-        local pa = get_priority(groups[a].kind)
-        local pb = get_priority(groups[b].kind)
-        if pa ~= pb then return pa < pb end
-        return a < b
-    end)
+    table.sort(group_order)
     return groups, group_order
 end
 
@@ -659,22 +653,6 @@ local function populate_quickfix_from_errors()
 
     -- Notify plugins (e.g. trouble.nvim) that the quickfix list changed.
     vim.api.nvim_exec_autocmds("QuickFixCmdPost", { pattern = "*" })
-end
-
--- Map error kind to sort priority (lower = more urgent).
-local priority_map = {
-    InvalidRead = 1, InvalidWrite = 1, InvalidFree = 1,
-    ["heap-use-after-free"] = 1, ["heap-buffer-overflow"] = 1, ["stack-buffer-overflow"] = 1,
-    UninitCondition = 2, UninitValue = 2, Overlap = 2,
-    Race = 3, ["data-race"] = 3, UnlockUnlocked = 3, LockOrder = 3,
-    ["lock-order-inversion"] = 3, ["signal-unsafe-call"] = 3,
-    Leak_DefinitelyLost = 4,
-    Leak_PossiblyLost = 5, Leak_IndirectlyLost = 5,
-    Leak_StillReachable = 6,
-}
-
-get_priority = function(kind)
-    return priority_map[kind] or 3
 end
 
 -- Map error kind to diagnostic severity.
@@ -1215,7 +1193,9 @@ M.valgrind_load_xml = function(args)
     local num_errors = M.parse_valgrind_xml(xml_file)
     populate_quickfix_from_errors()
     set_diagnostics()
-    if #qf_error_ids > 0 then vim.cmd("cfirst") end
+    -- Schedule cfirst so it runs after BufReadPost autocmds (e.g.
+    -- last-position-jump) that would otherwise override the cursor.
+    if #qf_error_ids > 0 then vim.schedule(function() vim.cmd("cfirst") end) end
     local msg = "Processed " .. num_errors .. " errors from '" .. xml_file .. "' into " .. #qf_error_ids .. " locations."
     local diff = compute_diff_summary()
     if diff then msg = msg .. diff end
@@ -1241,7 +1221,9 @@ local function load_files(filepaths)
     end
     populate_quickfix_from_errors()
     set_diagnostics()
-    if #qf_error_ids > 0 then vim.cmd("cfirst") end
+    -- Schedule cfirst so it runs after BufReadPost autocmds (e.g.
+    -- last-position-jump) that would otherwise override the cursor.
+    if #qf_error_ids > 0 then vim.schedule(function() vim.cmd("cfirst") end) end
     local msg = "Loaded " .. #errors .. " errors into " .. #qf_error_ids .. " quickfix entries."
     local diff = compute_diff_summary()
     if diff then msg = msg .. diff end
@@ -2916,7 +2898,6 @@ M._test = {
   set_prev_fingerprints = function(fps) prev_error_fingerprints = fps; has_loaded = fps ~= nil end,
   detect_log_format = detect_log_format,
   parse_suppression_names = parse_suppression_names,
-  get_priority = get_priority,
   get_available_kinds = get_available_kinds,
   expand_filter_args = expand_filter_args,
   matches_filter = matches_filter,
