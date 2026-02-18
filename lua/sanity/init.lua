@@ -26,6 +26,7 @@ local ns = vim.api.nvim_create_namespace("sanity")
 local set_diagnostics       -- Forward declaration; defined after populate_quickfix_from_errors.
 local get_available_kinds   -- Forward declaration; defined after format helpers.
 local filter_presets        -- Forward declaration; defined after get_available_kinds.
+local refresh_stack         -- Forward declaration; defined in stack section.
 
 local function reset_state()
     errors = {}
@@ -1240,28 +1241,106 @@ end
 local stack_bufnr = nil       -- Track the stack split buffer for toggling.
 local stack_frame_map = nil   -- buf line number (1-based) -> { file, line }
 
+-- Return (file, line, error_ids) for a quickfix entry index.
+local function get_qf_entry_position(idx)
+    if not idx or idx < 1 then return nil, nil, nil end
+    local ids = qf_error_ids[idx]
+    local fl = qf_file_lines[idx]
+    if fl then return fl.file, fl.line, ids end
+    local qflist = vim.fn.getqflist()
+    local entry = qflist[idx]
+    if not entry or entry.bufnr == 0 then return nil, nil, nil end
+    return vim.api.nvim_buf_get_name(entry.bufnr), entry.lnum, ids
+end
+
+-- True only for the built-in quickfix *window* (not loclist, not wrappers).
+local function is_qflist_window(win)
+    win = win or vim.api.nvim_get_current_win()
+    local info = vim.fn.getwininfo(win)
+    if not info or not info[1] then return false end
+    return info[1].quickfix == 1 and info[1].loclist ~= 1
+end
+
+-- Trouble qflist windows are not native quickfix windows.
+local function is_trouble_like_window(win)
+    win = win or vim.api.nvim_get_current_win()
+    local buf = vim.api.nvim_win_get_buf(win)
+    if vim.bo[buf].filetype == "trouble" then return true end
+    if vim.bo[buf].buftype == "quickfix" and not is_qflist_window(win) then
+        return true
+    end
+    return false
+end
+
+-- A source window is a normal non-floating window showing a source buffer.
+local function is_source_window(win)
+    if not win or not vim.api.nvim_win_is_valid(win) then return false end
+    if vim.api.nvim_win_get_config(win).relative ~= "" then return false end
+    local buf = vim.api.nvim_win_get_buf(win)
+    if not buf or not vim.api.nvim_buf_is_valid(buf) then return false end
+    if vim.bo[buf].buftype ~= "" then return false end
+    if vim.fn.buflisted(buf) ~= 1 then return false end
+    local ft = vim.bo[buf].filetype
+    if ft == "qf" or ft == "trouble" then return false end
+    if stack_bufnr and buf == stack_bufnr then return false end
+    return true
+end
+
+-- Resolve a line in the stack buffer to the nearest frame entry.
+local function get_stack_frame_position(line)
+    if not stack_frame_map then return nil, nil, nil end
+    local info = stack_frame_map[line]
+    if info and info.file then return info.file, info.line, info.error_ids end
+    local max_line = vim.api.nvim_buf_line_count(stack_bufnr)
+    for offset = 1, max_line do
+        local down = line + offset
+        if down <= max_line then
+            local d = stack_frame_map[down]
+            if d and d.file then return d.file, d.line, d.error_ids end
+        end
+        local up = line - offset
+        if up >= 1 then
+            local u = stack_frame_map[up]
+            if u and u.file then return u.file, u.line, u.error_ids end
+        end
+    end
+    return nil, nil, nil
+end
+
 -- Get the current file and line from cursor position or quickfix entry.
 -- Returns (file, line, error_ids). The third value is non-nil only when
--- called from the quickfix window — it carries the error IDs directly so
--- callers can bypass location_index (whose keys may not match Vim's
--- normalised buffer paths).
+-- called from a quickfix-like UI, so callers can bypass location_index
+-- (whose keys may not match Vim's normalized buffer paths).
 local function get_current_position()
-    if vim.bo.buftype == "quickfix" then
-        local idx = vim.fn.line(".")
-        local ids = qf_error_ids[idx]
-        local fl = qf_file_lines[idx]
-        if fl then return fl.file, fl.line, ids end
-        local qflist = vim.fn.getqflist()
-        local entry = qflist[idx]
-        if not entry or entry.bufnr == 0 then return nil, nil end
-        return vim.api.nvim_buf_get_name(entry.bufnr), entry.lnum, ids
+    local win = vim.api.nvim_get_current_win()
+    local buf = vim.api.nvim_win_get_buf(win)
+
+    if stack_bufnr and buf == stack_bufnr then
+        local line = vim.api.nvim_win_get_cursor(win)[1]
+        local file, resolved_line, ids = get_stack_frame_position(line)
+        if file and resolved_line then return file, resolved_line, ids end
+        return nil, nil, nil
     end
-    if stack_bufnr and vim.api.nvim_get_current_buf() == stack_bufnr then
-        local info = stack_frame_map and stack_frame_map[vim.api.nvim_win_get_cursor(0)[1]]
-        if info then return info.file, info.line end
-        return nil, nil
+
+    if is_qflist_window(win) then
+        -- In the real quickfix window, cursor line maps 1:1 to entry index.
+        return get_qf_entry_position(vim.fn.line("."))
     end
-    return vim.api.nvim_buf_get_name(0), vim.api.nvim_win_get_cursor(0)[1]
+
+    if is_trouble_like_window(win) then
+        -- trouble.nvim keeps qflist idx in sync with the selected item.
+        local info = vim.fn.getqflist({ idx = 0 })
+        local file, line, ids = get_qf_entry_position(info and info.idx)
+        if file and line then return file, line, ids end
+        return nil, nil, nil
+    end
+
+    -- Fallback for quickfix-like custom buffers that don't expose wininfo.
+    if vim.bo[buf].buftype == "quickfix" then
+        return get_qf_entry_position(vim.fn.line("."))
+    end
+
+    return vim.api.nvim_buf_get_name(buf), vim.api.nvim_win_get_cursor(win)[1], nil
 end
 
 -- Return the first error at the cursor position, or nil.
@@ -1334,27 +1413,52 @@ local function find_adjacent_frames(file, line, direction)
     return targets
 end
 
--- Jump to a target frame. When in the quickfix window, use :cc to update
--- both the visual cursor and the internal quickfix index (keeping ]q/[q
--- in sync), then return focus to the quickfix window.
+-- Find a normal (non-special) window suitable for editing source files.
+-- Returns the window handle, or nil if none exists.
+local function find_source_win()
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+        if is_source_window(win) then return win end
+    end
+    return nil
+end
+
+-- Jump to a target frame. When in a non-source window (quickfix,
+-- trouble.nvim, etc.), open the file in a source window and return
+-- focus. In the real quickfix window, use :cc to keep ]q/[q in sync.
 local function jump_to_frame(target)
-    if vim.bo.buftype == "quickfix" then
-        local qflist = vim.fn.getqflist()
-        for i, entry in ipairs(qflist) do
-            if entry.bufnr ~= 0 and entry.lnum == target.line
-                and vim.api.nvim_buf_get_name(entry.bufnr) == target.file then
-                vim.cmd("silent " .. i .. "cc")
-                vim.cmd("wincmd p")
-                return
+    local cur_win = vim.api.nvim_get_current_win()
+    local cur_buf = vim.api.nvim_win_get_buf(cur_win)
+    local from_stack_window = stack_bufnr and cur_buf == stack_bufnr
+
+    if not is_source_window(cur_win) then
+        local src_win = find_source_win()
+        if not src_win then return end
+
+        -- In the real quickfix window, try :cc to keep qf idx in sync.
+        if is_qflist_window(cur_win) then
+            local qflist = vim.fn.getqflist()
+            for i, entry in ipairs(qflist) do
+                if entry.bufnr ~= 0 and entry.lnum == target.line
+                    and vim.api.nvim_buf_get_name(entry.bufnr) == target.file then
+                    vim.cmd("silent " .. i .. "cc")
+                    vim.api.nvim_set_current_win(cur_win)
+                    return
+                end
             end
         end
-        -- No matching qf entry; update the source window manually.
-        vim.cmd("wincmd p")
+
+        -- In trouble/special windows, edit in a source window so the list
+        -- buffer is not replaced.
+        vim.api.nvim_set_current_win(src_win)
         vim.cmd("edit " .. vim.fn.fnameescape(target.file))
-        vim.api.nvim_win_set_cursor(0, { target.line, 0 })
-        vim.cmd("wincmd p")
+        vim.api.nvim_win_set_cursor(src_win, { target.line, 0 })
+        if from_stack_window and refresh_stack then
+            refresh_stack(target.file, target.line, target.error_ids)
+        end
+        vim.api.nvim_set_current_win(cur_win)
         return
     end
+
     vim.cmd("edit " .. vim.fn.fnameescape(target.file))
     vim.api.nvim_win_set_cursor(0, { target.line, 0 })
 end
@@ -1364,7 +1468,7 @@ end
 local function navigate_stack(direction)
     -- Keep the quickfix internal index in sync with the cursor so that
     -- ]q/[q continue from the right position after ]s/[s navigation.
-    if vim.bo.buftype == "quickfix" then
+    if is_qflist_window(vim.api.nvim_get_current_win()) then
         vim.fn.setqflist({}, "a", { idx = vim.fn.line(".") })
     end
 
@@ -1833,11 +1937,11 @@ local function find_related_targets(err, file, line, all_errors)
     local targets = {}
     local seen_locs = {}
 
-    local function add_target(f, l, label)
+    local function add_target(f, l, label, ids)
         local key = f .. ":" .. l
         if seen_locs[key] then return end
         seen_locs[key] = true
-        table.insert(targets, { file = f, line = l, label = label })
+        table.insert(targets, { file = f, line = l, label = label, error_ids = ids })
     end
 
     -- Other stacks within the same error at different locations.
@@ -1845,7 +1949,7 @@ local function find_related_targets(err, file, line, all_errors)
         for _, stack in ipairs(err.stacks) do
             local frame = stack.frames[1]
             if frame and (frame.file ~= file or frame.line ~= line) then
-                add_target(frame.file, frame.line, stack.label or err.message)
+                add_target(frame.file, frame.line, stack.label or err.message, { err.id })
             end
         end
     end
@@ -1864,7 +1968,7 @@ local function find_related_targets(err, file, line, all_errors)
                             local frame = other.stacks[1] and other.stacks[1].frames[1]
                             if frame then
                                 add_target(frame.file, frame.line,
-                                    string.format("[%s] %s", other.kind, other.message))
+                                    string.format("[%s] %s", other.kind, other.message), { other.id })
                             end
                             goto next_error
                         end
@@ -2514,7 +2618,16 @@ local function build_stack_content(file, line, error_ids)
 
     local buf_lines = {}
     local frame_map = {}
-    local cursor_line = nil
+    local preferred_ids = {}
+    if error_ids and #error_ids > 0 then
+        for _, id in ipairs(error_ids) do
+            preferred_ids[id] = true
+        end
+    end
+    local cursor_line_preferred = nil
+    local cursor_line_fallback = nil
+    local active_group_has_preferred = false
+    local active_group_error_ids = nil
 
     local function format_frame(prefix, frame)
         local func_col = frame.func or "???"
@@ -2524,15 +2637,26 @@ local function build_stack_content(file, line, error_ids)
 
     local function emit_frame(prefix, frame)
         table.insert(buf_lines, format_frame(prefix, frame))
-        frame_map[#buf_lines] = { file = frame.file, line = frame.line, prefix_bytes = #prefix }
-        if not cursor_line and frame.file == file and frame.line == line then
-            cursor_line = #buf_lines
+        frame_map[#buf_lines] = {
+            file = frame.file,
+            line = frame.line,
+            prefix_bytes = #prefix,
+            error_ids = active_group_error_ids,
+        }
+        if frame.file == file and frame.line == line then
+            if active_group_has_preferred then
+                if not cursor_line_preferred then
+                    cursor_line_preferred = #buf_lines
+                end
+            elseif not cursor_line_fallback then
+                cursor_line_fallback = #buf_lines
+            end
         end
     end
 
     local function emit_label(prefix, text)
         table.insert(buf_lines, prefix .. " " .. text .. ":")
-        frame_map[#buf_lines] = { prefix_bytes = #prefix + 1 }
+        frame_map[#buf_lines] = { prefix_bytes = #prefix + 1, error_ids = active_group_error_ids }
     end
 
     -- Emit a flat (single-stack) list of frames joined with tree chars.
@@ -2564,6 +2688,15 @@ local function build_stack_content(file, line, error_ids)
 
     for ki, kind in ipairs(kind_order) do
         local group_errs = kind_groups[kind]
+        active_group_error_ids = {}
+        active_group_has_preferred = false
+        for _, gerr in ipairs(group_errs) do
+            table.insert(active_group_error_ids, gerr.id)
+            if preferred_ids[gerr.id] then
+                active_group_has_preferred = true
+            end
+        end
+
         if ki > 1 then table.insert(buf_lines, "") end
 
         local header = string.format("[%s] %s", kind, group_errs[1].message)
@@ -2571,6 +2704,7 @@ local function build_stack_content(file, line, error_ids)
             header = header .. string.format(" (+%d more)", #group_errs - 1)
         end
         table.insert(buf_lines, header)
+        frame_map[#buf_lines] = { error_ids = active_group_error_ids }
 
         -- Pool all stacks, deduplicating by frame sequence.
         local raw_stacks = {}
@@ -2600,7 +2734,7 @@ local function build_stack_content(file, line, error_ids)
         end
     end
 
-    return buf_lines, frame_map, cursor_line or 1
+    return buf_lines, frame_map, cursor_line_preferred or cursor_line_fallback or 1
 end
 
 -- Apply syntax highlights to the stack buffer via extmarks.
@@ -2667,7 +2801,7 @@ end
 
 -- Refresh the stack buffer content for a new file:line position.
 -- When there are no errors at the new position, keeps the last stack visible.
-local function refresh_stack(file, line, error_ids)
+refresh_stack = function(file, line, error_ids)
     if not stack_bufnr or not vim.api.nvim_buf_is_valid(stack_bufnr) then return end
 
     local new_key = file .. ":" .. line
