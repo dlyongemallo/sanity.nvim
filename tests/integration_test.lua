@@ -17,7 +17,7 @@ end
 describe("load_files integration", function()
   it("produces a summary message for sanitizer logs", function()
     T.reset_state()
-    T.set_prev_fingerprints({})
+    T.set_prev_fingerprints(nil)
     local log = H.localize_log("examples/asan.log")
     local msgs = capture_notify(function()
       T.load_files({ log })
@@ -31,7 +31,7 @@ describe("load_files integration", function()
 
   it("includes diff summary on second load", function()
     T.reset_state()
-    T.set_prev_fingerprints({})
+    T.set_prev_fingerprints(nil)
     local log = H.localize_log("examples/asan.log")
     -- First load to populate state.
     capture_notify(function()
@@ -46,9 +46,25 @@ describe("load_files integration", function()
     assert(summary:find("%(0 new, 0 fixed, 1 unchanged%)"), "expected all unchanged: " .. summary)
   end)
 
+  it("shows diff after first load produced 0 errors", function()
+    T.reset_state()
+    T.set_prev_fingerprints(nil)
+    -- First load with no files produces 0 errors.
+    capture_notify(function()
+      T.load_files({})
+    end)
+    -- Second load with actual errors should show diff (all new).
+    local log = H.localize_log("examples/asan.log")
+    local msgs = capture_notify(function()
+      T.load_files({ log })
+    end)
+    local summary = msgs[#msgs]
+    assert(summary:find("%(1 new, 0 fixed, 0 unchanged%)"), "expected all-new diff: " .. summary)
+  end)
+
   it("reflects changed errors in diff summary", function()
     T.reset_state()
-    T.set_prev_fingerprints({})
+    T.set_prev_fingerprints(nil)
     local asan_log = H.localize_log("examples/asan.log")
     local tsan_log = H.localize_log("examples/tsan.log")
     -- Load ASAN log first.

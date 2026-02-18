@@ -98,3 +98,45 @@ describe("get_available_kinds", function()
     assert_eq(T.get_available_kinds(), {})
   end)
 end)
+
+describe("quickfix priority ordering", function()
+  it("sorts entries by severity: invalid access before race before leak", function()
+    T.reset_state()
+    T.set_filter(nil)
+    -- Insert in reverse priority order so the test is meaningful.
+    T.new_error("Leak_DefinitelyLost", "bytes lost", "valgrind", {
+      { label = "s", frames = { { func = "alloc", file = "a.c", line = 1 } } },
+    }, {})
+    T.new_error("Race", "data race", "valgrind", {
+      { label = "s", frames = { { func = "worker", file = "b.c", line = 2 } } },
+    }, {})
+    T.new_error("InvalidWrite", "bad write", "valgrind", {
+      { label = "s", frames = { { func = "writer", file = "c.c", line = 3 } } },
+    }, {})
+
+    T.populate_quickfix()
+    local qf = vim.fn.getqflist()
+    assert_eq(#qf, 3)
+    assert(qf[1].text:find("%[InvalidWrite%]"), "expected InvalidWrite first: " .. qf[1].text)
+    assert(qf[2].text:find("%[Race%]"), "expected Race second: " .. qf[2].text)
+    assert(qf[3].text:find("%[Leak_DefinitelyLost%]"), "expected Leak last: " .. qf[3].text)
+  end)
+
+  it("uses lexicographic tiebreak within the same priority", function()
+    T.reset_state()
+    T.set_filter(nil)
+    T.new_error("InvalidWrite", "bad write", "valgrind", {
+      { label = "s", frames = { { func = "w", file = "z.c", line = 9 } } },
+    }, {})
+    T.new_error("InvalidRead", "bad read", "valgrind", {
+      { label = "s", frames = { { func = "r", file = "a.c", line = 1 } } },
+    }, {})
+
+    T.populate_quickfix()
+    local qf = vim.fn.getqflist()
+    assert_eq(#qf, 2)
+    -- Both are priority 1; tiebreak is lexicographic on the group key (file:line:kind).
+    assert(qf[1].text:find("%[InvalidRead%]"), "expected InvalidRead first: " .. qf[1].text)
+    assert(qf[2].text:find("%[InvalidWrite%]"), "expected InvalidWrite second: " .. qf[2].text)
+  end)
+end)
