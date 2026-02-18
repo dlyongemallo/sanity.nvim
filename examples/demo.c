@@ -5,7 +5,7 @@
  * to demonstrate the features of sanity.nvim. DO NOT use this code
  * as a reference for correct programming practices!
  *
- * Compile and run with different tools:
+ * Compile and run with different tools (the create_logs.sh script will do this for you):
  *
  *   # Memcheck (memory errors and leaks)
  *   gcc -g -pthread demo.c -o demo
@@ -22,7 +22,7 @@
  *   gcc -g -fsanitize=thread -pthread demo.c -o demo_tsan
  *   setarch $(uname -m) --addr-no-randomize ./demo_tsan 2> tsan.log
  *
- *   # Open Neovim with sanity.nvim to load and analyze the above logs:
+ * Open Neovim with sanity.nvim to load and analyze the above logs:
  *   nvim -c ":SanityLoadLog memcheck.xml helgrind.xml asan.log tsan.log"
  */
 
