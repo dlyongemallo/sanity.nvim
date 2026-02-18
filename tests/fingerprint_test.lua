@@ -60,12 +60,22 @@ end)
 describe("compute diff summary", function()
   it("returns nil when no previous load exists", function()
     T.reset_state()
-    T.set_prev_fingerprints({})
+    T.set_prev_fingerprints(nil)
     T.new_error("Race", "data race", "valgrind", {
       { label = "s", frames = { { func = "f", file = "a.c", line = 1 } } },
     }, {})
     local result = T.compute_diff_summary()
     assert_eq(result, nil)
+  end)
+
+  it("reports all new when previous load had 0 errors", function()
+    T.reset_state()
+    T.set_prev_fingerprints({})
+    T.new_error("Race", "data race", "valgrind", {
+      { label = "s", frames = { { func = "f", file = "a.c", line = 1 } } },
+    }, {})
+    local result = T.compute_diff_summary()
+    assert_eq(result, " (1 new, 0 fixed, 0 unchanged)")
   end)
 
   it("reports all unchanged when sets are identical", function()

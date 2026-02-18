@@ -18,7 +18,8 @@ local last_valgrind_args = nil  -- Raw args string from last :SanityRunValgrind.
 local valgrind_xml_file = nil -- Temp XML file for the active job.
 local valgrind_generation = 0 -- Counter to detect stale async callbacks.
 local suppression_counts = {}  -- name -> count from last valgrind XML run.
-local prev_error_fingerprints = {}  -- Fingerprint bag from previous load for diff summary.
+local prev_error_fingerprints = nil  -- Fingerprint bag from previous load for diff summary (nil = no previous load).
+local has_loaded = false  -- Whether at least one load has completed.
 
 local ns = vim.api.nvim_create_namespace("sanity")
 
@@ -74,7 +75,7 @@ end
 -- Compare current errors against the previous fingerprint bag.
 -- Returns a summary string or nil if there was no previous load.
 local function compute_diff_summary()
-    if not next(prev_error_fingerprints) then return nil end
+    if prev_error_fingerprints == nil then return nil end
     local new_fps = snapshot_fingerprints()
     local new_count = 0
     local fixed_count = 0
@@ -1205,7 +1206,11 @@ end
 M.valgrind_load_xml = function(args)
     register_keymaps()
     local xml_file = args.args
-    prev_error_fingerprints = snapshot_fingerprints()
+    -- Snapshot previous errors for diff summary. On the very first load,
+    -- has_loaded is false so we skip and compute_diff_summary returns nil.
+    if has_loaded then
+        prev_error_fingerprints = snapshot_fingerprints()
+    end
     reset_state()
     local num_errors = M.parse_valgrind_xml(xml_file)
     populate_quickfix_from_errors()
@@ -1214,12 +1219,15 @@ M.valgrind_load_xml = function(args)
     local msg = "Processed " .. num_errors .. " errors from '" .. xml_file .. "' into " .. #qf_error_ids .. " locations."
     local diff = compute_diff_summary()
     if diff then msg = msg .. diff end
+    has_loaded = true
     vim.notify(msg)
 end
 
 local function load_files(filepaths)
     register_keymaps()
-    prev_error_fingerprints = snapshot_fingerprints()
+    if has_loaded then
+        prev_error_fingerprints = snapshot_fingerprints()
+    end
     reset_state()
     for _, filepath in ipairs(filepaths) do
         local format = detect_log_format(filepath)
@@ -1237,6 +1245,7 @@ local function load_files(filepaths)
     local msg = "Loaded " .. #errors .. " errors into " .. #qf_error_ids .. " quickfix entries."
     local diff = compute_diff_summary()
     if diff then msg = msg .. diff end
+    has_loaded = true
     vim.notify(msg)
 end
 
@@ -1735,13 +1744,19 @@ M.export_errors = function(args)
     end
 
     local json = vim.fn.json_encode(export)
-    local fh = io.open(filename, "w")
+    local fh, open_err = io.open(filename, "w")
     if not fh then
-        vim.notify("Failed to open " .. filename .. " for writing.", vim.log.levels.ERROR)
+        vim.notify(("Failed to open %s for writing: %s"):format(filename, open_err or "unknown error"),
+            vim.log.levels.ERROR)
         return
     end
-    fh:write(json .. "\n")
+    local ok, write_err = fh:write(json .. "\n")
     fh:close()
+    if not ok then
+        vim.notify(("Failed to write to %s: %s"):format(filename, write_err or "unknown error"),
+            vim.log.levels.ERROR)
+        return
+    end
     vim.notify("Exported " .. #export .. " error(s) to " .. filename .. ".")
 end
 
@@ -2898,7 +2913,7 @@ M._test = {
   error_fingerprint = error_fingerprint,
   snapshot_fingerprints = snapshot_fingerprints,
   compute_diff_summary = function() return compute_diff_summary() end,
-  set_prev_fingerprints = function(fps) prev_error_fingerprints = fps end,
+  set_prev_fingerprints = function(fps) prev_error_fingerprints = fps; has_loaded = fps ~= nil end,
   detect_log_format = detect_log_format,
   parse_suppression_names = parse_suppression_names,
   get_priority = get_priority,
@@ -2915,5 +2930,6 @@ M._test = {
   summarize_table_keys = summarize_table_keys,
   merge_meta_sets = merge_meta_sets,
   load_files = load_files,
+  populate_quickfix = populate_quickfix_from_errors,
 }
 return M
