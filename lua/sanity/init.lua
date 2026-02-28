@@ -131,6 +131,7 @@ function M.setup(opts)
     }, opts.suppression_files or {})
     config.valgrind_suppressions = opts.valgrind_suppressions or {}
     config.track_origins = opts.track_origins == nil and "ask" or opts.track_origins
+    config.stack_fold_limit = opts.stack_fold_limit or 6
 
     vim.api.nvim_create_user_command("SanityRunValgrind", M.run_valgrind, { nargs = 1 })
     vim.api.nvim_create_user_command("SanityLoadLog", M.sanity_load_log, {
@@ -2082,6 +2083,31 @@ local function frame_key(frame)
     return frame.file .. ":" .. frame.line
 end
 
+-- Compute the fraction of frame locations shared between 2+ stacks.
+-- Returns 0.0 when no frames are shared, 1.0 when all are shared.
+local function compute_sharing_ratio(stacks)
+    if #stacks < 2 then return 0 end
+    local counts = {}  -- frame_key -> number of stacks containing it
+    local total_unique = 0
+    for _, stack in ipairs(stacks) do
+        local seen = {}
+        for _, frame in ipairs(stack.frames) do
+            local key = frame_key(frame)
+            if not seen[key] then
+                seen[key] = true
+                counts[key] = (counts[key] or 0) + 1
+            end
+        end
+    end
+    local shared = 0
+    for _, c in pairs(counts) do
+        total_unique = total_unique + 1
+        if c >= 2 then shared = shared + 1 end
+    end
+    if total_unique == 0 then return 0 end
+    return shared / total_unique
+end
+
 -- Deduplicate stacks by frame sequence.
 local function dedup_stacks(stacks)
     local seen = {}
@@ -2311,7 +2337,7 @@ end
 
 -- Render the call trie with tree-drawing characters.
 -- Output: deepest frames at top, shallowest at bottom.
-local function render_call_trie(root, common_leaves, emit_frame, emit_label)
+local function render_call_trie(root, common_leaves, emit_frame, emit_label, fold_limit, emit_summary)
     -- UTF-8 tree-drawing characters.
     local TOP   = "\xe2\x94\x8c"  -- ┌
     local MID   = "\xe2\x94\x82"  -- │
@@ -2326,10 +2352,18 @@ local function render_call_trie(root, common_leaves, emit_frame, emit_label)
     local max_depth = 0
 
     -- Compute max depth for common-leaf rendering.
+    -- Linear chains (single-child paths) contribute depth 1 regardless of
+    -- length, since they are rendered flat at the child column.
     local function find_max_depth(node, depth)
         if depth > max_depth then max_depth = depth end
         for _, child in ipairs(node.children) do
-            find_max_depth(child, depth + 1)
+            local terminal = child
+            while #terminal.children == 1 do
+                terminal = terminal.children[1]
+            end
+            -- Chain from child..terminal collapses to depth+1.
+            -- Recurse from terminal at that collapsed depth.
+            find_max_depth(terminal, depth + 1)
         end
     end
     find_max_depth(root, -1)
@@ -2362,9 +2396,17 @@ local function render_call_trie(root, common_leaves, emit_frame, emit_label)
     end
 
     -- Depth of the deepest non-branching descendant from a node.
+    -- Linear chains are collapsed, so single-child paths do not increase depth.
     local function get_leaf_depth(node, depth)
         if #node.children == 0 then return depth end
-        if #node.children == 1 then return get_leaf_depth(node.children[1], depth + 1) end
+        if #node.children == 1 then
+            local terminal = node.children[1]
+            while #terminal.children == 1 do
+                terminal = terminal.children[1]
+            end
+            if #terminal.children == 0 then return depth end
+            return depth
+        end
         return depth
     end
 
@@ -2415,11 +2457,86 @@ local function render_call_trie(root, common_leaves, emit_frame, emit_label)
         return table.concat(parts)
     end
 
+    -- Collect a linear chain starting from node.  Returns an array of trie
+    -- nodes [node, node.children[1], ...] following single-child links, or
+    -- nil when node has != 1 children (no chain to collapse).
+    local function collect_chain(node)
+        if #node.children ~= 1 then return nil end
+        local chain = { node }
+        local cursor = node.children[1]
+        while #cursor.children == 1 do
+            table.insert(chain, cursor)
+            cursor = cursor.children[1]
+        end
+        table.insert(chain, cursor)  -- terminal: 0 or 2+ children
+        return chain
+    end
+
+    -- Emit an interior chain frame at column cd.
+    local function emit_interior_chain_frame(cframe, cd, depth)
+        local ch
+        if not rails[cd] then
+            ch = TOP
+            rails[cd] = true
+        else
+            ch = BRANCH
+        end
+        local has_deeper = false
+        for d = cd + 1, max_depth do
+            if rails[d] then has_deeper = true; break end
+        end
+        local pfx
+        if has_deeper then
+            pfx = make_prefix(cd, ch, CLOSE)
+        else
+            pfx = make_prefix(cd, ch, nil)
+        end
+        pfx = rstrip(pfx)
+        emit_frame(pfx .. "  ", cframe)
+    end
+
+    -- Emit frames for a collapsed chain at column cd.  chain_frames is
+    -- ordered deepest-first (output order).  emit_last handles the final
+    -- frame (the child node from the parent's perspective) which may need
+    -- special rail management.
+    local function emit_chain_frames(chain_frames, cd, depth, emit_last)
+        local nf = #chain_frames
+        -- Fold long chains: show first 2, summary, last 1.
+        -- Require nf > 3 so at least 1 frame is hidden (2 shown + 1 last).
+        if fold_limit and fold_limit > 0 and nf > fold_limit and nf > 3 and emit_summary then
+            -- First 2 interior frames.
+            for fi = 1, 2 do
+                emit_interior_chain_frame(chain_frames[fi], cd, depth)
+            end
+            -- Summary line for the hidden frames.
+            local hidden = {}
+            for fi = 3, nf - 1 do
+                table.insert(hidden, chain_frames[fi])
+            end
+            local ch = BRANCH
+            local pfx = make_prefix(cd, ch, nil)
+            if depth < 0 then pfx = rstrip(pfx) end
+            emit_summary(pfx, hidden, cd)
+            -- Last frame (the child node).
+            emit_last(chain_frames[nf])
+            return
+        end
+        for fi, cframe in ipairs(chain_frames) do
+            if fi == nf then
+                emit_last(cframe)
+            else
+                emit_interior_chain_frame(cframe, cd, depth)
+            end
+        end
+    end
+
     -- Inline DFS rendering.  For each child of a node:
     --   1. Emit labels (introduce the section) at the child's leaf depth.
-    --   2. Recurse into subtree (deeper content).
+    --   2. Recurse into subtree (deeper content), or emit collapsed chain.
     --   3. Emit sub_labels (transition from subtree) at the child's depth.
     --   4. Emit the child's frame at the child's depth.
+    -- When a child starts a linear chain (single-child path), steps 2-4 are
+    -- replaced by flat chain rendering at the child's depth column.
     local function render_node(node, depth)
         local n = #node.children
         for ci, child in ipairs(node.children) do
@@ -2433,127 +2550,231 @@ local function render_call_trie(root, common_leaves, emit_frame, emit_label)
             -- child and the parent has no sub_labels that would keep the
             -- rail open after it).
             local effective_last = is_last and #node.sub_labels == 0
-            local label_closed_rail = false
 
-            -- 1. Labels: introduce this branch's section.
-            for li, lbl in ipairs(child.labels) do
-                local ch
-                -- When the last child is a leaf at root level (depth < 0),
-                -- close the rail so the frame underneath gets plain
-                -- indentation.  At deeper levels the frame itself closes
-                -- the rail with ┌┘ to connect to the parent.
-                if effective_last and depth < 0 and li == #child.labels
-                   and #child.children == 0 then
-                    if rails[ld] then
-                        ch = BOT
-                        rails[ld] = false
+            -- Detect linear chain: child -> ... -> terminal.
+            local chain = collect_chain(child)
+            if chain then
+                -- Build output frames deepest-first, interleaving sub_labels.
+                local terminal = chain[#chain]
+
+                -- 1. Labels on child (entry node of chain).
+                local label_closed_rail = false
+                local chain_is_leaf = (#terminal.children == 0)
+                for li, lbl in ipairs(child.labels) do
+                    local ch
+                    if effective_last and depth < 0 and li == #child.labels
+                       and chain_is_leaf then
+                        if rails[ld] then
+                            ch = BOT
+                            rails[ld] = false
+                        else
+                            ch = BOT
+                        end
+                        label_closed_rail = true
+                    elseif not rails[ld] then
+                        ch = TOP
+                        rails[ld] = true
                     else
-                        ch = BOT
+                        ch = BRANCH
                     end
-                    label_closed_rail = true
-                elseif not rails[ld] then
-                    ch = TOP
-                    rails[ld] = true
-                else
-                    ch = BRANCH
+                    emit_label(make_label_prefix(ld, ch, nil), strip_label(lbl))
                 end
-                emit_label(make_label_prefix(ld, ch, nil), strip_label(lbl))
-            end
 
-            -- 2. Recurse into subtree.
-            render_node(child, cd)
-
-            -- 3. Sub_labels: transition from deeper subtree.
-            --    Close any deeper rails with ┴.
-            for _, sl in ipairs(child.sub_labels) do
-                local ch
-                if not rails[cd] then
-                    ch = TOP
-                    rails[cd] = true
-                else
-                    ch = BRANCH
+                -- 2a. If terminal has children, recurse into its subtree
+                --     at the collapsed depth.
+                if #terminal.children > 0 then
+                    render_node(terminal, cd)
                 end
-                emit_label(make_label_prefix(cd, ch, MERGE), strip_label(sl))
-            end
 
-            -- 4. Emit the child's frame.
-            if effective_last and label_closed_rail then
-                -- Rail was closed by the label.  Emit frame with plain
-                -- indent, opening the parent rail if needed.
-                local open_parent = depth >= 0 and not rails[depth]
-                if open_parent then rails[depth] = true end
-                local parts = {}
-                for d = 0, max_depth do
-                    if d == depth and open_parent then
-                        table.insert(parts, TOP)
+                -- 2b. Collect chain frames deepest-first with sub_labels.
+                --     Chain nodes are [child, ..., terminal] (shallow to deep).
+                --     Output order is deep to shallow.
+                local chain_frames = {}
+                for i = #chain, 1, -1 do
+                    local cnode = chain[i]
+                    -- Emit sub_labels for this chain node.
+                    for _, sl in ipairs(cnode.sub_labels) do
+                        local ch
+                        if not rails[cd] then
+                            ch = TOP
+                            rails[cd] = true
+                        else
+                            ch = BRANCH
+                        end
+                        emit_label(make_label_prefix(cd, ch, MERGE), strip_label(sl))
+                    end
+                    table.insert(chain_frames, cnode.frame)
+                end
+
+                -- 2c. Emit the chain frames.  The last frame (child) gets
+                --     special handling based on effective_last.
+                emit_chain_frames(chain_frames, cd, depth, function(cframe)
+                    -- This is the child's frame (shallowest in chain).
+                    if effective_last and label_closed_rail then
+                        local open_parent = depth >= 0 and not rails[depth]
+                        if open_parent then rails[depth] = true end
+                        local parts = {}
+                        for d = 0, max_depth do
+                            if d == depth and open_parent then
+                                table.insert(parts, TOP)
+                            else
+                                table.insert(parts, rails[d] and MID or " ")
+                            end
+                        end
+                        emit_frame(table.concat(parts) .. "  ", cframe)
+                    elseif effective_last then
+                        if depth >= 0 and not rails[depth] then
+                            rails[depth] = true
+                            local parts = {}
+                            for d = 0, depth - 1 do
+                                table.insert(parts, rails[d] and MID or " ")
+                            end
+                            table.insert(parts, TOP)
+                            table.insert(parts, CLOSE)
+                            rails[cd] = false
+                            for d = cd + 1, max_depth do
+                                table.insert(parts, rails[d] and MID or " ")
+                            end
+                            emit_frame(table.concat(parts) .. "  ", cframe)
+                        else
+                            rails[cd] = false
+                            emit_frame(rstrip(make_prefix(cd, BOT, CLOSE)) .. "  ", cframe)
+                        end
                     else
-                        table.insert(parts, rails[d] and MID or " ")
+                        local ch
+                        if not rails[cd] then
+                            ch = TOP
+                            rails[cd] = true
+                        else
+                            ch = MID
+                        end
+                        local has_deeper = false
+                        for d = cd + 1, max_depth do
+                            if rails[d] then has_deeper = true; break end
+                        end
+                        local pfx
+                        if has_deeper then
+                            pfx = make_prefix(cd, ch, CLOSE)
+                        else
+                            pfx = make_prefix(cd, ch, nil)
+                        end
+                        if depth < 0 then pfx = rstrip(pfx) end
+                        emit_frame(pfx .. "  ", cframe)
                     end
+                end)
+            else
+                -- No chain: original rendering path.
+                local label_closed_rail = false
+
+                -- 1. Labels: introduce this branch's section.
+                for li, lbl in ipairs(child.labels) do
+                    local ch
+                    if effective_last and depth < 0 and li == #child.labels
+                       and #child.children == 0 then
+                        if rails[ld] then
+                            ch = BOT
+                            rails[ld] = false
+                        else
+                            ch = BOT
+                        end
+                        label_closed_rail = true
+                    elseif not rails[ld] then
+                        ch = TOP
+                        rails[ld] = true
+                    else
+                        ch = BRANCH
+                    end
+                    emit_label(make_label_prefix(ld, ch, nil), strip_label(lbl))
                 end
-                emit_frame(table.concat(parts) .. "  ", child.frame)
-            elseif effective_last then
-                -- Last child: close this depth's rail and connect to parent.
-                local is_pass_through_branch =
-                    (n == 1)
-                    and (#child.children > 1)
-                    and (#child.labels == 0)
-                    and (#child.sub_labels == 0)
-                if depth >= 0 and not rails[depth] and not is_pass_through_branch then
-                    rails[depth] = true
+
+                -- 2. Recurse into subtree.
+                render_node(child, cd)
+
+                -- 3. Sub_labels: transition from deeper subtree.
+                --    Close any deeper rails with ┴.
+                for _, sl in ipairs(child.sub_labels) do
+                    local ch
+                    if not rails[cd] then
+                        ch = TOP
+                        rails[cd] = true
+                    else
+                        ch = BRANCH
+                    end
+                    emit_label(make_label_prefix(cd, ch, MERGE), strip_label(sl))
+                end
+
+                -- 4. Emit the child's frame.
+                if effective_last and label_closed_rail then
+                    local open_parent = depth >= 0 and not rails[depth]
+                    if open_parent then rails[depth] = true end
                     local parts = {}
-                    for d = 0, depth - 1 do
-                        table.insert(parts, rails[d] and MID or " ")
-                    end
-                    table.insert(parts, TOP)    -- ┌ at parent depth
-                    table.insert(parts, CLOSE)  -- ┘ at child depth
-                    rails[cd] = false
-                    for d = cd + 1, max_depth do
-                        table.insert(parts, rails[d] and MID or " ")
+                    for d = 0, max_depth do
+                        if d == depth and open_parent then
+                            table.insert(parts, TOP)
+                        else
+                            table.insert(parts, rails[d] and MID or " ")
+                        end
                     end
                     emit_frame(table.concat(parts) .. "  ", child.frame)
-                else
-                    if is_pass_through_branch and depth >= 0 then
-                        -- Show an explicit merge into the shared tail:
-                        -- parent column uses ┌ and child column uses ┴.
+                elseif effective_last then
+                    local is_pass_through_branch =
+                        (n == 1)
+                        and (#child.children > 1)
+                        and (#child.labels == 0)
+                        and (#child.sub_labels == 0)
+                    if depth >= 0 and not rails[depth] and not is_pass_through_branch then
+                        rails[depth] = true
                         local parts = {}
                         for d = 0, depth - 1 do
                             table.insert(parts, rails[d] and MID or " ")
                         end
                         table.insert(parts, TOP)
-                        table.insert(parts, MERGE)
-                        rails[depth] = true
+                        table.insert(parts, CLOSE)
                         rails[cd] = false
                         for d = cd + 1, max_depth do
                             table.insert(parts, rails[d] and MID or " ")
                         end
-                        emit_frame(rstrip(table.concat(parts)) .. "  ", child.frame)
+                        emit_frame(table.concat(parts) .. "  ", child.frame)
                     else
-                        rails[cd] = false
-                        emit_frame(rstrip(make_prefix(cd, BOT, CLOSE)) .. "  ", child.frame)
+                        if is_pass_through_branch and depth >= 0 then
+                            local parts = {}
+                            for d = 0, depth - 1 do
+                                table.insert(parts, rails[d] and MID or " ")
+                            end
+                            table.insert(parts, TOP)
+                            table.insert(parts, MERGE)
+                            rails[depth] = true
+                            rails[cd] = false
+                            for d = cd + 1, max_depth do
+                                table.insert(parts, rails[d] and MID or " ")
+                            end
+                            emit_frame(rstrip(table.concat(parts)) .. "  ", child.frame)
+                        else
+                            rails[cd] = false
+                            emit_frame(rstrip(make_prefix(cd, BOT, CLOSE)) .. "  ", child.frame)
+                        end
                     end
-                end
-            else
-                -- Middle child or deferred close: rail continues.
-                local ch
-                if not rails[cd] then
-                    ch = TOP
-                    rails[cd] = true
                 else
-                    ch = MID
-                end
-                -- Close any leftover deeper rails from the subtree.
-                local has_deeper = false
-                for d = cd + 1, max_depth do
-                    if rails[d] then has_deeper = true; break end
-                end
-                if has_deeper then
-                    local pfx = make_prefix(cd, ch, CLOSE)
-                    if depth < 0 then pfx = rstrip(pfx) end
-                    emit_frame(pfx .. "  ", child.frame)
-                else
-                    local pfx = make_prefix(cd, ch, nil)
-                    if depth < 0 then pfx = rstrip(pfx) end
-                    emit_frame(pfx .. "  ", child.frame)
+                    local ch
+                    if not rails[cd] then
+                        ch = TOP
+                        rails[cd] = true
+                    else
+                        ch = MID
+                    end
+                    local has_deeper = false
+                    for d = cd + 1, max_depth do
+                        if rails[d] then has_deeper = true; break end
+                    end
+                    if has_deeper then
+                        local pfx = make_prefix(cd, ch, CLOSE)
+                        if depth < 0 then pfx = rstrip(pfx) end
+                        emit_frame(pfx .. "  ", child.frame)
+                    else
+                        local pfx = make_prefix(cd, ch, nil)
+                        if depth < 0 then pfx = rstrip(pfx) end
+                        emit_frame(pfx .. "  ", child.frame)
+                    end
                 end
             end
         end
@@ -2675,6 +2896,57 @@ local function build_stack_content(file, line, error_ids)
         end
     end
 
+    -- Emit multiple stacks as flat sections, annotating shared frames with *.
+    local function emit_flat_sections(stacks, shared_keys)
+        local TOP   = "\xe2\x94\x8c"  -- ┌
+        local BRANCH = "\xe2\x94\x9c" -- ├
+        local BOT   = "\xe2\x94\x94"  -- └
+        for si, stack in ipairs(stacks) do
+            if si > 1 then table.insert(buf_lines, "") end
+            if stack.label then
+                emit_label("", strip_label(stack.label))
+            end
+            local nf = #stack.frames
+            for i, fr in ipairs(stack.frames) do
+                -- Emit sub_labels at the transition point.
+                if stack.sub_labels and stack.sub_labels[i] then
+                    emit_label("", strip_label(stack.sub_labels[i]))
+                end
+                local ch
+                if i == 1 and nf > 1 then ch = TOP
+                elseif i == nf and nf > 1 then ch = BOT
+                elseif nf > 1 then ch = BRANCH
+                else ch = " " end
+                local is_shared = shared_keys[frame_key(fr)]
+                local func_col = fr.func or "???"
+                local basename = fr.file:match("[^/]+$") or fr.file
+                local prefix = ch .. "  "
+                local rendered
+                if is_shared then
+                    rendered = string.format("%s%-27s* %s:%d", prefix, func_col, basename, fr.line)
+                else
+                    rendered = string.format("%s%-28s %s:%d", prefix, func_col, basename, fr.line)
+                end
+                table.insert(buf_lines, rendered)
+                frame_map[#buf_lines] = {
+                    file = fr.file,
+                    line = fr.line,
+                    prefix_bytes = #prefix,
+                    error_ids = active_group_error_ids,
+                }
+                if fr.file == file and fr.line == line then
+                    if active_group_has_preferred then
+                        if not cursor_line_preferred then
+                            cursor_line_preferred = #buf_lines
+                        end
+                    elseif not cursor_line_fallback then
+                        cursor_line_fallback = #buf_lines
+                    end
+                end
+            end
+        end
+    end
+
     -- Group errors by kind so same-kind errors are merged into one tree.
     local kind_groups = {}
     local kind_order = {}
@@ -2726,10 +2998,41 @@ local function build_stack_content(file, line, error_ids)
             if #deduped == 1 then
                 -- All stacks collapsed after composition: flat display.
                 emit_flat(deduped[1].frames)
+            elseif #deduped > 2 and compute_sharing_ratio(deduped) < 0.3 then
+                -- Low sharing: flat sections are clearer than a trie.
+                -- Count how many stacks each frame_key appears in,
+                -- deduplicating within each stack so recursive calls
+                -- are not incorrectly marked as shared.
+                local shared_keys = {}
+                for _, st in ipairs(deduped) do
+                    local seen = {}
+                    for _, fr in ipairs(st.frames) do
+                        local key = frame_key(fr)
+                        if not seen[key] then
+                            seen[key] = true
+                            shared_keys[key] = (shared_keys[key] or 0) + 1
+                        end
+                    end
+                end
+                -- Keep only keys appearing in 2+ stacks.
+                for key, cnt in pairs(shared_keys) do
+                    if cnt < 2 then shared_keys[key] = nil end
+                end
+                emit_flat_sections(deduped, shared_keys)
             else
                 local trie_root = build_call_trie(deduped)
                 local common_leaves = factor_common_leaves(trie_root)
-                render_call_trie(trie_root, common_leaves, emit_frame, emit_label)
+                local function emit_fold_summary(prefix, hidden_frames, cd)
+                    local text = string.format("%s  ... (%d more)", prefix, #hidden_frames)
+                    table.insert(buf_lines, text)
+                    frame_map[#buf_lines] = {
+                        prefix_bytes = #prefix,
+                        error_ids = active_group_error_ids,
+                        collapsed_frames = hidden_frames,
+                    }
+                end
+                render_call_trie(trie_root, common_leaves, emit_frame, emit_label,
+                    config.stack_fold_limit, emit_fold_summary)
             end
         end
     end
@@ -2782,6 +3085,19 @@ local function highlight_stack_buf(buf, lines, fmap)
             vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, 0, {
                 end_col = #line, hl_group = "Title",
             })
+        elseif fi and fi.collapsed_frames then
+            -- Collapsed chain summary line: highlight entirely as Comment.
+            local pb = fi.prefix_bytes or 0
+            if pb > 0 then
+                vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, 0, {
+                    end_col = pb, hl_group = "NonText",
+                })
+            end
+            if pb < #line then
+                vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, pb, {
+                    end_col = #line, hl_group = "Comment",
+                })
+            end
         elseif fi then
             -- Label line: tree prefix then label text.
             local pb = fi.prefix_bytes
@@ -2828,6 +3144,72 @@ refresh_stack = function(file, line, error_ids)
 
     -- Reset preview so the next CursorMoved triggers a fresh preview.
     stack_last_preview = ""
+end
+
+-- Expand a collapsed summary line in the stack buffer.
+local function expand_collapsed_line(line_nr)
+    if not stack_bufnr or not vim.api.nvim_buf_is_valid(stack_bufnr) then return end
+    local info = stack_frame_map and stack_frame_map[line_nr]
+    if not info or not info.collapsed_frames then return end
+
+    local frames = info.collapsed_frames
+    local error_ids = info.error_ids
+
+    -- Reuse the prefix from the summary line (up to prefix_bytes).
+    -- The summary line was rendered with the correct rail characters, so
+    -- we extract that prefix and pad it for each expanded frame.
+    local summary_text = vim.api.nvim_buf_get_lines(stack_bufnr, line_nr - 1, line_nr, false)[1] or ""
+    local pb = info.prefix_bytes or 0
+    local prefix = summary_text:sub(1, pb) .. "  "
+
+    local expanded_lines = {}
+    local expanded_entries = {}
+    for _, fr in ipairs(frames) do
+        local func_col = fr.func or "???"
+        local basename = fr.file:match("[^/]+$") or fr.file
+        local rendered = string.format("%s%-28s %s:%d", prefix, func_col, basename, fr.line)
+        table.insert(expanded_lines, rendered)
+        table.insert(expanded_entries, {
+            file = fr.file,
+            line = fr.line,
+            prefix_bytes = #prefix,
+            error_ids = error_ids,
+        })
+    end
+
+    -- Replace the summary line with expanded lines.
+    vim.bo[stack_bufnr].modifiable = true
+    vim.api.nvim_buf_set_lines(stack_bufnr, line_nr - 1, line_nr, false, expanded_lines)
+    vim.bo[stack_bufnr].modifiable = false
+
+    -- Rebuild frame_map: replace the summary entry with expanded entries
+    -- and shift everything after the insertion point.
+    local shift = #expanded_lines - 1
+    local new_map = {}
+    for k, v in pairs(stack_frame_map) do
+        if type(k) == "number" then
+            if k < line_nr then
+                new_map[k] = v
+            elseif k == line_nr then
+                -- This entry is replaced by the expanded entries.
+                goto expand_continue
+            else
+                new_map[k + shift] = v
+            end
+        else
+            new_map[k] = v
+        end
+        ::expand_continue::
+    end
+    -- Insert expanded entries.
+    for i, entry in ipairs(expanded_entries) do
+        new_map[line_nr + i - 1] = entry
+    end
+    stack_frame_map = new_map
+
+    -- Re-highlight the buffer.
+    local all_lines = vim.api.nvim_buf_get_lines(stack_bufnr, 0, -1, false)
+    highlight_stack_buf(stack_bufnr, all_lines, stack_frame_map)
 end
 
 M.sanity_stack = function()
@@ -3009,6 +3391,13 @@ M.sanity_stack = function()
     -- Navigate between frame lines.
     vim.keymap.set("n", "]s", function() jump_to_frame_line(1) end, kopts)
     vim.keymap.set("n", "[s", function() jump_to_frame_line(-1) end, kopts)
+
+    -- Expand collapsed chain summary lines.
+    vim.keymap.set("n", "<Tab>", function()
+        if not stack_win or not vim.api.nvim_win_is_valid(stack_win) then return end
+        local cur = vim.api.nvim_win_get_cursor(stack_win)[1]
+        expand_collapsed_line(cur)
+    end, kopts)
 end
 
 M.sanity_load_log = function(args)
@@ -3049,5 +3438,7 @@ M._test = {
   merge_meta_sets = merge_meta_sets,
   load_files = load_files,
   populate_quickfix = populate_quickfix_from_errors,
+  compute_sharing_ratio = compute_sharing_ratio,
+  set_config = function(key, val) config[key] = val end,
 }
 return M

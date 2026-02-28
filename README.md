@@ -22,6 +22,7 @@ This plugin depends on [xml2lua](https://github.com/manoelcampos/xml2lua). The i
     --   debug      = false,  -- set to a key (e.g., "<a-d>") to enable
     -- },
     -- track_origins = "ask",  -- true (always), false (never), "ask" (prompt on uninit errors)
+    -- stack_fold_limit = 6,  -- fold long call chains in :SanityStack; 0 to disable
     -- valgrind_suppressions = { ".valgrind.supp" },  -- passed as --suppressions= to valgrind
   },
   dependencies = {

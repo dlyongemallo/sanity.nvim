@@ -60,10 +60,10 @@ describe("dag-like join rendering", function()
     )
     assert_eq(lines, {
       "[Race] data race",
-      fmt("  " .. TOP .. HORIZ .. " ", "log_it", "log.c", 5),
-      fmt(TOP .. CLOSE .. "  ", "path_a", "a.c", 10),
+      fmt(" " .. TOP .. HORIZ .. " ", "log_it", "log.c", 5),
+      fmt(TOP .. "  ", "path_a", "a.c", 10),
       fmt(MID .. "  ", "top_a", "top_a.c", 100),
-      fmt(MID .. BOT .. "  ", "path_b", "b.c", 20),
+      fmt(BRANCH .. "  ", "path_b", "b.c", 20),
       fmt(BOT .. "  ", "top_b", "top_b.c", 200),
     })
   end)
