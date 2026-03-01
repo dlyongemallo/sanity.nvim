@@ -631,6 +631,28 @@ local function group_error_frames()
     return groups, group_order
 end
 
+-- Map error kind to diagnostic severity.
+local function get_severity(kind)
+    if kind:match("^Leak_StillReachable") then
+        return vim.diagnostic.severity.INFO
+    elseif kind:match("^Leak_Possibly") or kind:match("^Leak_Indirect") then
+        return vim.diagnostic.severity.WARN
+    else
+        return vim.diagnostic.severity.ERROR
+    end
+end
+
+-- Map error kind to quickfix type character (E/W/I).
+local function get_qf_type(kind)
+    local sev = get_severity(kind)
+    if sev == vim.diagnostic.severity.WARN then
+        return "W"
+    elseif sev == vim.diagnostic.severity.INFO then
+        return "I"
+    end
+    return "E"
+end
+
 -- Populate the quickfix list from the errors array.
 local function populate_quickfix_from_errors()
     local groups, group_order = group_error_frames()
@@ -659,6 +681,7 @@ local function populate_quickfix_from_errors()
             filename = group.file,
             lnum = group.line,
             text = msg,
+            type = get_qf_type(kind),
         })
 
         local ids = {}
@@ -705,17 +728,6 @@ local function populate_quickfix_from_errors()
 
     -- Notify plugins (e.g. trouble.nvim) that the quickfix list changed.
     vim.api.nvim_exec_autocmds("QuickFixCmdPost", { pattern = "*" })
-end
-
--- Map error kind to diagnostic severity.
-local function get_severity(kind)
-    if kind:match("^Leak_StillReachable") then
-        return vim.diagnostic.severity.INFO
-    elseif kind:match("^Leak_Possibly") or kind:match("^Leak_Indirect") then
-        return vim.diagnostic.severity.WARN
-    else
-        return vim.diagnostic.severity.ERROR
-    end
 end
 
 -- Set diagnostics on buffers for all error frames.
@@ -3603,6 +3615,7 @@ M._test = {
   merge_meta_sets = merge_meta_sets,
   load_files = load_files,
   populate_quickfix = populate_quickfix_from_errors,
+  get_qf_type = get_qf_type,
   compute_sharing_ratio = compute_sharing_ratio,
   set_config = function(key, val) config[key] = val end,
 }
