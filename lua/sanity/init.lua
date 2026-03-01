@@ -2923,8 +2923,11 @@ M.sanity_stack = function()
     end
 
     -- CursorMoved autocmd on the stack buffer for live preview.
+    -- nested = true so that :edit inside preview_frame triggers BufReadPost
+    -- and FileType, which are needed for filetype detection and treesitter.
     vim.api.nvim_create_autocmd("CursorMoved", {
         buffer = buf,
+        nested = true,
         callback = function()
             if not stack_win or not vim.api.nvim_win_is_valid(stack_win) then return end
             local cur = vim.api.nvim_win_get_cursor(stack_win)[1]
