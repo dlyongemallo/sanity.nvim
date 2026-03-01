@@ -9,7 +9,7 @@ This plugin depends on [xml2lua](https://github.com/manoelcampos/xml2lua). The i
 ```lua
 {
   'dlyongemallo/sanity.nvim',
-  cmd = { "SanityLoadLog", "SanityRunValgrind", "SanityDebug" },
+  cmd = { "SanityLoadLog", "SanityRunValgrind" },
   opts = {
     -- picker = "fzf-lua",  -- "telescope", "mini.pick", "snacks"; nil to auto-detect
     -- keymaps = {
@@ -55,6 +55,7 @@ The `cmd` field makes lazy.nvim defer loading until one of those commands is fir
 :SanitySaveSuppressions [<file>]
 :SanityAuditSuppressions
 :SanityExport [<file>]
+:SanityDiff
 :SanityDebug
 ```
 
@@ -76,7 +77,7 @@ To populate the plugin with data, either run `:SanityRunValgrind` (which starts 
 
 `:SanityExport [<file>]` writes the current error set to a JSON file (default: `sanity-export.json`). Respects the active filter, so you can export a subset of errors.
 
-When reloading errors (running valgrind again or loading a new log), the notification summary includes a run-to-run diff showing how many errors are new, fixed, or unchanged compared to the previous load.
+When reloading errors (running valgrind again or loading a new log), the notification summary includes a run-to-run diff showing how many errors are new, fixed, or unchanged compared to the previous load. `:SanityDiff` opens a floating window with the full breakdown, listing each error grouped by kind and location so you can see exactly what changed.
 
 Quickfix entries are sorted by severity so critical errors (invalid accesses, buffer overflows) appear first, followed by uninitialised value errors, threading issues, and leaks.
 
@@ -153,6 +154,38 @@ You can also load multiple files at once:
 ```
 
 It is recommended to use the [Trouble](https://github.com/folke/trouble.nvim) plugin to display the quickfix list in a more useful way.
+
+### Run-to-run diff using `:SanityDiff`
+
+The fix-verify loop is the core workflow when using dynamic analysis tools: fix a bug, re-run, and check whether the fix worked and nothing new appeared. `sanity.nvim` tracks this automatically.
+
+Using [examples/demo.c](examples/demo.c) as an example, compile the demo and open it in Neovim:
+
+```bash
+gcc -g -pthread examples/demo.c -o examples/demo
+nvim examples/demo.c
+```
+
+Run valgrind from inside Neovim:
+
+```vim
+:SanityRunValgrind --track-origins=no --tool=memcheck --show-reachable=yes ./examples/demo
+```
+
+The quickfix list fills with errors. Now fix one of the bugs without leaving Neovim -- for instance, the use-after-free in `demonstrate_use_after_free` by removing the read after `free(data)`. Then recompile and re-run from inside Neovim:
+
+```vim
+:!gcc -g -pthread % -o examples/demo
+:SanityRunValgrind --track-origins=no --tool=memcheck --show-reachable=yes ./examples/demo
+```
+
+The diff state lives in memory, so staying in the same Neovim session between runs is required. The notification now includes a diff summary such as `(0 new, 2 fixed, 8 unchanged)`. To see the full picture, run:
+
+```vim
+:SanityDiff
+```
+
+A floating window opens showing exactly which errors are new (`+`), fixed (`-`), and unchanged (`=`), grouped by kind and location. This makes it easy to confirm your fix worked without introducing regressions.
 
 ### Lualine
 
