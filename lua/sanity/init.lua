@@ -2087,19 +2087,31 @@ M.debug_error = function()
         vim.notify("No error at cursor.", vim.log.levels.WARN)
         return
     end
-    if not err.stacks or #err.stacks == 0 or not err.stacks[1].frames or #err.stacks[1].frames == 0 then
-        vim.notify("No stack frames available for this error.", vim.log.levels.WARN)
+    -- Use the cursor's actual position, not the first stack frame.
+    local file, line = get_current_position()
+    if not file or not line then
+        vim.notify("No position to debug.", vim.log.levels.WARN)
         return
     end
-    local frame = err.stacks[1].frames[1]
     local ok, dap = pcall(require, "dap")
     if ok then
-        vim.cmd("edit " .. vim.fn.fnameescape(frame.file))
-        vim.api.nvim_win_set_cursor(0, { frame.line, 0 })
+        local target_win = vim.api.nvim_get_current_win()
+        if not is_source_window(target_win) then
+            target_win = find_source_win()
+            if not target_win then
+                vim.notify("No source window available.", vim.log.levels.WARN)
+                return
+            end
+        end
+        vim.api.nvim_set_current_win(target_win)
+        vim.cmd("edit " .. vim.fn.fnameescape(file))
+        vim.api.nvim_win_set_cursor(target_win, { line, 0 })
         dap.toggle_breakpoint()
-        vim.notify("Breakpoint set at " .. frame.file .. ":" .. frame.line)
+        vim.notify("Breakpoint set at " .. file .. ":" .. line)
     else
-        local gdb_cmd = "break " .. frame.file .. ":" .. frame.line
+        -- Quote the file path so GDB handles spaces and special characters.
+        local gdb_file = file:gsub('"', '\\"')
+        local gdb_cmd = string.format('break "%s":%s', gdb_file, line)
         vim.fn.setreg("+", gdb_cmd)
         vim.notify("GDB command copied to clipboard: " .. gdb_cmd)
     end
