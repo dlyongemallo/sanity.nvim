@@ -95,6 +95,55 @@ local function compute_diff_summary()
     return string.format(" (%d new, %d fixed, %d unchanged)", new_count, fixed_count, unchanged_count)
 end
 
+-- Compute detailed per-error diff between current errors and the previous load.
+-- Returns nil if there is no previous load. Otherwise returns a table with:
+--   new       = list of current error objects not matched in the previous set
+--   fixed     = list of { kind, source, location } for previous errors gone now
+--   unchanged = list of current error objects matched in the previous set
+local function compute_diff_details()
+    if prev_error_fingerprints == nil then return nil end
+
+    -- Copy previous counts so we can decrement as we match.
+    local prev_remaining = {}
+    for fp, count in pairs(prev_error_fingerprints) do
+        prev_remaining[fp] = count
+    end
+
+    local new_errors = {}
+    local unchanged_errors = {}
+
+    for _, err in ipairs(errors) do
+        local fp = error_fingerprint(err)
+        if prev_remaining[fp] and prev_remaining[fp] > 0 then
+            prev_remaining[fp] = prev_remaining[fp] - 1
+            table.insert(unchanged_errors, err)
+        else
+            table.insert(new_errors, err)
+        end
+    end
+
+    -- Remaining previous fingerprints are errors that were fixed.
+    local fixed_entries = {}
+    for fp, count in pairs(prev_remaining) do
+        if count > 0 then
+            local kind, source, location = fp:match("^(.-)%z(.-)%z(.*)$")
+            for _ = 1, count do
+                table.insert(fixed_entries, {
+                    kind = kind or "?",
+                    source = source or "?",
+                    location = location ~= "" and location or nil,
+                })
+            end
+        end
+    end
+
+    return {
+        new = new_errors,
+        fixed = fixed_entries,
+        unchanged = unchanged_errors,
+    }
+end
+
 -- Create an error object, register it, and update location_index.
 local function new_error(kind, message, source, stacks, meta)
     error_id_counter = error_id_counter + 1
@@ -174,6 +223,7 @@ function M.setup(opts)
         complete = "file",
     })
     vim.api.nvim_create_user_command("SanityDebug", M.debug_error, { nargs = 0 })
+    vim.api.nvim_create_user_command("SanityDiff", M.show_diff, { nargs = 0 })
 
     -- Refresh diagnostic columns when a source file is opened.
     vim.api.nvim_create_autocmd("BufReadPost", {
@@ -1090,7 +1140,15 @@ M.run_valgrind = function(args)
         table.insert(cmd, a)
     end
     vim.notify("Running valgrind...", vim.log.levels.INFO)
+    local stderr_lines = {}
     local job_id = vim.fn.jobstart(cmd, {
+        on_stderr = function(_, data)
+            for _, line in ipairs(data) do
+                if line ~= "" then
+                    table.insert(stderr_lines, line)
+                end
+            end
+        end,
         on_exit = function(_, code)
             valgrind_job_id = nil
             vim.schedule(function()
@@ -1098,40 +1156,64 @@ M.run_valgrind = function(args)
                 if generation ~= valgrind_generation then
                     return
                 end
+
+                -- Clear the tracked file before loading so that reset_state()
+                -- (called inside valgrind_load_xml) does not delete the file
+                -- we are about to parse.
+                valgrind_xml_file = nil
+
+                if vim.fn.filereadable(xml_file) ~= 1 then
+                    local msg = "Valgrind did not produce output (exit code " .. code .. ")."
+                    if code == 127 then
+                        msg = "Command not found (exit code 127). Check that valgrind and the target program are installed and on PATH."
+                    elseif code == 126 then
+                        msg = "Permission denied (exit code 126). Check that the target program is executable."
+                    end
+                    if #stderr_lines > 0 then
+                        msg = msg .. "\n" .. table.concat(stderr_lines, "\n")
+                    end
+                    vim.notify(msg, vim.log.levels.ERROR)
+                    vim.fn.delete(xml_file)
+                    return
+                end
+
                 if code ~= 0 then
                     vim.notify("Valgrind exited with code " .. code, vim.log.levels.WARN)
                 end
                 vim.notify("Valgrind completed, loading results...", vim.log.levels.INFO)
-                local ok, err = pcall(M.valgrind_load_xml, { args = xml_file })
+                local ok, load_err = pcall(M.valgrind_load_xml, { args = xml_file })
                 if not ok then
-                    vim.notify("Failed to load valgrind XML: " .. tostring(err), vim.log.levels.ERROR)
+                    vim.notify("Failed to load valgrind XML: " .. tostring(load_err), vim.log.levels.ERROR)
                 end
                 vim.fn.delete(xml_file)
-                valgrind_xml_file = nil
 
                 -- Offer to re-run with --track-origins=yes for uninitialised value errors.
-                if config.track_origins == false then return end
-                if last_valgrind_args and last_valgrind_args:find("%-%-track%-origins") then return end
-                local has_uninit = false
-                for _, err in ipairs(errors) do
-                    if err.kind == "UninitCondition" or err.kind == "UninitValue" then
-                        has_uninit = true
-                        break
-                    end
-                end
-                if not has_uninit then return end
-                local rerun_args = "--track-origins=yes " .. last_valgrind_args
-                if config.track_origins == true then
-                    M.run_valgrind({ args = rerun_args })
-                else
-                    vim.ui.select({ "Yes", "No" }, {
-                        prompt = "Uninitialised value errors found. Re-run with --track-origins=yes?",
-                    }, function(choice)
-                        if choice == "Yes" then
-                            M.run_valgrind({ args = rerun_args })
+                -- Deferred so the scheduled cfirst from valgrind_load_xml runs
+                -- first; otherwise it dismisses the vim.ui.select prompt.
+                vim.schedule(function()
+                    if config.track_origins == false then return end
+                    if last_valgrind_args and last_valgrind_args:find("%-%-track%-origins") then return end
+                    local has_uninit = false
+                    for _, e in ipairs(errors) do
+                        if e.kind == "UninitCondition" or e.kind == "UninitValue" then
+                            has_uninit = true
+                            break
                         end
-                    end)
-                end
+                    end
+                    if not has_uninit then return end
+                    local rerun_args = "--track-origins=yes " .. last_valgrind_args
+                    if config.track_origins == true then
+                        M.run_valgrind({ args = rerun_args })
+                    else
+                        vim.ui.select({ "Yes", "No" }, {
+                            prompt = "Uninitialised value errors found. Re-run with --track-origins=yes?",
+                        }, function(choice)
+                            if choice == "Yes" then
+                                M.run_valgrind({ args = rerun_args })
+                            end
+                        end)
+                    end
+                end)
             end)
         end,
     })
@@ -1845,6 +1927,88 @@ M.export_errors = function(args)
         return
     end
     vim.notify("Exported " .. #export .. " error(s) to " .. filename .. ".")
+end
+
+-- SanityDiff: show a floating window with the detailed run-to-run diff.
+M.show_diff = function()
+    local details = compute_diff_details()
+    if not details then
+        vim.notify("No previous run to compare against. Load or run twice to see a diff.",
+            vim.log.levels.INFO)
+        return
+    end
+
+    -- Group entries by kind + location, returning { {kind, location, count}, ... }.
+    local function group_entries(entries, get_kind_loc)
+        local groups = {}
+        local seen = {}
+        for _, entry in ipairs(entries) do
+            local kind, location = get_kind_loc(entry)
+            local key = kind .. "\0" .. (location or "")
+            if seen[key] then
+                groups[seen[key]].count = groups[seen[key]].count + 1
+            else
+                table.insert(groups, { kind = kind, location = location, count = 1 })
+                seen[key] = #groups
+            end
+        end
+        table.sort(groups, function(a, b)
+            if a.kind ~= b.kind then return a.kind < b.kind end
+            return (a.location or "") < (b.location or "")
+        end)
+        return groups
+    end
+
+    local function error_kind_loc(err)
+        local loc
+        if err.stacks and err.stacks[1] and err.stacks[1].frames and err.stacks[1].frames[1] then
+            local f = err.stacks[1].frames[1]
+            loc = f.file .. ":" .. f.line
+        end
+        return err.kind, loc
+    end
+
+    local function fixed_kind_loc(entry)
+        return entry.kind, entry.location
+    end
+
+    local new_groups = group_entries(details.new, error_kind_loc)
+    local fixed_groups = group_entries(details.fixed, fixed_kind_loc)
+    local unchanged_groups = group_entries(details.unchanged, error_kind_loc)
+
+    local lines = {}
+    local header = string.format("%d new, %d fixed, %d unchanged",
+        #details.new, #details.fixed, #details.unchanged)
+    table.insert(lines, header)
+    table.insert(lines, string.rep("\xe2\x94\x80", vim.fn.strdisplaywidth(header)))
+
+    local function render_groups(groups, prefix)
+        for _, g in ipairs(groups) do
+            local loc = g.location or "unknown location"
+            local suffix = g.count > 1 and string.format(" (x%d)", g.count) or ""
+            table.insert(lines, string.format("  %s [%s] %s%s", prefix, g.kind, loc, suffix))
+        end
+    end
+
+    if #new_groups > 0 then
+        table.insert(lines, "")
+        table.insert(lines, "New:")
+        render_groups(new_groups, "+")
+    end
+
+    if #fixed_groups > 0 then
+        table.insert(lines, "")
+        table.insert(lines, "Fixed:")
+        render_groups(fixed_groups, "-")
+    end
+
+    if #unchanged_groups > 0 then
+        table.insert(lines, "")
+        table.insert(lines, "Unchanged:")
+        render_groups(unchanged_groups, "=")
+    end
+
+    show_floating_window("Run-to-Run Diff", lines)
 end
 
 -- SanityExplain: show a floating window explaining the error type.
@@ -3421,6 +3585,7 @@ M._test = {
   error_fingerprint = error_fingerprint,
   snapshot_fingerprints = snapshot_fingerprints,
   compute_diff_summary = function() return compute_diff_summary() end,
+  compute_diff_details = function() return compute_diff_details() end,
   set_prev_fingerprints = function(fps) prev_error_fingerprints = fps; has_loaded = fps ~= nil end,
   detect_log_format = detect_log_format,
   parse_suppression_names = parse_suppression_names,
