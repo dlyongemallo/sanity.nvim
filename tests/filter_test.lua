@@ -73,6 +73,28 @@ describe("get_available_kinds", function()
   end)
 end)
 
+describe("get_qf_type", function()
+  it("returns E for error-severity kinds", function()
+    assert_eq(T.get_qf_type("InvalidRead"), "E")
+    assert_eq(T.get_qf_type("InvalidWrite"), "E")
+    assert_eq(T.get_qf_type("Leak_DefinitelyLost"), "E")
+    assert_eq(T.get_qf_type("heap-use-after-free"), "E")
+  end)
+
+  it("returns W for warning-severity kinds", function()
+    assert_eq(T.get_qf_type("Leak_PossiblyLost"), "W")
+    assert_eq(T.get_qf_type("Leak_IndirectlyLost"), "W")
+  end)
+
+  it("returns I for info-severity kinds", function()
+    assert_eq(T.get_qf_type("Leak_StillReachable"), "I")
+  end)
+
+  it("returns E for unknown kinds", function()
+    assert_eq(T.get_qf_type("SomethingUnknown"), "E")
+  end)
+end)
+
 describe("quickfix ordering", function()
   it("sorts entries by file and line number", function()
     T.reset_state()
@@ -116,5 +138,26 @@ describe("quickfix ordering", function()
     assert_eq(qf[1].lnum, 99)
     assert_eq(vim.fn.bufname(qf[2].bufnr), "z.c")
     assert_eq(qf[2].lnum, 1)
+  end)
+
+  it("sets type field matching error severity", function()
+    T.reset_state()
+    T.set_filter(nil)
+    T.new_error("InvalidWrite", "bad write", "valgrind", {
+      { label = "s", frames = { { func = "w", file = "t.c", line = 1 } } },
+    }, {})
+    T.new_error("Leak_PossiblyLost", "maybe lost", "valgrind", {
+      { label = "s", frames = { { func = "a", file = "t.c", line = 2 } } },
+    }, {})
+    T.new_error("Leak_StillReachable", "reachable", "valgrind", {
+      { label = "s", frames = { { func = "b", file = "t.c", line = 3 } } },
+    }, {})
+
+    T.populate_quickfix()
+    local qf = vim.fn.getqflist()
+    assert_eq(#qf, 3)
+    assert_eq(qf[1].type, "E")
+    assert_eq(qf[2].type, "W")
+    assert_eq(qf[3].type, "I")
   end)
 end)

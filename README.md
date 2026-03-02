@@ -79,7 +79,7 @@ To populate the plugin with data, either run `:SanityRunValgrind` (which starts 
 
 When reloading errors (running valgrind again or loading a new log), the notification summary includes a run-to-run diff showing how many errors are new, fixed, or unchanged compared to the previous load. `:SanityDiff` opens a floating window with the full breakdown, listing each error grouped by kind and location so you can see exactly what changed.
 
-Quickfix entries are sorted by severity so critical errors (invalid accesses, buffer overflows) appear first, followed by uninitialised value errors, threading issues, and leaks.
+Quickfix entries carry a `type` marker (`E`/`W`/`I`) reflecting error severity. The native quickfix window displays this marker, and plugins (for example, trouble.nvim) can leverage it for severity-based highlighting or sorting.
 
 `:SanityDebug` helps debug the error at the cursor. When [nvim-dap](https://github.com/mfussenegger/nvim-dap) is available, it jumps to the error location and sets a breakpoint. Otherwise, it copies a GDB `break` command to the system clipboard.
 
