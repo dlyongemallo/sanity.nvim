@@ -63,6 +63,7 @@ See the [getting started tutorial](doc/tutorial-getting-started.md) for sanitize
 | `:SanityExport [file]` | optional | Export current errors to JSON (default: `sanity-export.json`); respects active filter. |
 | `:SanityDiff` | none | Show detailed run-to-run diff in a floating window. |
 | `:SanityDebug` | none | Set breakpoint via nvim-dap or copy GDB command to clipboard. |
+| `:SanityWatch [on\|off]` | optional | Toggle file watchers that reload on changes to the last loaded files. |
 
 ## Tutorials
 
