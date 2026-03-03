@@ -4,40 +4,11 @@ local explanations = require("sanity.explanations")
 local S = require("sanity.state")
 local F = require("sanity.format")
 local D = require("sanity.diff")
+local Q = require("sanity.quickfix")
 
-local set_diagnostics       -- Forward declaration; defined after populate_quickfix_from_errors.
 local stop_watching         -- Forward declaration; defined after sanity_stack.
 local start_watching        -- Forward declaration; defined after stop_watching.
-local get_available_kinds   -- Forward declaration; defined after format helpers.
-local filter_presets        -- Forward declaration; defined after get_available_kinds.
 local refresh_stack         -- Forward declaration; defined in stack section.
-
--- Create an error object, register it, and update S.location_index.
-local function new_error(kind, message, source, stacks, meta)
-    S.error_id_counter = S.error_id_counter + 1
-    local err = {
-        id = S.error_id_counter,
-        kind = kind,
-        message = message,
-        source = source,
-        stacks = stacks,
-        meta = meta or {},
-    }
-    table.insert(S.errors, err)
-    S.errors_by_id[err.id] = err
-    for _, stack in ipairs(stacks) do
-        for _, frame in ipairs(stack.frames) do
-            -- Normalise the stored frame path so all consumers and indexes agree.
-            frame.file = F.normalize_path(frame.file)
-            local key = frame.file .. ":" .. frame.line
-            if not S.location_index[key] then
-                S.location_index[key] = {}
-            end
-            table.insert(S.location_index[key], err.id)
-        end
-    end
-    return err
-end
 
 function M.setup(opts)
     opts = opts or {}
@@ -72,8 +43,8 @@ function M.setup(opts)
     vim.api.nvim_create_user_command("SanityFilter", M.filter_errors, {
         nargs = "*",
         complete = function()
-            local items = get_available_kinds()
-            for name, _ in pairs(filter_presets) do
+            local items = Q.get_available_kinds()
+            for name, _ in pairs(Q.filter_presets) do
                 table.insert(items, name)
             end
             table.sort(items)
@@ -105,7 +76,7 @@ function M.setup(opts)
         group = vim.api.nvim_create_augroup("sanity", { clear = true }),
         callback = function(ev)
             if #S.errors > 0 and S.config.diagnostics_enabled then
-                set_diagnostics(ev.buf)
+                Q.set_diagnostics(ev.buf)
             end
         end,
     })
@@ -142,273 +113,15 @@ local function detect_log_format(filepath)
     return nil
 end
 
--- Collect unique error kinds from all loaded errors.
-get_available_kinds = function()
-    local seen = {}
-    local kinds = {}
-    for _, err in ipairs(S.errors) do
-        if not seen[err.kind] then
-            seen[err.kind] = true
-            table.insert(kinds, err.kind)
-        end
-    end
-    table.sort(kinds)
-    return kinds
-end
-
--- Preset filter groups that expand to sets of kind prefixes/names.
-filter_presets = {
-    errors = {
-        "InvalidRead", "InvalidWrite", "InvalidFree",
-        "UninitCondition", "UninitValue", "Overlap",
-        "heap-use-after-free", "heap-buffer-overflow", "stack-buffer-overflow",
-        "use-of-uninitialized-value",
-        "signed-integer-overflow", "division-by-zero", "shift-exponent",
-        "null-pointer-passed-as-argument",
-    },
-    leaks = {
-        "Leak_",
-    },
-    races = {
-        "Race", "data-race",
-    },
-    threading = {
-        "Race", "data-race", "UnlockUnlocked", "LockOrder",
-        "lock-order-inversion", "signal-unsafe-call",
-    },
-}
-
--- Expand a list of filter arguments, resolving any preset names.
-local function expand_filter_args(args_list)
-    local result = {}
-    local seen = {}
-    for _, arg in ipairs(args_list) do
-        local preset = filter_presets[arg]
-        local items = preset or { arg }
-        for _, kind in ipairs(items) do
-            if not seen[kind] then
-                seen[kind] = true
-                table.insert(result, kind)
-            end
-        end
-    end
-    return result
-end
-
--- Check whether an error's kind matches any entry in the active filter.
-local function matches_filter(kind)
-    if not S.current_filter then return true end
-    for _, fk in ipairs(S.current_filter) do
-        if kind == fk or F.starts_with(kind, fk) then
-            return true
-        end
-    end
-    return false
-end
-
--- Group error frames by (file, line, kind), collecting link sets.
--- Each group tracks its errors, file/line, kind, and a link set showing where
--- each frame points in the stack (END for the deepest, ->basename:line otherwise).
--- Returns (groups, group_order) where group_order is sorted by file:line:kind.
-local function group_error_frames()
-    local group_order = {}
-    local groups = {}
-
-    for _, err in ipairs(S.errors) do
-        if not matches_filter(err.kind) then goto filter_skip end
-        for _, stack in ipairs(err.stacks) do
-            for fi, frame in ipairs(stack.frames) do
-                local padded = string.format("%06d", frame.line)
-                local group_key = frame.file .. ":" .. padded .. ":" .. err.kind
-
-                if not groups[group_key] then
-                    groups[group_key] = {
-                        errors = {},
-                        error_id_set = {},
-                        file = frame.file,
-                        line = frame.line,
-                        kind = err.kind,
-                        link_set = {},
-                    }
-                    table.insert(group_order, group_key)
-                end
-
-                local group = groups[group_key]
-
-                if not group.error_id_set[err.id] then
-                    group.error_id_set[err.id] = true
-                    table.insert(group.errors, err)
-                end
-
-                -- Deepest frame (first in array) links to END.
-                -- Each subsequent frame links to the previous frame (one level deeper).
-                if fi == 1 then
-                    group.link_set["END"] = true
-                else
-                    local prev = stack.frames[fi - 1]
-                    local basename = prev.file:match("[^/]+$") or prev.file
-                    local link_key = basename .. ":" .. string.format("%06d", prev.line)
-                    group.link_set["->" .. link_key] = true
-                end
-            end
-        end
-        ::filter_skip::
-    end
-
-    table.sort(group_order)
-    return groups, group_order
-end
-
--- Map error kind to diagnostic severity.
-local function get_severity(kind)
-    if kind:match("^Leak_StillReachable") then
-        return vim.diagnostic.severity.INFO
-    elseif kind:match("^Leak_Possibly") or kind:match("^Leak_Indirect") then
-        return vim.diagnostic.severity.WARN
-    else
-        return vim.diagnostic.severity.ERROR
-    end
-end
-
--- Map error kind to quickfix type character (E/W/I).
-local function get_qf_type(kind)
-    local sev = get_severity(kind)
-    if sev == vim.diagnostic.severity.WARN then
-        return "W"
-    elseif sev == vim.diagnostic.severity.INFO then
-        return "I"
-    end
-    return "E"
-end
-
--- Populate the quickfix list from the errors array.
-local function populate_quickfix_from_errors()
-    local groups, group_order = group_error_frames()
-
-    local qf_entries = {}
-    S.qf_error_ids = {}
-    S.qf_file_lines = {}
-
-    for _, group_key in ipairs(group_order) do
-        local group = groups[group_key]
-        local errs = group.errors
-        local kind = group.kind
-        local source = errs[1].source
-        local links = F.format_link_set(group.link_set)
-
-        local msg
-        if source == "valgrind" then
-            msg = F.format_valgrind_group(kind, errs, links)
-        elseif source == "sanitizer" then
-            msg = F.format_sanitizer_group(kind, errs, links)
-        else
-            msg = kind
-        end
-
-        table.insert(qf_entries, {
-            filename = group.file,
-            lnum = group.line,
-            text = msg,
-            type = get_qf_type(kind),
-        })
-
-        local ids = {}
-        for _, err in ipairs(errs) do
-            table.insert(ids, err.id)
-        end
-        table.insert(S.qf_error_ids, ids)
-        table.insert(S.qf_file_lines, { file = group.file, line = group.line })
-    end
-
-    vim.fn.setqflist(qf_entries, "r")
-
-    -- Deduplicate quickfix entries (for multi-file loads).
-    local qflist = vim.fn.getqflist()
-    local seen = {}
-    local deduped = {}
-    local deduped_ids = {}
-    local deduped_fl = {}
-    for i, entry in ipairs(qflist) do
-        local key = entry.bufnr .. ":" .. entry.lnum .. ":" .. (entry.text or "")
-        if not seen[key] then
-            seen[key] = true
-            table.insert(deduped, entry)
-            if S.qf_error_ids[i] then
-                table.insert(deduped_ids, S.qf_error_ids[i])
-            end
-            if S.qf_file_lines[i] then
-                table.insert(deduped_fl, S.qf_file_lines[i])
-            end
-        end
-    end
-    if #deduped < #qflist then
-        vim.fn.setqflist(deduped, "r")
-        S.qf_error_ids = deduped_ids
-        S.qf_file_lines = deduped_fl
-    end
-
-    -- Set the quickfix title so the active filter is visible in the statusline.
-    local title = "sanity"
-    if S.current_filter then
-        title = title .. " (filter: " .. table.concat(S.current_filter, ", ") .. ")"
-    end
-    vim.fn.setqflist({}, "a", { title = title })
-
-    -- Notify plugins (e.g. trouble.nvim) that the quickfix list changed.
-    vim.api.nvim_exec_autocmds("QuickFixCmdPost", { pattern = "*" })
-end
-
--- Set diagnostics on buffers for all error frames.
--- When only_bufnr is given, only refresh diagnostics for that buffer.
-set_diagnostics = function(only_bufnr)
-    if not S.config.diagnostics_enabled then return end
-
-    local groups, group_order = group_error_frames()
-
-    local buf_diags = {}
-    for _, group_key in ipairs(group_order) do
-        local group = groups[group_key]
-        local bufnr = vim.fn.bufnr(group.file, false)
-        if bufnr == -1 then goto diag_continue end
-        if only_bufnr and bufnr ~= only_bufnr then goto diag_continue end
-        if not buf_diags[bufnr] then
-            buf_diags[bufnr] = {}
-        end
-        -- Use first non-blank column so lsp_lines.nvim arrows align with code.
-        local lnum = group.line - 1  -- Diagnostics use 0-based lines.
-        local col = 0
-        if vim.api.nvim_buf_is_loaded(bufnr) then
-            local lines = vim.api.nvim_buf_get_lines(bufnr, lnum, lnum + 1, false)
-            if lines[1] then
-                col = #(lines[1]:match("^(%s*)") or "")
-            end
-        end
-        local links = F.format_link_set(group.link_set)
-        local msg = string.format("[%s] %s (%s)", group.kind, group.errors[1].message, links)
-        table.insert(buf_diags[bufnr], {
-            lnum = lnum,
-            col = col,
-            message = msg,
-            severity = get_severity(group.kind),
-            source = "sanity",
-        })
-        ::diag_continue::
-    end
-
-    for bufnr, diags in pairs(buf_diags) do
-        vim.diagnostic.set(S.ns, bufnr, diags)
-    end
-end
-
 M.filter_errors = function(args)
     if args.args == "" then
-        local kinds = get_available_kinds()
+        local kinds = Q.get_available_kinds()
         if #kinds == 0 then
             vim.notify("No errors loaded.", vim.log.levels.INFO)
             return
         end
         local preset_names = {}
-        for name, _ in pairs(filter_presets) do
+        for name, _ in pairs(Q.filter_presets) do
             table.insert(preset_names, name)
         end
         table.sort(preset_names)
@@ -425,11 +138,11 @@ M.filter_errors = function(args)
     for token in args.args:gmatch("%S+") do
         table.insert(raw_args, token)
     end
-    local filter_kinds = expand_filter_args(raw_args)
+    local filter_kinds = Q.expand_filter_args(raw_args)
     if #filter_kinds == 0 then return end
     S.current_filter = filter_kinds
-    populate_quickfix_from_errors()
-    set_diagnostics()
+    Q.populate_quickfix_from_errors()
+    Q.set_diagnostics()
     vim.notify("Filter set: " .. table.concat(filter_kinds, ", "), vim.log.levels.INFO)
 end
 
@@ -439,8 +152,8 @@ M.clear_filter = function()
         return
     end
     S.current_filter = nil
-    populate_quickfix_from_errors()
-    set_diagnostics()
+    Q.populate_quickfix_from_errors()
+    Q.set_diagnostics()
     vim.notify("Filter cleared.", vim.log.levels.INFO)
 end
 
@@ -448,14 +161,14 @@ M.toggle_diagnostics = function(args)
     local arg = args.args
     if arg == "on" then
         S.config.diagnostics_enabled = true
-        set_diagnostics()
+        Q.set_diagnostics()
     elseif arg == "off" then
         S.config.diagnostics_enabled = false
         vim.diagnostic.reset(S.ns)
     else
         S.config.diagnostics_enabled = not S.config.diagnostics_enabled
         if S.config.diagnostics_enabled then
-            set_diagnostics()
+            Q.set_diagnostics()
         else
             vim.diagnostic.reset(S.ns)
         end
@@ -559,7 +272,7 @@ M.parse_valgrind_xml = function(xml_file)
         end
 
         if #final_stacks > 0 then
-            new_error(err_kind, message, "valgrind", final_stacks, meta)
+            Q.new_error(err_kind, message, "valgrind", final_stacks, meta)
             num_errors = num_errors + 1
         end
 
@@ -696,7 +409,7 @@ M.parse_sanitizer_log = function(log_file)
     local function finalize_error()
         finalize_stack()
         if #current_stacks > 0 then
-            new_error(current_kind, current_message, "sanitizer", current_stacks, current_meta)
+            Q.new_error(current_kind, current_message, "sanitizer", current_stacks, current_meta)
         end
         current_stacks = {}
         current_meta = {}
@@ -857,7 +570,7 @@ M.parse_ubsan_log = function(log_file)
             })
         end
         if #stacks > 0 then
-            new_error(current_kind, current_message, "sanitizer", stacks, {})
+            Q.new_error(current_kind, current_message, "sanitizer", stacks, {})
             num_errors = num_errors + 1
         end
         current_file = nil
@@ -1109,8 +822,8 @@ M.valgrind_load_xml = function(args)
     pre_load_diff()
     S.reset_state()
     local num_errors = M.parse_valgrind_xml(xml_file)
-    populate_quickfix_from_errors()
-    set_diagnostics()
+    Q.populate_quickfix_from_errors()
+    Q.set_diagnostics()
     -- Schedule cfirst so it runs after BufReadPost autocmds (e.g.
     -- last-position-jump) that would otherwise override the cursor.
     if #S.qf_error_ids > 0 then vim.schedule(function() vim.cmd("cfirst") end) end
@@ -1139,8 +852,8 @@ local function load_files(filepaths)
             vim.notify("Parsed UBSAN log: " .. filepath)
         end
     end
-    populate_quickfix_from_errors()
-    set_diagnostics()
+    Q.populate_quickfix_from_errors()
+    Q.set_diagnostics()
     -- Schedule cfirst so it runs after BufReadPost autocmds (e.g.
     -- last-position-jump) that would otherwise override the cursor.
     if #S.qf_error_ids > 0 then vim.schedule(function() vim.cmd("cfirst") end) end
@@ -1802,7 +1515,7 @@ M.export_errors = function(args)
     -- Build a serializable representation of the error set.
     local export = {}
     for _, err in ipairs(S.errors) do
-        if not matches_filter(err.kind) then goto export_continue end
+        if not Q.matches_filter(err.kind) then goto export_continue end
         table.insert(export, {
             id = err.id,
             kind = err.kind,
@@ -3560,7 +3273,7 @@ end
 
 -- Expose internals for testing behind a single table.
 M._test = {
-  new_error = new_error,
+  new_error = Q.new_error,
   reset_state = S.reset_state,
   build_stack_content = build_stack_content,
   strip_label = strip_label,
@@ -3576,9 +3289,9 @@ M._test = {
   detect_log_format = detect_log_format,
   parse_suppression_names = parse_suppression_names,
   parse_sanitizer_suppression_names = parse_sanitizer_suppression_names,
-  get_available_kinds = get_available_kinds,
-  expand_filter_args = expand_filter_args,
-  matches_filter = matches_filter,
+  get_available_kinds = Q.get_available_kinds,
+  expand_filter_args = Q.expand_filter_args,
+  matches_filter = Q.matches_filter,
   set_filter = function(f) S.current_filter = f end,
   format_link_set = F.format_link_set,
   format_valgrind_group = F.format_valgrind_group,
@@ -3588,8 +3301,8 @@ M._test = {
   summarize_table_keys = F.summarize_table_keys,
   merge_meta_sets = F.merge_meta_sets,
   load_files = load_files,
-  populate_quickfix = populate_quickfix_from_errors,
-  get_qf_type = get_qf_type,
+  populate_quickfix = Q.populate_quickfix_from_errors,
+  get_qf_type = Q.get_qf_type,
   compute_sharing_ratio = compute_sharing_ratio,
   normalize_path = F.normalize_path,
   resolve_path = F.resolve_path,
