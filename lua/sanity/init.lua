@@ -1655,8 +1655,10 @@ local function generate_suppression(err)
             supp_type = "Memcheck:Addr"
         elseif kind == "InvalidFree" then
             supp_type = "Memcheck:Free"
-        elseif kind == "UninitCondition" or kind == "UninitValue" then
+        elseif kind == "UninitCondition" then
             supp_type = "Memcheck:Cond"
+        elseif kind == "UninitValue" then
+            supp_type = "Memcheck:Value"
         elseif kind == "Overlap" then
             supp_type = "Memcheck:Overlap"
         elseif starts_with(kind, "Leak_") then
