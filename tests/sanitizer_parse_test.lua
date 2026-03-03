@@ -102,3 +102,22 @@ describe("parse TSAN log", function()
     assert_eq(uaf.stacks[1].frames[1].line, 137)
   end)
 end)
+
+describe("normalize_path in location_index", function()
+  it("matches errors despite redundant slashes in frame paths", function()
+    T.reset_state()
+    local cwd = vim.fn.getcwd()
+    local file_with_slashes = cwd .. "//src//main.c"
+    local normalised = T.normalize_path(file_with_slashes)
+    T.new_error("InvalidRead", "bad read", "test", {
+      { label = "stack", frames = { { func = "f", file = file_with_slashes, line = 42 } } },
+    }, {})
+    -- The location_index key should use the normalised path.
+    local errs = T.errors()
+    assert_eq(#errs, 1)
+    local key = normalised .. ":42"
+    local li = T.location_index()
+    assert(li[key] and #li[key] > 0, "expected non-empty location_index entry at normalised key: " .. key)
+    assert_eq(li[key][1], errs[1].id)
+  end)
+end)
