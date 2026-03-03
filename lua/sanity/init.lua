@@ -1842,32 +1842,54 @@ local function parse_suppression_names(filepath)
     return result
 end
 
+-- Parse suppression entries from a sanitizer .supp file (TSan/LSan format).
+-- Each non-empty, non-comment line is a suppression entry of the form type:function.
+-- Returns an array of { name = string, line = number, file = string }.
+local function parse_sanitizer_suppression_names(filepath)
+    local fh = io.open(filepath, "r")
+    if not fh then return nil end
+    local result = {}
+    local line_num = 0
+    for line in fh:lines() do
+        line_num = line_num + 1
+        local trimmed = line:match("^%s*(.-)%s*$")
+        if trimmed ~= "" and not trimmed:match("^#") then
+            table.insert(result, { name = trimmed, line = line_num, file = filepath })
+        end
+    end
+    fh:close()
+    return result
+end
+
 -- SanityAuditSuppressions: report which suppressions were used/unused in the last run.
 M.audit_suppressions = function()
-    if vim.tbl_isempty(suppression_counts) then
-        vim.notify("No suppression data available. Run :SanityRunValgrind or load a valgrind XML log first.",
-            vim.log.levels.WARN)
-        return
-    end
-
-    -- Collect suppression files to audit.
-    local files = {}
+    -- Collect valgrind suppression files to audit.
+    local vg_files = {}
     for _, path in ipairs(config.valgrind_suppressions) do
-        table.insert(files, path)
+        table.insert(vg_files, path)
     end
     local default_vg = config.suppression_files.valgrind
     if default_vg and vim.fn.filereadable(default_vg) == 1 then
-        -- Avoid duplicates.
         local already = false
-        for _, f in ipairs(files) do
+        for _, f in ipairs(vg_files) do
             if f == default_vg then already = true; break end
         end
         if not already then
-            table.insert(files, default_vg)
+            table.insert(vg_files, default_vg)
         end
     end
 
-    if #files == 0 then
+    -- Collect sanitizer suppression files (TSan, LSan).
+    local san_files = {}
+    for _, key in ipairs({ "lsan", "tsan" }) do
+        local path = config.suppression_files[key]
+        if path and vim.fn.filereadable(path) == 1 then
+            table.insert(san_files, path)
+        end
+    end
+
+    local has_vg_data = not vim.tbl_isempty(suppression_counts)
+    if #vg_files == 0 and #san_files == 0 then
         vim.notify("No suppression files configured or found.", vim.log.levels.INFO)
         return
     end
@@ -1875,29 +1897,58 @@ M.audit_suppressions = function()
     local lines = {}
     local total_used = 0
     local total_unused = 0
-    for _, filepath in ipairs(files) do
-        local entries = parse_suppression_names(filepath)
+
+    -- Audit valgrind suppression files.
+    if #vg_files > 0 then
+        if not has_vg_data then
+            table.insert(lines, "Valgrind: no suppression count data available.")
+            table.insert(lines, "  Run :SanityRunValgrind or load a valgrind XML log first.")
+            table.insert(lines, "")
+        else
+            for _, filepath in ipairs(vg_files) do
+                local entries = parse_suppression_names(filepath)
+                if not entries then
+                    table.insert(lines, "Could not read: " .. filepath)
+                    goto audit_vg_continue
+                end
+                table.insert(lines, filepath .. ":")
+                for _, entry in ipairs(entries) do
+                    local count = suppression_counts[entry.name]
+                    if count and count > 0 then
+                        table.insert(lines, string.format("  %s  (used %d time%s)",
+                            entry.name, count, count == 1 and "" or "s"))
+                        total_used = total_used + 1
+                    else
+                        table.insert(lines, string.format("  %s  (unused)", entry.name))
+                        total_unused = total_unused + 1
+                    end
+                end
+                ::audit_vg_continue::
+            end
+        end
+    end
+
+    -- Audit sanitizer suppression files (TSan/LSan).
+    for _, filepath in ipairs(san_files) do
+        local entries = parse_sanitizer_suppression_names(filepath)
         if not entries then
             table.insert(lines, "Could not read: " .. filepath)
-            goto audit_continue
+            goto audit_san_continue
+        end
+        if #lines > 0 and lines[#lines] ~= "" then
+            table.insert(lines, "")
         end
         table.insert(lines, filepath .. ":")
         for _, entry in ipairs(entries) do
-            local count = suppression_counts[entry.name]
-            if count and count > 0 then
-                table.insert(lines, string.format("  %s  (used %d time%s)",
-                    entry.name, count, count == 1 and "" or "s"))
-                total_used = total_used + 1
-            else
-                table.insert(lines, string.format("  %s  (unused)", entry.name))
-                total_unused = total_unused + 1
-            end
+            table.insert(lines, string.format("  %s  (usage data not available)", entry.name))
         end
-        ::audit_continue::
+        ::audit_san_continue::
     end
 
-    table.insert(lines, "")
-    table.insert(lines, string.format("Total: %d used, %d unused", total_used, total_unused))
+    if has_vg_data and #vg_files > 0 then
+        table.insert(lines, "")
+        table.insert(lines, string.format("Valgrind: %d used, %d unused", total_used, total_unused))
+    end
 
     show_floating_window("Suppression Audit", lines)
 end
@@ -3615,6 +3666,7 @@ M._test = {
   set_prev_fingerprints = function(fps) prev_error_fingerprints = fps; has_loaded = fps ~= nil end,
   detect_log_format = detect_log_format,
   parse_suppression_names = parse_suppression_names,
+  parse_sanitizer_suppression_names = parse_sanitizer_suppression_names,
   get_available_kinds = get_available_kinds,
   expand_filter_args = expand_filter_args,
   matches_filter = matches_filter,
