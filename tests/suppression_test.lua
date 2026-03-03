@@ -27,6 +27,29 @@ describe("generate_suppression", function()
     assert(text:find("match%-leak%-kinds: definite"), "expected match-leak-kinds: definite")
   end)
 
+  it("generates valgrind Memcheck:Cond for UninitCondition", function()
+    T.reset_state()
+    local err = T.new_error("UninitCondition", "Conditional jump", "valgrind", {
+      { label = "stack", frames = { { func = "check", file = "a.c", line = 1 } } },
+    }, {})
+    local text, tool = T.generate_suppression(err)
+    assert(text, "expected suppression text")
+    assert_eq(tool, "valgrind")
+    assert(text:find("Memcheck:Cond"), "expected Memcheck:Cond")
+  end)
+
+  it("generates valgrind Memcheck:Value for UninitValue", function()
+    T.reset_state()
+    local err = T.new_error("UninitValue", "Use of uninitialised value", "valgrind", {
+      { label = "stack", frames = { { func = "compute", file = "a.c", line = 1 } } },
+    }, {})
+    local text, tool = T.generate_suppression(err)
+    assert(text, "expected suppression text")
+    assert_eq(tool, "valgrind")
+    assert(text:find("Memcheck:Value"), "expected Memcheck:Value")
+    assert(not text:find("Memcheck:Cond"), "must not use Memcheck:Cond for UninitValue")
+  end)
+
   it("generates valgrind Helgrind:Race for Race", function()
     T.reset_state()
     local err = T.new_error("Race", "data race", "valgrind", {
