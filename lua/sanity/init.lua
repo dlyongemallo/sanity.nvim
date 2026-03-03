@@ -3,6 +3,7 @@ local pickers = require("sanity.pickers")
 local explanations = require("sanity.explanations")
 local S = require("sanity.state")
 local F = require("sanity.format")
+local D = require("sanity.diff")
 
 local set_diagnostics       -- Forward declaration; defined after populate_quickfix_from_errors.
 local stop_watching         -- Forward declaration; defined after sanity_stack.
@@ -10,100 +11,6 @@ local start_watching        -- Forward declaration; defined after stop_watching.
 local get_available_kinds   -- Forward declaration; defined after format helpers.
 local filter_presets        -- Forward declaration; defined after get_available_kinds.
 local refresh_stack         -- Forward declaration; defined in stack section.
-
--- Build a fingerprint for an error: kind + source + first frame location.
-local function error_fingerprint(err)
-    local ff = ""
-    if err.stacks and err.stacks[1] and err.stacks[1].frames and err.stacks[1].frames[1] then
-        local f = err.stacks[1].frames[1]
-        ff = f.file .. ":" .. f.line
-    end
-    return err.kind .. "\0" .. err.source .. "\0" .. ff
-end
-
--- Snapshot the current error list as a fingerprint bag (multiset).
--- Each fingerprint maps to its occurrence count so that duplicate errors
--- are tracked individually rather than collapsed into a set.
-local function snapshot_fingerprints()
-    local fps = {}
-    for _, err in ipairs(S.errors) do
-        local fp = error_fingerprint(err)
-        fps[fp] = (fps[fp] or 0) + 1
-    end
-    return fps
-end
-
--- Compare current errors against the previous fingerprint bag.
--- Returns a summary string or nil if there was no previous load.
-local function compute_diff_summary()
-    if S.prev_error_fingerprints == nil then return nil end
-    local new_fps = snapshot_fingerprints()
-    local new_count = 0
-    local fixed_count = 0
-    local unchanged_count = 0
-    -- Collect all fingerprints from both bags.
-    local all_fps = {}
-    for fp in pairs(new_fps) do all_fps[fp] = true end
-    for fp in pairs(S.prev_error_fingerprints) do all_fps[fp] = true end
-    for fp in pairs(all_fps) do
-        local cur = new_fps[fp] or 0
-        local prev = S.prev_error_fingerprints[fp] or 0
-        local common = math.min(cur, prev)
-        unchanged_count = unchanged_count + common
-        new_count = new_count + (cur - common)
-        fixed_count = fixed_count + (prev - common)
-    end
-    return string.format(" (%d new, %d fixed, %d unchanged)", new_count, fixed_count, unchanged_count)
-end
-
--- Compute detailed per-error diff between current errors and the previous load.
--- Returns nil if there is no previous load. Otherwise returns a table with:
---   new       = list of current error objects not matched in the previous set
---   fixed     = list of { kind, source, location } for previous errors gone now
---   unchanged = list of current error objects matched in the previous set
-local function compute_diff_details()
-    if S.prev_error_fingerprints == nil then return nil end
-
-    -- Copy previous counts so we can decrement as we match.
-    local prev_remaining = {}
-    for fp, count in pairs(S.prev_error_fingerprints) do
-        prev_remaining[fp] = count
-    end
-
-    local new_errors = {}
-    local unchanged_errors = {}
-
-    for _, err in ipairs(S.errors) do
-        local fp = error_fingerprint(err)
-        if prev_remaining[fp] and prev_remaining[fp] > 0 then
-            prev_remaining[fp] = prev_remaining[fp] - 1
-            table.insert(unchanged_errors, err)
-        else
-            table.insert(new_errors, err)
-        end
-    end
-
-    -- Remaining previous fingerprints are errors that were fixed.
-    local fixed_entries = {}
-    for fp, count in pairs(prev_remaining) do
-        if count > 0 then
-            local kind, source, location = fp:match("^(.-)%z(.-)%z(.*)$")
-            for _ = 1, count do
-                table.insert(fixed_entries, {
-                    kind = kind or "?",
-                    source = source or "?",
-                    location = location ~= "" and location or nil,
-                })
-            end
-        end
-    end
-
-    return {
-        new = new_errors,
-        fixed = fixed_entries,
-        unchanged = unchanged_errors,
-    }
-end
 
 -- Create an error object, register it, and update S.location_index.
 local function new_error(kind, message, source, stacks, meta)
@@ -1208,7 +1115,7 @@ M.valgrind_load_xml = function(args)
     -- last-position-jump) that would otherwise override the cursor.
     if #S.qf_error_ids > 0 then vim.schedule(function() vim.cmd("cfirst") end) end
     local msg = "Processed " .. num_errors .. " errors from '" .. xml_file .. "' into " .. #S.qf_error_ids .. " locations."
-    local diff = compute_diff_summary()
+    local diff = D.compute_diff_summary()
     if diff then msg = msg .. diff end
     S.has_loaded = true
     save_snapshot()
@@ -1238,7 +1145,7 @@ local function load_files(filepaths)
     -- last-position-jump) that would otherwise override the cursor.
     if #S.qf_error_ids > 0 then vim.schedule(function() vim.cmd("cfirst") end) end
     local msg = "Loaded " .. #S.errors .. " errors into " .. #S.qf_error_ids .. " quickfix entries."
-    local diff = compute_diff_summary()
+    local diff = D.compute_diff_summary()
     if diff then msg = msg .. diff end
     S.has_loaded = true
     S.last_loaded_files = filepaths
@@ -1926,7 +1833,7 @@ end
 
 -- SanityDiff: show a floating window with the detailed run-to-run diff.
 M.show_diff = function()
-    local details = compute_diff_details()
+    local details = D.compute_diff_details()
     if not details then
         vim.notify("No previous run to compare against. Load or run twice to see a diff.",
             vim.log.levels.INFO)
@@ -3661,10 +3568,10 @@ M._test = {
   generate_suppression = generate_suppression,
   errors = function() return S.errors end,
   location_index = function() return S.location_index end,
-  error_fingerprint = error_fingerprint,
-  snapshot_fingerprints = snapshot_fingerprints,
-  compute_diff_summary = function() return compute_diff_summary() end,
-  compute_diff_details = function() return compute_diff_details() end,
+  error_fingerprint = D.error_fingerprint,
+  snapshot_fingerprints = D.snapshot_fingerprints,
+  compute_diff_summary = function() return D.compute_diff_summary() end,
+  compute_diff_details = function() return D.compute_diff_details() end,
   set_prev_fingerprints = function(fps) S.prev_error_fingerprints = fps; S.has_loaded = fps ~= nil end,
   detect_log_format = detect_log_format,
   parse_suppression_names = parse_suppression_names,
