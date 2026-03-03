@@ -1,0 +1,6 @@
+/home/user/project/examples/demo.c:55:15: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
+    #0 0x555555555200 in overflow_add /home/user/project/examples/demo.c:55
+    #1 0x555555555400 in main /home/user/project/examples/demo.c:120
+    #2 0x7ffff7a3a249 in __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58
+
+/home/user/project/examples/demo.c:72:10: runtime error: null pointer passed as argument 1, which is declared to never be null

@@ -156,6 +156,42 @@ local M = {
             "Use sigaction with SA_RESTART where appropriate.",
         },
     },
+    ["signed-integer-overflow"] = {
+        title = "Signed Integer Overflow",
+        description = "An arithmetic operation on signed integers produced a result that " ..
+            "cannot be represented in the type. This is undefined behaviour in C/C++.",
+        common_fixes = {
+            "Use a wider integer type for the computation.",
+            "Add overflow checks before the arithmetic.",
+            "Use unsigned types if wrapping semantics are intended.",
+        },
+    },
+    ["null-pointer-passed-as-argument"] = {
+        title = "Null Pointer Argument",
+        description = "A null pointer was passed to a function parameter that is declared " ..
+            "to never be null (e.g. via __attribute__((nonnull)) or _Nonnull).",
+        common_fixes = {
+            "Check the pointer for NULL before passing it.",
+            "Ensure the caller's logic guarantees a valid pointer.",
+        },
+    },
+    ["shift-exponent"] = {
+        title = "Invalid Shift Exponent",
+        description = "A shift operation used an exponent that is negative or too large " ..
+            "for the type width. This is undefined behaviour.",
+        common_fixes = {
+            "Clamp or validate the shift amount before use.",
+            "Use unsigned types for the shift operand.",
+        },
+    },
+    ["division-by-zero"] = {
+        title = "Division by Zero",
+        description = "An integer division or modulo operation had a divisor of zero.",
+        common_fixes = {
+            "Check the divisor for zero before dividing.",
+            "Handle the zero case as a special path.",
+        },
+    },
     ["use-of-uninitialized-value"] = {
         title = "Use of Uninitialised Value (MSAN)",
         description = "MemorySanitizer detected a read of memory that was never written to. " ..

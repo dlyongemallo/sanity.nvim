@@ -91,6 +91,18 @@ nvim program.c
 :SanityLoadLog msan.log
 ```
 
+UndefinedBehaviorSanitizer catches undefined behaviour such as signed integer overflow, null pointer dereferences, and invalid shifts. For best results, enable stack traces:
+
+```bash
+gcc -g -fsanitize=undefined -fno-omit-frame-pointer program.c -o ./program
+UBSAN_OPTIONS=print_stacktrace=1 ./program 2> ubsan.log
+nvim program.c
+```
+
+```vim
+:SanityLoadLog ubsan.log
+```
+
 ## Loading multiple files
 
 `:SanityLoadLog` auto-detects the file format (`valgrind` XML or sanitizer log) and accepts multiple files:

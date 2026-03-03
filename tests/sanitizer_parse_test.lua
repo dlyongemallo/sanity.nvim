@@ -103,6 +103,53 @@ describe("parse TSAN log", function()
   end)
 end)
 
+describe("detect_log_format for UBSAN", function()
+  it("identifies UBSAN log", function()
+    assert_eq(T.detect_log_format("tests/ubsan.log"), "ubsan_log")
+  end)
+end)
+
+describe("parse UBSAN log", function()
+  it("parses signed-integer-overflow with stack frames", function()
+    T.reset_state()
+    local log = H.localize_log("tests/ubsan.log")
+    local count = M.parse_ubsan_log(log)
+    assert(count and count > 0, "expected parsed errors")
+
+    local errs = T.errors()
+    assert(#errs >= 1, "expected at least 1 error")
+
+    local overflow = nil
+    for _, e in ipairs(errs) do
+      if e.kind == "signed-integer-overflow" then overflow = e; break end
+    end
+    assert(overflow, "expected signed-integer-overflow error")
+    assert_eq(overflow.source, "sanitizer")
+
+    -- Should have parsed stack frames.
+    local s1 = overflow.stacks[1].frames
+    assert(#s1 >= 1, "expected at least one frame")
+    assert_eq(s1[1].func, "overflow_add")
+    assert_eq(s1[1].line, 55)
+  end)
+
+  it("parses null-pointer error without stack frames", function()
+    T.reset_state()
+    local log = H.localize_log("tests/ubsan.log")
+    M.parse_ubsan_log(log)
+
+    local errs = T.errors()
+    local null_err = nil
+    for _, e in ipairs(errs) do
+      if e.kind == "null-pointer-passed-as-argument" then null_err = e; break end
+    end
+    assert(null_err, "expected null-pointer-passed-as-argument error")
+    -- Should have a single-frame stack from the header location.
+    assert_eq(#null_err.stacks, 1)
+    assert_eq(null_err.stacks[1].frames[1].line, 72)
+  end)
+end)
+
 describe("detect_log_format for MSAN", function()
   it("identifies MSAN sanitizer log", function()
     assert_eq(T.detect_log_format("tests/msan.log"), "sanitizer_log")
