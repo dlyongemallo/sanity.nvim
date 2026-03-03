@@ -16,40 +16,6 @@ describe("starts_with", function()
   end)
 end)
 
-describe("ipairs_safe", function()
-  it("iterates numeric keys in order", function()
-    local result = {}
-    for k, v in T.ipairs_safe({ [1] = "a", [2] = "b", [3] = "c" }) do
-      table.insert(result, k .. "=" .. v)
-    end
-    assert_eq(result, { "1=a", "2=b", "3=c" })
-  end)
-
-  it("iterates string-numeric keys in order", function()
-    local result = {}
-    for k, v in T.ipairs_safe({ ["2"] = "b", ["1"] = "a", ["3"] = "c" }) do
-      table.insert(result, k .. "=" .. v)
-    end
-    assert_eq(result, { "1=a", "2=b", "3=c" })
-  end)
-
-  it("returns empty iterator for non-table input", function()
-    local count = 0
-    for _ in T.ipairs_safe("not a table") do
-      count = count + 1
-    end
-    assert_eq(count, 0)
-  end)
-
-  it("returns empty iterator for nil input", function()
-    local count = 0
-    for _ in T.ipairs_safe(nil) do
-      count = count + 1
-    end
-    assert_eq(count, 0)
-  end)
-end)
-
 describe("summarize_rw", function()
   it("returns read for read-only set", function()
     assert_eq(T.summarize_rw({ read = true }), "read")

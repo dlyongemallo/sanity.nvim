@@ -251,43 +251,6 @@ local function starts_with(str, start)
     return str:sub(1, #start) == start
 end
 
--- Iterate over a table in numeric key order.
--- xml2lua creates tables with numeric keys, but pairs() doesn't preserve order.
--- Handles both numeric keys (1, 2, 3) and string keys ("1", "2", "3").
-local function ipairs_safe(t)
-    if type(t) ~= "table" then
-        return function() end
-    end
-    local numeric_keys = {}
-    local other_keys = {}
-    for k in pairs(t) do
-        local num = tonumber(k)
-        if num then
-            table.insert(numeric_keys, { key = k, num = num })
-        else
-            table.insert(other_keys, k)
-        end
-    end
-    -- Sort numeric keys by their numeric value.
-    table.sort(numeric_keys, function(a, b) return a.num < b.num end)
-    -- Build final key list: numeric keys first (in order), then other keys.
-    local keys = {}
-    for _, entry in ipairs(numeric_keys) do
-        table.insert(keys, entry.key)
-    end
-    for _, k in ipairs(other_keys) do
-        table.insert(keys, k)
-    end
-    local i = 0
-    return function()
-        i = i + 1
-        local k = keys[i]
-        if k then
-            return k, t[k]
-        end
-    end
-end
-
 local summarize_rw = function(rw)
     local has_read = false
     local has_write = false
@@ -842,42 +805,52 @@ M.toggle_diagnostics = function(args)
     end
 end
 
--- Parse a valgrind XML file into structured error objects.
-M.parse_valgrind_xml = function(xml_file)
-    local xml2lua = require("xml2lua")
-    -- Create a fresh handler each call to avoid xml2lua's repeated-parse bug.
-    local handler = require("xmlhandler.tree"):new()
+-- Unescape the five predefined XML entities.
+local function xml_unescape(s)
+    s = s:gsub("&lt;", "<")
+    s = s:gsub("&gt;", ">")
+    s = s:gsub("&amp;", "&")
+    s = s:gsub("&quot;", '"')
+    s = s:gsub("&apos;", "'")
+    return s
+end
 
-    local parser = xml2lua.parser(handler)
-    local ok, parse_err = pcall(function()
-        parser:parse(xml2lua.loadFile(xml_file))
-    end)
-    if not ok then
-        vim.notify("Failed to parse XML: " .. tostring(parse_err), vim.log.levels.ERROR)
+-- Parse a valgrind XML file into structured error objects.
+-- Uses a line-by-line state machine instead of a full XML library.
+M.parse_valgrind_xml = function(xml_file)
+    local fh = io.open(xml_file, "r")
+    if not fh then
+        vim.notify("Failed to open XML file: " .. xml_file, vim.log.levels.ERROR)
         return 0
     end
-
-    local output = handler.root.valgrindoutput
-    local error_list = output.error
-    if error_list and #error_list <= 1 then
-        -- xml2lua doesn't wrap single-element lists in an array.
-        error_list = { error_list }
-    end
-    if not error_list then return 0 end
 
     local cwd = vim.fn.getcwd()
     local num_errors = 0
 
-    for _, e in pairs(error_list) do
-        if not e.kind then goto not_error_continue end
-        if not e.stack then goto not_error_continue end
+    -- Element nesting stack (tag names).
+    local name_stack = {}
+    -- Per-error state.
+    local err_kind = nil
+    local err_message = nil
+    local err_auxwhats = {}
+    -- Per-frame state.
+    local frame_ip = nil
+    local frame_fn = nil
+    local frame_dir = nil
+    local frame_file = nil
+    local frame_line = nil
+    -- Per-stack state.
+    local stack_frames = {}
+    -- Per-error stacks.
+    local err_stacks_raw = {}  -- { frames = { ... } } for each stack
+    -- Per-suppcount pair state.
+    local pair_name = nil
+    local pair_count = nil
 
-        local message = ""
-        if e.what then
-            message = e.what
-        elseif e.xwhat then
-            message = e.xwhat.text
-        end
+    -- Emit a completed error.
+    local function emit_error()
+        if not err_kind then return end
+        local message = err_message or ""
 
         -- Extract metadata from message.
         local meta = {}
@@ -893,84 +866,140 @@ M.parse_valgrind_xml = function(xml_file)
         local lsize, blocks, loss_record, total_records = string.match(message,
             "(.+) bytes in (%d+) blocks .* in loss record (%d+) of (%d+)")
         if lsize then
-            meta.leak_type = e.kind:match("^Leak_(.*)") or "unknown"
+            meta.leak_type = err_kind:match("^Leak_(.*)") or "unknown"
             meta.size = lsize
             meta.blocks = blocks
             meta.loss_record = loss_record
             meta.total_records = total_records
         end
 
-        -- Build stacks.
-        local stacks_list = e.stack
-        if stacks_list and #stacks_list <= 1 then
-            stacks_list = { stacks_list }
-        end
-
-        -- Extract auxwhat labels for secondary stacks.
-        local auxwhat_list = e.auxwhat
-        if type(auxwhat_list) == "string" then
-            auxwhat_list = { auxwhat_list }
-        end
-
-        local err_stacks = {}
-        local stack_idx = 0
-        for _, s in ipairs_safe(stacks_list) do
-            if not s.frame then goto not_stack_continue end
-            stack_idx = stack_idx + 1
-            local frame_list = s.frame
-            if frame_list and #frame_list <= 1 then
-                frame_list = { frame_list }
-            end
-
+        -- Build final stacks with labels from auxwhat.
+        -- Use the raw stack index for auxwhat lookup so that filtered-out
+        -- stacks don't shift the label mapping.
+        local final_stacks = {}
+        for raw_idx, raw_stack in ipairs(err_stacks_raw) do
             local frames = {}
-            for _, f in ipairs_safe(frame_list) do
-                if not f.dir or not f.file then goto not_frame_continue end
-                if not starts_with(f.dir, cwd) then goto not_frame_continue end
-                table.insert(frames, {
-                    file = f.dir .. "/" .. f.file,
-                    line = tonumber(f.line) or 1,
-                    func = f.fn,
-                })
-                ::not_frame_continue::
+            for _, f in ipairs(raw_stack.frames) do
+                if f.dir and f.file and starts_with(f.dir, cwd) then
+                    table.insert(frames, {
+                        file = f.dir .. "/" .. f.file,
+                        line = tonumber(f.line) or 1,
+                        func = f.fn,
+                    })
+                end
             end
-
             if #frames > 0 then
-                -- First stack uses the error message; subsequent stacks use auxwhat.
                 local label
-                if stack_idx == 1 then
+                if raw_idx == 1 then
                     label = message
-                elseif auxwhat_list and auxwhat_list[stack_idx - 1] then
-                    label = auxwhat_list[stack_idx - 1]
+                elseif err_auxwhats[raw_idx - 1] then
+                    label = err_auxwhats[raw_idx - 1]
                 else
                     label = message
                 end
-                table.insert(err_stacks, {
-                    label = label,
-                    frames = frames,
-                })
+                table.insert(final_stacks, { label = label, frames = frames })
             end
-            ::not_stack_continue::
         end
 
-        if #err_stacks > 0 then
-            new_error(e.kind, message, "valgrind", err_stacks, meta)
+        if #final_stacks > 0 then
+            new_error(err_kind, message, "valgrind", final_stacks, meta)
             num_errors = num_errors + 1
         end
-        ::not_error_continue::
+
+        err_kind = nil
+        err_message = nil
+        err_auxwhats = {}
+        err_stacks_raw = {}
     end
 
-    -- Extract suppression usage counts from XML.
-    local supp_counts_list = output.suppcounts and output.suppcounts.pair
-    if supp_counts_list then
-        if supp_counts_list.name then
-            -- Single pair — xml2lua doesn't wrap it in an array.
-            supp_counts_list = { supp_counts_list }
+    -- Current parent element name.
+    local function parent()
+        return name_stack[#name_stack]
+    end
+
+    local ok, parse_err = pcall(function()
+    for line in fh:lines() do
+        -- Match self-closing tag (rare in valgrind XML, but handle it).
+        local self_close = line:match("^%s*<(%w+)%s*/>%s*$")
+        if self_close then
+            goto xml_continue
         end
-        for _, pair in ipairs_safe(supp_counts_list) do
-            if pair.name and pair.count then
-                suppression_counts[pair.name] = tonumber(pair.count) or 0
+
+        -- Match opening tag.
+        local open_tag = line:match("^%s*<(%w+)>%s*$")
+        if open_tag then
+            table.insert(name_stack, open_tag)
+            goto xml_continue
+        end
+
+        -- Match closing tag.
+        local close_tag = line:match("^%s*</(%w+)>%s*$")
+        if close_tag then
+            if close_tag == "frame" then
+                table.insert(stack_frames, {
+                    ip = frame_ip, fn = frame_fn,
+                    dir = frame_dir, file = frame_file, line = frame_line,
+                })
+                frame_ip = nil
+                frame_fn = nil
+                frame_dir = nil
+                frame_file = nil
+                frame_line = nil
+            elseif close_tag == "stack" then
+                table.insert(err_stacks_raw, { frames = stack_frames })
+                stack_frames = {}
+            elseif close_tag == "error" then
+                emit_error()
+            elseif close_tag == "pair" then
+                -- Suppression count pair.
+                if pair_name and pair_count then
+                    suppression_counts[pair_name] = tonumber(pair_count) or 0
+                end
+                pair_name = nil
+                pair_count = nil
             end
+            if #name_stack > 0 then
+                table.remove(name_stack)
+            end
+            goto xml_continue
         end
+
+        -- Match single-line leaf element: <tag>text</tag>
+        local tag, text = line:match("^%s*<(%w+)>(.-)</(%w+)>%s*$")
+        if tag and text then
+            text = xml_unescape(text)
+            -- Route based on nesting context.
+            if parent() == "frame" then
+                if tag == "ip" then frame_ip = text
+                elseif tag == "fn" then frame_fn = text
+                elseif tag == "dir" then frame_dir = text
+                elseif tag == "file" then frame_file = text
+                elseif tag == "line" then frame_line = text
+                end
+            elseif parent() == "error" then
+                if tag == "kind" then err_kind = text
+                elseif tag == "what" then err_message = text
+                elseif tag == "auxwhat" then table.insert(err_auxwhats, text)
+                end
+            elseif parent() == "xwhat" then
+                if tag == "text" then err_message = text end
+            elseif parent() == "xauxwhat" then
+                if tag == "text" then table.insert(err_auxwhats, text) end
+            elseif parent() == "pair" then
+                if tag == "name" then pair_name = text
+                elseif tag == "count" then pair_count = text
+                end
+            end
+            goto xml_continue
+        end
+
+        ::xml_continue::
+    end
+    end)
+    fh:close()
+    if not ok then
+        vim.notify("Failed to parse XML: " .. tostring(parse_err), vim.log.levels.ERROR)
+        return 0
     end
 
     return num_errors
@@ -3692,7 +3721,6 @@ M._test = {
   format_link_set = format_link_set,
   format_valgrind_group = format_valgrind_group,
   format_sanitizer_group = format_sanitizer_group,
-  ipairs_safe = ipairs_safe,
   starts_with = starts_with,
   summarize_rw = summarize_rw,
   summarize_table_keys = summarize_table_keys,

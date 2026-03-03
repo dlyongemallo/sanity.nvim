@@ -9,9 +9,6 @@ end
 
 describe("stack capture and linear rendering", function()
   it("captures caller chain from memcheck.xml", function()
-    if not pcall(require, "xml2lua") then
-      return
-    end
     T.reset_state()
     local xml = H.localize_log("tests/memcheck.xml")
     local count = M.parse_valgrind_xml(xml)
@@ -26,6 +23,8 @@ describe("stack capture and linear rendering", function()
     end
     assert(target, "expected InvalidWrite error")
 
+    -- First stack uses the error message as its label.
+    assert_eq(target.stacks[1].label, "Invalid write of size 1")
     local s1 = target.stacks[1].frames
     assert_eq(s1[1].func, "write_to_buffer")
     assert_eq(s1[2].func, "process_data")
@@ -34,8 +33,11 @@ describe("stack capture and linear rendering", function()
     assert_eq(basename(s1[4].file), "demo.c")
     assert_eq(s1[4].line, 328)
 
-    -- Second stack (alloc site). The malloc frame from valgrind internals is
-    -- filtered by the cwd check, so only project-local frames remain.
+    -- Second stack uses the auxwhat as its label. The malloc frame from
+    -- valgrind internals is filtered by the cwd check, so only
+    -- project-local frames remain.
+    assert_eq(target.stacks[2].label,
+        "Address 0x4a5cc50 is 0 bytes after a block of size 16 alloc'd")
     local s2 = target.stacks[2].frames
     assert_eq(s2[1].func, "process_data")
     assert_eq(s2[2].func, "demonstrate_buffer_overflow")
