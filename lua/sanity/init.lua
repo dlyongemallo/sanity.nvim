@@ -2,6 +2,7 @@ local M = {}
 local pickers = require("sanity.pickers")
 local explanations = require("sanity.explanations")
 local S = require("sanity.state")
+local F = require("sanity.format")
 
 local set_diagnostics       -- Forward declaration; defined after populate_quickfix_from_errors.
 local stop_watching         -- Forward declaration; defined after sanity_stack.
@@ -21,7 +22,7 @@ local function error_fingerprint(err)
 end
 
 -- Snapshot the current error list as a fingerprint bag (multiset).
--- Each fingerprint maps to its occurrence count so that duplicate S.errors
+-- Each fingerprint maps to its occurrence count so that duplicate errors
 -- are tracked individually rather than collapsed into a set.
 local function snapshot_fingerprints()
     local fps = {}
@@ -32,7 +33,7 @@ local function snapshot_fingerprints()
     return fps
 end
 
--- Compare current S.errors against the previous fingerprint bag.
+-- Compare current errors against the previous fingerprint bag.
 -- Returns a summary string or nil if there was no previous load.
 local function compute_diff_summary()
     if S.prev_error_fingerprints == nil then return nil end
@@ -55,10 +56,10 @@ local function compute_diff_summary()
     return string.format(" (%d new, %d fixed, %d unchanged)", new_count, fixed_count, unchanged_count)
 end
 
--- Compute detailed per-error diff between current S.errors and the previous load.
+-- Compute detailed per-error diff between current errors and the previous load.
 -- Returns nil if there is no previous load. Otherwise returns a table with:
 --   new       = list of current error objects not matched in the previous set
---   fixed     = list of { kind, source, location } for previous S.errors gone now
+--   fixed     = list of { kind, source, location } for previous errors gone now
 --   unchanged = list of current error objects matched in the previous set
 local function compute_diff_details()
     if S.prev_error_fingerprints == nil then return nil end
@@ -82,7 +83,7 @@ local function compute_diff_details()
         end
     end
 
-    -- Remaining previous fingerprints are S.errors that were fixed.
+    -- Remaining previous fingerprints are errors that were fixed.
     local fixed_entries = {}
     for fp, count in pairs(prev_remaining) do
         if count > 0 then
@@ -104,19 +105,6 @@ local function compute_diff_details()
     }
 end
 
--- Normalise a file path so redundant slashes and relative segments
--- do not cause S.location_index misses.
-local function normalize_path(path)
-    return vim.fs.normalize(path)
-end
-
--- Resolve a possibly-relative path to an absolute, normalised form.
--- Uses fnamemodify(":p") which is cross-platform (handles Windows drive
--- letters, backslashes, etc.) and resolves relative paths against cwd.
-local function resolve_path(path)
-    return normalize_path(vim.fn.fnamemodify(path, ":p"))
-end
-
 -- Create an error object, register it, and update S.location_index.
 local function new_error(kind, message, source, stacks, meta)
     S.error_id_counter = S.error_id_counter + 1
@@ -133,7 +121,7 @@ local function new_error(kind, message, source, stacks, meta)
     for _, stack in ipairs(stacks) do
         for _, frame in ipairs(stack.frames) do
             -- Normalise the stored frame path so all consumers and indexes agree.
-            frame.file = normalize_path(frame.file)
+            frame.file = F.normalize_path(frame.file)
             local key = frame.file .. ":" .. frame.line
             if not S.location_index[key] then
                 S.location_index[key] = {}
@@ -215,57 +203,8 @@ function M.setup(opts)
         end,
     })
 
-    -- Store keymap S.config; keymaps are registered on first log load.
+    -- Store keymap config; keymaps are registered on first log load.
     S.config.keymaps = opts.keymaps or {}
-end
-
-local function starts_with(str, start)
-    return str:sub(1, #start) == start
-end
-
-local summarize_rw = function(rw)
-    local has_read = false
-    local has_write = false
-    for k, _ in pairs(rw) do
-        if k == "read" then
-            has_read = true
-        elseif k == "write" then
-            has_write = true
-        end
-        if has_read and has_write then
-            return "read/write"
-        end
-    end
-    if has_read then
-        return "read"
-    elseif has_write then
-        return "write"
-    else
-        return "unknown operation"
-    end
-end
-
-local summarize_table_keys = function(t, show_only_first_entry, sort_by_numeric_value)
-    show_only_first_entry = show_only_first_entry or false
-    sort_by_numeric_value = sort_by_numeric_value or false
-
-    local sorted_t = {}
-    local n = 0
-    for k, _ in pairs(t) do
-        if sort_by_numeric_value then
-            k = tonumber(k)
-        end
-        table.insert(sorted_t, k)
-        n = n + 1
-    end
-    table.sort(sorted_t)
-    if n == 1 then
-        return sorted_t[1]
-    elseif show_only_first_entry then
-        return sorted_t[1] .. "/..."
-    else
-        return table.concat(sorted_t, '/')
-    end
 end
 
 -- Detect the format of a log file by reading the first few lines.
@@ -296,175 +235,7 @@ local function detect_log_format(filepath)
     return nil
 end
 
--- Format a link set into a summary string.
--- Link sets contain entries like "->basename:000042" and "END".
-local function format_link_set(link_set)
-    local sorted_links = {}
-    for k, _ in pairs(link_set) do
-        table.insert(sorted_links, k)
-    end
-    table.sort(sorted_links)
-    local summary = ""
-    local prev_filename = ""
-    local has_end = false
-    for _, full_link in ipairs(sorted_links) do
-        if full_link == "END" then
-            has_end = true
-        else
-            local filename, line_number = string.match(full_link, "^%->(.*):(%d+)$")
-            line_number = line_number:match("^0*(%d+)$")
-            if filename == prev_filename then
-                summary = summary .. "," .. line_number
-            else
-                if prev_filename ~= "" then
-                    summary = summary .. "/"
-                end
-                summary = summary .. filename .. ":" .. line_number
-                prev_filename = filename
-            end
-        end
-    end
-    if has_end then
-        if summary ~= "" then
-            summary = summary .. "/"
-        end
-        summary = summary .. "END"
-    end
-    return summary
-end
-
--- Format a quickfix message for a group of valgrind S.errors with the same kind.
-local function format_valgrind_group(kind, errs, links)
-    -- Data race S.errors.
-    local rw, size, addr, thr = string.match(errs[1].message,
-        "^Possible data race during (.*) of size (%d+) at (0x%x+) by thread (#%d+)")
-    if rw then
-        local rw_set = {}
-        local size_set = {}
-        local addr_set = {}
-        local thr_set = {}
-        for _, err in ipairs(errs) do
-            local m = err.meta
-            if m.rw then rw_set[m.rw] = true end
-            if m.size then size_set[m.size] = true end
-            if m.addr then addr_set[m.addr] = true end
-            if m.thr then thr_set[m.thr] = true end
-        end
-        return string.format("[Race] Possible data race during %s of size %s at %s by thread %s (%s)",
-            summarize_rw(rw_set),
-            summarize_table_keys(size_set, false, true),
-            summarize_table_keys(addr_set, true),
-            summarize_table_keys(thr_set),
-            links)
-    end
-
-    -- Leak S.errors.
-    local leak_type = kind:match("^Leak_(.*)")
-    if leak_type and errs[1].meta.size then
-        local leak_type_set = {}
-        local size_set2 = {}
-        local blocks_set = {}
-        local loss_set = {}
-        local total_set = {}
-        for _, err in ipairs(errs) do
-            local m = err.meta
-            if m.leak_type then leak_type_set[m.leak_type] = true end
-            if m.size then size_set2[m.size] = true end
-            if m.blocks then blocks_set[m.blocks] = true end
-            if m.loss_record then loss_set[m.loss_record] = true end
-            if m.total_records then total_set[m.total_records] = true end
-        end
-        return string.format("[Leak_%s] %s bytes in %s blocks in loss record %s of %s (%s)",
-            summarize_table_keys(leak_type_set, false),
-            summarize_table_keys(size_set2, true, true),
-            summarize_table_keys(blocks_set, true, true),
-            summarize_table_keys(loss_set, true, true),
-            summarize_table_keys(total_set, false, true),
-            links)
-    end
-
-    -- General S.errors.
-    local msg = errs[1].message
-    if starts_with(msg, kind) then
-        msg = msg:sub(#kind + 1):match("^%s*(.*)")
-    end
-    return string.format("[%s] %s (%s)", kind, msg, links)
-end
-
--- Merge a set-valued meta field from multiple S.errors into one set.
-local function merge_meta_sets(errs, field)
-    local merged = {}
-    for _, err in ipairs(errs) do
-        if type(err.meta[field]) == "table" then
-            for k, _ in pairs(err.meta[field]) do
-                merged[k] = true
-            end
-        end
-    end
-    return merged
-end
-
--- Format a quickfix message for a group of sanitizer S.errors with the same kind.
-local function format_sanitizer_group(kind, errs, links)
-    -- rw_op S.errors (data race read/write).
-    if errs[1].meta.rw_op then
-        local rw_op_set = merge_meta_sets(errs, "rw_op")
-        local size_set = merge_meta_sets(errs, "size")
-        local addr_set = merge_meta_sets(errs, "addr")
-        local thr_set = merge_meta_sets(errs, "thr")
-        return string.format("[%s] %s of size %s at %s by thread %s (%s)",
-            kind,
-            summarize_table_keys(rw_op_set),
-            summarize_table_keys(size_set, false, true),
-            summarize_table_keys(addr_set, true),
-            summarize_table_keys(thr_set),
-            links)
-    end
-
-    -- Mutex creation.
-    if errs[1].meta.mutex then
-        local mutex_set = merge_meta_sets(errs, "mutex")
-        return string.format("[%s] Mutex %s created (%s)",
-            kind,
-            summarize_table_keys(mutex_set),
-            links)
-    end
-
-    -- Heap allocation.
-    if errs[1].meta.heap_block then
-        local size_set = merge_meta_sets(errs, "size")
-        local addr_set = merge_meta_sets(errs, "addr")
-        local thr_set = merge_meta_sets(errs, "thr")
-        return string.format("[%s] Location is heap block of size %s at %s allocated by %s (%s)",
-            kind,
-            summarize_table_keys(size_set, false, true),
-            summarize_table_keys(addr_set, true),
-            summarize_table_keys(thr_set),
-            links)
-    end
-
-    -- Leak S.errors.
-    if errs[1].meta.leak_type then
-        local leak_type_set = merge_meta_sets(errs, "leak_type")
-        local size_set = merge_meta_sets(errs, "size")
-        local num_objs_set = merge_meta_sets(errs, "num_objs")
-        return string.format("[%s] %s leak of %s byte(s) in %s object(s) allocated from (%s)",
-            kind,
-            summarize_table_keys(leak_type_set),
-            summarize_table_keys(size_set, false, true),
-            summarize_table_keys(num_objs_set, false, true),
-            links)
-    end
-
-    -- General S.errors.
-    local msg = errs[1].message
-    if starts_with(msg, kind) then
-        msg = msg:sub(#kind + 1):match("^%s*(.*)")
-    end
-    return string.format("[%s] %s (%s)", kind, msg, links)
-end
-
--- Collect unique error kinds from all loaded S.errors.
+-- Collect unique error kinds from all loaded errors.
 get_available_kinds = function()
     local seen = {}
     local kinds = {}
@@ -521,7 +292,7 @@ end
 local function matches_filter(kind)
     if not S.current_filter then return true end
     for _, fk in ipairs(S.current_filter) do
-        if kind == fk or starts_with(kind, fk) then
+        if kind == fk or F.starts_with(kind, fk) then
             return true
         end
     end
@@ -529,7 +300,7 @@ local function matches_filter(kind)
 end
 
 -- Group error frames by (file, line, kind), collecting link sets.
--- Each group tracks its S.errors, file/line, kind, and a link set showing where
+-- Each group tracks its errors, file/line, kind, and a link set showing where
 -- each frame points in the stack (END for the deepest, ->basename:line otherwise).
 -- Returns (groups, group_order) where group_order is sorted by file:line:kind.
 local function group_error_frames()
@@ -603,7 +374,7 @@ local function get_qf_type(kind)
     return "E"
 end
 
--- Populate the quickfix list from the S.errors array.
+-- Populate the quickfix list from the errors array.
 local function populate_quickfix_from_errors()
     local groups, group_order = group_error_frames()
 
@@ -616,13 +387,13 @@ local function populate_quickfix_from_errors()
         local errs = group.errors
         local kind = group.kind
         local source = errs[1].source
-        local links = format_link_set(group.link_set)
+        local links = F.format_link_set(group.link_set)
 
         local msg
         if source == "valgrind" then
-            msg = format_valgrind_group(kind, errs, links)
+            msg = F.format_valgrind_group(kind, errs, links)
         elseif source == "sanitizer" then
-            msg = format_sanitizer_group(kind, errs, links)
+            msg = F.format_sanitizer_group(kind, errs, links)
         else
             msg = kind
         end
@@ -705,7 +476,7 @@ set_diagnostics = function(only_bufnr)
                 col = #(lines[1]:match("^(%s*)") or "")
             end
         end
-        local links = format_link_set(group.link_set)
+        local links = F.format_link_set(group.link_set)
         local msg = string.format("[%s] %s (%s)", group.kind, group.errors[1].message, links)
         table.insert(buf_diags[bufnr], {
             lnum = lnum,
@@ -859,7 +630,7 @@ M.parse_valgrind_xml = function(xml_file)
         for raw_idx, raw_stack in ipairs(err_stacks_raw) do
             local frames = {}
             for _, f in ipairs(raw_stack.frames) do
-                if f.dir and f.file and starts_with(f.dir, cwd) then
+                if f.dir and f.file and F.starts_with(f.dir, cwd) then
                     table.insert(frames, {
                         file = f.dir .. "/" .. f.file,
                         line = tonumber(f.line) or 1,
@@ -1029,12 +800,12 @@ M.parse_sanitizer_log = function(log_file)
 
     local ok, parse_err = pcall(function()
     for line in log_file_handle:lines() do
-        if starts_with(line, "allocated by") then
+        if F.starts_with(line, "allocated by") then
             -- "allocated by" continues the current error as a new stack section.
             finalize_stack()
             current_label = last_addr .. " " .. line
             current_meta.heap_block = true
-        elseif not starts_with(line, "    #") then
+        elseif not F.starts_with(line, "    #") then
             -- Non-frame line: could be a new error or a section header within an error.
             -- Match ASAN format (==PID==ERROR:) and TSAN format (bare WARNING:).
             local maybe_error_message = string.match(line, "==%d+==ERROR: .*Sanitizer: (.*)")
@@ -1116,8 +887,8 @@ M.parse_sanitizer_log = function(log_file)
             if not target then
                 goto not_source_file_continue
             end
-            target = resolve_path(target)
-            if not starts_with(target, cwd) then
+            target = F.resolve_path(target)
+            if not F.starts_with(target, cwd) then
                 goto not_source_file_continue
             end
             local filename, line_number = string.match(target, "(%S+):(%d+)")
@@ -1171,7 +942,7 @@ M.parse_ubsan_log = function(log_file)
         local stacks = {}
         if #current_frames > 0 then
             table.insert(stacks, { label = current_message, frames = current_frames })
-        elseif current_file and starts_with(current_file, cwd) then
+        elseif current_file and F.starts_with(current_file, cwd) then
             -- No stack frames; use the header location as a single-frame stack.
             table.insert(stacks, {
                 label = current_message,
@@ -1210,8 +981,8 @@ M.parse_ubsan_log = function(log_file)
             local func_name = line:match("#%d+ 0x%x+ in (%S+)")
             local target = line:match("#%d+ 0x%x+ .* (.+)")
             if target then
-                target = resolve_path(target)
-                if starts_with(target, cwd) then
+                target = F.resolve_path(target)
+                if F.starts_with(target, cwd) then
                     local filename, line_number = target:match("(%S+):(%d+)")
                     if filename and line_number then
                         table.insert(current_frames, {
@@ -1304,7 +1075,7 @@ M.run_valgrind = function(args)
                 end
                 vim.fn.delete(xml_file)
 
-                -- Offer to re-run with --track-origins=yes for uninitialised value S.errors.
+                -- Offer to re-run with --track-origins=yes for uninitialised value errors.
                 -- Deferred so the scheduled cfirst from valgrind_load_xml runs
                 -- first; otherwise it dismisses the vim.ui.select prompt.
                 vim.schedule(function()
@@ -1585,7 +1356,7 @@ local function get_current_position()
         return get_qf_entry_position(vim.fn.line("."))
     end
 
-    return normalize_path(vim.api.nvim_buf_get_name(buf)), vim.api.nvim_win_get_cursor(win)[1], nil
+    return F.normalize_path(vim.api.nvim_buf_get_name(buf)), vim.api.nvim_win_get_cursor(win)[1], nil
 end
 
 -- Return the first error at the cursor position, or nil.
@@ -1811,7 +1582,7 @@ local function generate_suppression(err)
             supp_type = "Memcheck:Value"
         elseif kind == "Overlap" then
             supp_type = "Memcheck:Overlap"
-        elseif starts_with(kind, "Leak_") then
+        elseif F.starts_with(kind, "Leak_") then
             supp_type = "Memcheck:Leak"
             local leak_map = {
                 Leak_DefinitelyLost = "definite",
@@ -1902,7 +1673,7 @@ M.suppress_error = function()
     vim.notify("Suppression queued (" .. #S.suppressions .. " total).")
 end
 
--- SanitySaveSuppressions: write queued S.suppressions to file(s).
+-- SanitySaveSuppressions: write queued suppressions to file(s).
 M.save_suppressions = function(args)
     if #S.suppressions == 0 then
         vim.notify("No suppressions to save.", vim.log.levels.INFO)
@@ -1912,7 +1683,7 @@ M.save_suppressions = function(args)
     local filename = args and args.args and args.args ~= "" and args.args or nil
 
     if filename then
-        -- Write all S.suppressions to a single file.
+        -- Write all suppressions to a single file.
         local fh, open_err = io.open(filename, "a")
         if not fh then
             vim.notify("Failed to open " .. filename .. ": " .. (open_err or "unknown error"), vim.log.levels.ERROR)
@@ -1965,7 +1736,7 @@ M.save_suppressions = function(args)
             saved_tools[tool] = true
             ::save_continue::
         end
-        -- Only remove S.suppressions that were successfully written.
+        -- Only remove suppressions that were successfully written.
         local remaining = {}
         for _, s in ipairs(S.suppressions) do
             if not saved_tools[s.tool] then
@@ -2020,7 +1791,7 @@ local function parse_sanitizer_suppression_names(filepath)
     return result
 end
 
--- SanityAuditSuppressions: report which S.suppressions were used/unused in the last run.
+-- SanityAuditSuppressions: report which suppressions were used/unused in the last run.
 M.audit_suppressions = function()
     -- Collect valgrind suppression files to audit.
     local vg_files = {}
@@ -2247,7 +2018,7 @@ M.explain_error = function()
     local explanation = explanations[err.kind]
     if not explanation then
         for key, expl in pairs(explanations) do
-            if starts_with(err.kind, key) then
+            if F.starts_with(err.kind, key) then
                 explanation = expl
                 break
             end
@@ -2331,7 +2102,7 @@ end
 
 -- Find related targets sharing the same address as err.
 -- Includes other stacks within the same error (e.g. both sides of a
--- data race) and other S.errors referencing the same memory address.
+-- data race) and other errors referencing the same memory address.
 -- file/line is the current position used to exclude the caller's location.
 -- all_errors is the full error list to search for cross-error matches.
 local function find_related_targets(err, file, line, all_errors)
@@ -2355,7 +2126,7 @@ local function find_related_targets(err, file, line, all_errors)
         end
     end
 
-    -- Other S.errors sharing any address.
+    -- Other errors sharing any address.
     local addrs = extract_addrs(err)
     if #addrs > 0 then
         local seen_ids = { [err.id] = true }
@@ -2518,7 +2289,7 @@ local function dedup_stacks(stacks)
     return out
 end
 
--- Compose thread-aware stacks for sanitizer S.errors.  Operation stacks
+-- Compose thread-aware stacks for sanitizer errors.  Operation stacks
 -- ("by thread T1") are concatenated with the corresponding creation stacks
 -- ("Thread T1 ... created") so the trie can merge shared callers.
 local function compose_thread_stacks(all_stacks)
@@ -3178,7 +2949,7 @@ end
 -- Build the stack content lines and frame map for a given file:line.
 -- When error_ids is provided (from quickfix), uses those directly instead of
 -- looking up S.location_index, which avoids path-normalisation mismatches.
--- Returns buf_lines, frame_map, cursor_line or nil if no S.errors.
+-- Returns buf_lines, frame_map, cursor_line or nil if no errors.
 local function build_stack_content(file, line, error_ids)
     local ids = error_ids
     if not ids or #ids == 0 then
@@ -3186,7 +2957,7 @@ local function build_stack_content(file, line, error_ids)
     end
     if not ids or #ids == 0 then return nil end
 
-    -- Expand to all related S.errors: any error sharing a frame with the initial
+    -- Expand to all related errors: any error sharing a frame with the initial
     -- set is included, transitively.  This ensures the full tree is shown
     -- regardless of which frame the user triggered the stack from.
     local seen_ids = {}
@@ -3339,7 +3110,7 @@ local function build_stack_content(file, line, error_ids)
         end
     end
 
-    -- Group S.errors by kind so same-kind S.errors are merged into one tree.
+    -- Group S.errors by kind so same-kind errors are merged into one tree.
     local kind_groups = {}
     local kind_order = {}
     for _, err in ipairs(err_list) do
@@ -3508,7 +3279,7 @@ local function highlight_stack_buf(buf, lines, fmap)
 end
 
 -- Refresh the stack buffer content for a new file:line position.
--- When there are no S.errors at the new position, keeps the last stack visible.
+-- When there are no errors at the new position, keeps the last stack visible.
 refresh_stack = function(file, line, error_ids)
     if not S.stack_bufnr or not vim.api.nvim_buf_is_valid(S.stack_bufnr) then return end
 
@@ -3902,19 +3673,19 @@ M._test = {
   expand_filter_args = expand_filter_args,
   matches_filter = matches_filter,
   set_filter = function(f) S.current_filter = f end,
-  format_link_set = format_link_set,
-  format_valgrind_group = format_valgrind_group,
-  format_sanitizer_group = format_sanitizer_group,
-  starts_with = starts_with,
-  summarize_rw = summarize_rw,
-  summarize_table_keys = summarize_table_keys,
-  merge_meta_sets = merge_meta_sets,
+  format_link_set = F.format_link_set,
+  format_valgrind_group = F.format_valgrind_group,
+  format_sanitizer_group = F.format_sanitizer_group,
+  starts_with = F.starts_with,
+  summarize_rw = F.summarize_rw,
+  summarize_table_keys = F.summarize_table_keys,
+  merge_meta_sets = F.merge_meta_sets,
   load_files = load_files,
   populate_quickfix = populate_quickfix_from_errors,
   get_qf_type = get_qf_type,
   compute_sharing_ratio = compute_sharing_ratio,
-  normalize_path = normalize_path,
-  resolve_path = resolve_path,
+  normalize_path = F.normalize_path,
+  resolve_path = F.resolve_path,
   set_config = function(key, val) S.config[key] = val end,
   restore_snapshot = restore_snapshot,
   save_snapshot = save_snapshot,
