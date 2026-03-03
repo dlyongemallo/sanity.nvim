@@ -1,30 +1,7 @@
 local M = {}
 local pickers = require("sanity.pickers")
 local explanations = require("sanity.explanations")
-
-local config = {}
-
--- Structured error storage.
-local errors = {}
-local errors_by_id = {}
-local error_id_counter = 0
-local location_index = {}  -- "file:line" -> { error_id, ... }
-local qf_error_ids = {}    -- qf index -> { error_id, ... }
-local qf_file_lines = {}   -- qf index -> { file, line } using original frame paths
-local current_filter = nil  -- Array of kind strings when active.
-local suppressions = {}     -- Queued suppression entries: { text, tool }.
-local valgrind_job_id = nil  -- Active async valgrind job.
-local last_valgrind_args = nil  -- Raw args string from last :SanityRunValgrind.
-local valgrind_xml_file = nil -- Temp XML file for the active job.
-local valgrind_generation = 0 -- Counter to detect stale async callbacks.
-local suppression_counts = {}  -- name -> count from last valgrind XML run.
-local prev_error_fingerprints = nil  -- Fingerprint bag from previous load for diff summary (nil = no previous load).
-local has_loaded = false  -- Whether at least one load has completed.
-local last_loaded_files = {}  -- Paths from the last load_files call.
-local watchers = {}  -- Active vim.uv.new_fs_event handles.
-local watch_timer = nil  -- Debounce timer for watch mode reloads.
-
-local ns = vim.api.nvim_create_namespace("sanity")
+local S = require("sanity.state")
 
 local set_diagnostics       -- Forward declaration; defined after populate_quickfix_from_errors.
 local stop_watching         -- Forward declaration; defined after sanity_stack.
@@ -32,28 +9,6 @@ local start_watching        -- Forward declaration; defined after stop_watching.
 local get_available_kinds   -- Forward declaration; defined after format helpers.
 local filter_presets        -- Forward declaration; defined after get_available_kinds.
 local refresh_stack         -- Forward declaration; defined in stack section.
-
-local function reset_state()
-    errors = {}
-    errors_by_id = {}
-    error_id_counter = 0
-    location_index = {}
-    qf_error_ids = {}
-    qf_file_lines = {}
-    current_filter = nil
-    suppressions = {}
-    suppression_counts = {}
-    if valgrind_job_id then
-        vim.fn.jobstop(valgrind_job_id)
-        valgrind_job_id = nil
-    end
-    if valgrind_xml_file then
-        vim.fn.delete(valgrind_xml_file)
-        valgrind_xml_file = nil
-    end
-    valgrind_generation = valgrind_generation + 1
-    vim.diagnostic.reset(ns)
-end
 
 -- Build a fingerprint for an error: kind + source + first frame location.
 local function error_fingerprint(err)
@@ -66,21 +21,21 @@ local function error_fingerprint(err)
 end
 
 -- Snapshot the current error list as a fingerprint bag (multiset).
--- Each fingerprint maps to its occurrence count so that duplicate errors
+-- Each fingerprint maps to its occurrence count so that duplicate S.errors
 -- are tracked individually rather than collapsed into a set.
 local function snapshot_fingerprints()
     local fps = {}
-    for _, err in ipairs(errors) do
+    for _, err in ipairs(S.errors) do
         local fp = error_fingerprint(err)
         fps[fp] = (fps[fp] or 0) + 1
     end
     return fps
 end
 
--- Compare current errors against the previous fingerprint bag.
+-- Compare current S.errors against the previous fingerprint bag.
 -- Returns a summary string or nil if there was no previous load.
 local function compute_diff_summary()
-    if prev_error_fingerprints == nil then return nil end
+    if S.prev_error_fingerprints == nil then return nil end
     local new_fps = snapshot_fingerprints()
     local new_count = 0
     local fixed_count = 0
@@ -88,10 +43,10 @@ local function compute_diff_summary()
     -- Collect all fingerprints from both bags.
     local all_fps = {}
     for fp in pairs(new_fps) do all_fps[fp] = true end
-    for fp in pairs(prev_error_fingerprints) do all_fps[fp] = true end
+    for fp in pairs(S.prev_error_fingerprints) do all_fps[fp] = true end
     for fp in pairs(all_fps) do
         local cur = new_fps[fp] or 0
-        local prev = prev_error_fingerprints[fp] or 0
+        local prev = S.prev_error_fingerprints[fp] or 0
         local common = math.min(cur, prev)
         unchanged_count = unchanged_count + common
         new_count = new_count + (cur - common)
@@ -100,24 +55,24 @@ local function compute_diff_summary()
     return string.format(" (%d new, %d fixed, %d unchanged)", new_count, fixed_count, unchanged_count)
 end
 
--- Compute detailed per-error diff between current errors and the previous load.
+-- Compute detailed per-error diff between current S.errors and the previous load.
 -- Returns nil if there is no previous load. Otherwise returns a table with:
 --   new       = list of current error objects not matched in the previous set
---   fixed     = list of { kind, source, location } for previous errors gone now
+--   fixed     = list of { kind, source, location } for previous S.errors gone now
 --   unchanged = list of current error objects matched in the previous set
 local function compute_diff_details()
-    if prev_error_fingerprints == nil then return nil end
+    if S.prev_error_fingerprints == nil then return nil end
 
     -- Copy previous counts so we can decrement as we match.
     local prev_remaining = {}
-    for fp, count in pairs(prev_error_fingerprints) do
+    for fp, count in pairs(S.prev_error_fingerprints) do
         prev_remaining[fp] = count
     end
 
     local new_errors = {}
     local unchanged_errors = {}
 
-    for _, err in ipairs(errors) do
+    for _, err in ipairs(S.errors) do
         local fp = error_fingerprint(err)
         if prev_remaining[fp] and prev_remaining[fp] > 0 then
             prev_remaining[fp] = prev_remaining[fp] - 1
@@ -127,7 +82,7 @@ local function compute_diff_details()
         end
     end
 
-    -- Remaining previous fingerprints are errors that were fixed.
+    -- Remaining previous fingerprints are S.errors that were fixed.
     local fixed_entries = {}
     for fp, count in pairs(prev_remaining) do
         if count > 0 then
@@ -150,7 +105,7 @@ local function compute_diff_details()
 end
 
 -- Normalise a file path so redundant slashes and relative segments
--- do not cause location_index misses.
+-- do not cause S.location_index misses.
 local function normalize_path(path)
     return vim.fs.normalize(path)
 end
@@ -162,28 +117,28 @@ local function resolve_path(path)
     return normalize_path(vim.fn.fnamemodify(path, ":p"))
 end
 
--- Create an error object, register it, and update location_index.
+-- Create an error object, register it, and update S.location_index.
 local function new_error(kind, message, source, stacks, meta)
-    error_id_counter = error_id_counter + 1
+    S.error_id_counter = S.error_id_counter + 1
     local err = {
-        id = error_id_counter,
+        id = S.error_id_counter,
         kind = kind,
         message = message,
         source = source,
         stacks = stacks,
         meta = meta or {},
     }
-    table.insert(errors, err)
-    errors_by_id[err.id] = err
+    table.insert(S.errors, err)
+    S.errors_by_id[err.id] = err
     for _, stack in ipairs(stacks) do
         for _, frame in ipairs(stack.frames) do
             -- Normalise the stored frame path so all consumers and indexes agree.
             frame.file = normalize_path(frame.file)
             local key = frame.file .. ":" .. frame.line
-            if not location_index[key] then
-                location_index[key] = {}
+            if not S.location_index[key] then
+                S.location_index[key] = {}
             end
-            table.insert(location_index[key], err.id)
+            table.insert(S.location_index[key], err.id)
         end
     end
     return err
@@ -191,17 +146,17 @@ end
 
 function M.setup(opts)
     opts = opts or {}
-    config.picker = opts.picker
-    config.diagnostics_enabled = true
-    config.suppression_files = vim.tbl_extend("force", {
+    S.config.picker = opts.picker
+    S.config.diagnostics_enabled = true
+    S.config.suppression_files = vim.tbl_extend("force", {
         valgrind = ".valgrind.supp",
         lsan = ".lsan.supp",
         tsan = ".tsan.supp",
     }, opts.suppression_files or {})
-    config.valgrind_suppressions = opts.valgrind_suppressions or {}
-    config.track_origins = opts.track_origins == nil and "ask" or opts.track_origins
-    config.stack_fold_limit = opts.stack_fold_limit or 6
-    config.snapshot_file = opts.snapshot_file == nil and ".sanity-snapshot.json" or opts.snapshot_file
+    S.config.valgrind_suppressions = opts.valgrind_suppressions or {}
+    S.config.track_origins = opts.track_origins == nil and "ask" or opts.track_origins
+    S.config.stack_fold_limit = opts.stack_fold_limit or 6
+    S.config.snapshot_file = opts.snapshot_file == nil and ".sanity-snapshot.json" or opts.snapshot_file
 
     vim.api.nvim_create_user_command("SanityRunValgrind", M.run_valgrind, { nargs = 1 })
     vim.api.nvim_create_user_command("SanityLoadLog", M.sanity_load_log, {
@@ -254,14 +209,14 @@ function M.setup(opts)
     vim.api.nvim_create_autocmd("BufReadPost", {
         group = vim.api.nvim_create_augroup("sanity", { clear = true }),
         callback = function(ev)
-            if #errors > 0 and config.diagnostics_enabled then
+            if #S.errors > 0 and S.config.diagnostics_enabled then
                 set_diagnostics(ev.buf)
             end
         end,
     })
 
-    -- Store keymap config; keymaps are registered on first log load.
-    config.keymaps = opts.keymaps or {}
+    -- Store keymap S.config; keymaps are registered on first log load.
+    S.config.keymaps = opts.keymaps or {}
 end
 
 local function starts_with(str, start)
@@ -378,9 +333,9 @@ local function format_link_set(link_set)
     return summary
 end
 
--- Format a quickfix message for a group of valgrind errors with the same kind.
+-- Format a quickfix message for a group of valgrind S.errors with the same kind.
 local function format_valgrind_group(kind, errs, links)
-    -- Data race errors.
+    -- Data race S.errors.
     local rw, size, addr, thr = string.match(errs[1].message,
         "^Possible data race during (.*) of size (%d+) at (0x%x+) by thread (#%d+)")
     if rw then
@@ -403,7 +358,7 @@ local function format_valgrind_group(kind, errs, links)
             links)
     end
 
-    -- Leak errors.
+    -- Leak S.errors.
     local leak_type = kind:match("^Leak_(.*)")
     if leak_type and errs[1].meta.size then
         local leak_type_set = {}
@@ -428,7 +383,7 @@ local function format_valgrind_group(kind, errs, links)
             links)
     end
 
-    -- General errors.
+    -- General S.errors.
     local msg = errs[1].message
     if starts_with(msg, kind) then
         msg = msg:sub(#kind + 1):match("^%s*(.*)")
@@ -436,7 +391,7 @@ local function format_valgrind_group(kind, errs, links)
     return string.format("[%s] %s (%s)", kind, msg, links)
 end
 
--- Merge a set-valued meta field from multiple errors into one set.
+-- Merge a set-valued meta field from multiple S.errors into one set.
 local function merge_meta_sets(errs, field)
     local merged = {}
     for _, err in ipairs(errs) do
@@ -449,9 +404,9 @@ local function merge_meta_sets(errs, field)
     return merged
 end
 
--- Format a quickfix message for a group of sanitizer errors with the same kind.
+-- Format a quickfix message for a group of sanitizer S.errors with the same kind.
 local function format_sanitizer_group(kind, errs, links)
-    -- rw_op errors (data race read/write).
+    -- rw_op S.errors (data race read/write).
     if errs[1].meta.rw_op then
         local rw_op_set = merge_meta_sets(errs, "rw_op")
         local size_set = merge_meta_sets(errs, "size")
@@ -488,7 +443,7 @@ local function format_sanitizer_group(kind, errs, links)
             links)
     end
 
-    -- Leak errors.
+    -- Leak S.errors.
     if errs[1].meta.leak_type then
         local leak_type_set = merge_meta_sets(errs, "leak_type")
         local size_set = merge_meta_sets(errs, "size")
@@ -501,7 +456,7 @@ local function format_sanitizer_group(kind, errs, links)
             links)
     end
 
-    -- General errors.
+    -- General S.errors.
     local msg = errs[1].message
     if starts_with(msg, kind) then
         msg = msg:sub(#kind + 1):match("^%s*(.*)")
@@ -509,11 +464,11 @@ local function format_sanitizer_group(kind, errs, links)
     return string.format("[%s] %s (%s)", kind, msg, links)
 end
 
--- Collect unique error kinds from all loaded errors.
+-- Collect unique error kinds from all loaded S.errors.
 get_available_kinds = function()
     local seen = {}
     local kinds = {}
-    for _, err in ipairs(errors) do
+    for _, err in ipairs(S.errors) do
         if not seen[err.kind] then
             seen[err.kind] = true
             table.insert(kinds, err.kind)
@@ -564,8 +519,8 @@ end
 
 -- Check whether an error's kind matches any entry in the active filter.
 local function matches_filter(kind)
-    if not current_filter then return true end
-    for _, fk in ipairs(current_filter) do
+    if not S.current_filter then return true end
+    for _, fk in ipairs(S.current_filter) do
         if kind == fk or starts_with(kind, fk) then
             return true
         end
@@ -574,14 +529,14 @@ local function matches_filter(kind)
 end
 
 -- Group error frames by (file, line, kind), collecting link sets.
--- Each group tracks its errors, file/line, kind, and a link set showing where
+-- Each group tracks its S.errors, file/line, kind, and a link set showing where
 -- each frame points in the stack (END for the deepest, ->basename:line otherwise).
 -- Returns (groups, group_order) where group_order is sorted by file:line:kind.
 local function group_error_frames()
     local group_order = {}
     local groups = {}
 
-    for _, err in ipairs(errors) do
+    for _, err in ipairs(S.errors) do
         if not matches_filter(err.kind) then goto filter_skip end
         for _, stack in ipairs(err.stacks) do
             for fi, frame in ipairs(stack.frames) do
@@ -648,13 +603,13 @@ local function get_qf_type(kind)
     return "E"
 end
 
--- Populate the quickfix list from the errors array.
+-- Populate the quickfix list from the S.errors array.
 local function populate_quickfix_from_errors()
     local groups, group_order = group_error_frames()
 
     local qf_entries = {}
-    qf_error_ids = {}
-    qf_file_lines = {}
+    S.qf_error_ids = {}
+    S.qf_file_lines = {}
 
     for _, group_key in ipairs(group_order) do
         local group = groups[group_key]
@@ -683,8 +638,8 @@ local function populate_quickfix_from_errors()
         for _, err in ipairs(errs) do
             table.insert(ids, err.id)
         end
-        table.insert(qf_error_ids, ids)
-        table.insert(qf_file_lines, { file = group.file, line = group.line })
+        table.insert(S.qf_error_ids, ids)
+        table.insert(S.qf_file_lines, { file = group.file, line = group.line })
     end
 
     vim.fn.setqflist(qf_entries, "r")
@@ -700,24 +655,24 @@ local function populate_quickfix_from_errors()
         if not seen[key] then
             seen[key] = true
             table.insert(deduped, entry)
-            if qf_error_ids[i] then
-                table.insert(deduped_ids, qf_error_ids[i])
+            if S.qf_error_ids[i] then
+                table.insert(deduped_ids, S.qf_error_ids[i])
             end
-            if qf_file_lines[i] then
-                table.insert(deduped_fl, qf_file_lines[i])
+            if S.qf_file_lines[i] then
+                table.insert(deduped_fl, S.qf_file_lines[i])
             end
         end
     end
     if #deduped < #qflist then
         vim.fn.setqflist(deduped, "r")
-        qf_error_ids = deduped_ids
-        qf_file_lines = deduped_fl
+        S.qf_error_ids = deduped_ids
+        S.qf_file_lines = deduped_fl
     end
 
     -- Set the quickfix title so the active filter is visible in the statusline.
     local title = "sanity"
-    if current_filter then
-        title = title .. " (filter: " .. table.concat(current_filter, ", ") .. ")"
+    if S.current_filter then
+        title = title .. " (filter: " .. table.concat(S.current_filter, ", ") .. ")"
     end
     vim.fn.setqflist({}, "a", { title = title })
 
@@ -728,7 +683,7 @@ end
 -- Set diagnostics on buffers for all error frames.
 -- When only_bufnr is given, only refresh diagnostics for that buffer.
 set_diagnostics = function(only_bufnr)
-    if not config.diagnostics_enabled then return end
+    if not S.config.diagnostics_enabled then return end
 
     local groups, group_order = group_error_frames()
 
@@ -763,7 +718,7 @@ set_diagnostics = function(only_bufnr)
     end
 
     for bufnr, diags in pairs(buf_diags) do
-        vim.diagnostic.set(ns, bufnr, diags)
+        vim.diagnostic.set(S.ns, bufnr, diags)
     end
 end
 
@@ -781,8 +736,8 @@ M.filter_errors = function(args)
         table.sort(preset_names)
         local msg = "Available kinds: " .. table.concat(kinds, ", ")
             .. "\nPresets: " .. table.concat(preset_names, ", ")
-        if current_filter then
-            msg = msg .. "\nCurrent filter: " .. table.concat(current_filter, ", ")
+        if S.current_filter then
+            msg = msg .. "\nCurrent filter: " .. table.concat(S.current_filter, ", ")
         end
         vim.notify(msg, vim.log.levels.INFO)
         return
@@ -794,18 +749,18 @@ M.filter_errors = function(args)
     end
     local filter_kinds = expand_filter_args(raw_args)
     if #filter_kinds == 0 then return end
-    current_filter = filter_kinds
+    S.current_filter = filter_kinds
     populate_quickfix_from_errors()
     set_diagnostics()
     vim.notify("Filter set: " .. table.concat(filter_kinds, ", "), vim.log.levels.INFO)
 end
 
 M.clear_filter = function()
-    if not current_filter then
+    if not S.current_filter then
         vim.notify("No filter active.", vim.log.levels.INFO)
         return
     end
-    current_filter = nil
+    S.current_filter = nil
     populate_quickfix_from_errors()
     set_diagnostics()
     vim.notify("Filter cleared.", vim.log.levels.INFO)
@@ -814,17 +769,17 @@ end
 M.toggle_diagnostics = function(args)
     local arg = args.args
     if arg == "on" then
-        config.diagnostics_enabled = true
+        S.config.diagnostics_enabled = true
         set_diagnostics()
     elseif arg == "off" then
-        config.diagnostics_enabled = false
-        vim.diagnostic.reset(ns)
+        S.config.diagnostics_enabled = false
+        vim.diagnostic.reset(S.ns)
     else
-        config.diagnostics_enabled = not config.diagnostics_enabled
-        if config.diagnostics_enabled then
+        S.config.diagnostics_enabled = not S.config.diagnostics_enabled
+        if S.config.diagnostics_enabled then
             set_diagnostics()
         else
-            vim.diagnostic.reset(ns)
+            vim.diagnostic.reset(S.ns)
         end
     end
 end
@@ -977,7 +932,7 @@ M.parse_valgrind_xml = function(xml_file)
             elseif close_tag == "pair" then
                 -- Suppression count pair.
                 if pair_name and pair_count then
-                    suppression_counts[pair_name] = tonumber(pair_count) or 0
+                    S.suppression_counts[pair_name] = tonumber(pair_count) or 0
                 end
                 pair_name = nil
                 pair_count = nil
@@ -1281,21 +1236,21 @@ M.parse_ubsan_log = function(log_file)
 end
 
 M.run_valgrind = function(args)
-    if valgrind_job_id then
-        vim.fn.jobstop(valgrind_job_id)
-        valgrind_job_id = nil
+    if S.valgrind_job_id then
+        vim.fn.jobstop(S.valgrind_job_id)
+        S.valgrind_job_id = nil
     end
-    if valgrind_xml_file then
-        vim.fn.delete(valgrind_xml_file)
-        valgrind_xml_file = nil
+    if S.valgrind_xml_file then
+        vim.fn.delete(S.valgrind_xml_file)
+        S.valgrind_xml_file = nil
     end
-    valgrind_generation = valgrind_generation + 1
-    local generation = valgrind_generation
-    last_valgrind_args = args.args
+    S.valgrind_generation = S.valgrind_generation + 1
+    local generation = S.valgrind_generation
+    S.last_valgrind_args = args.args
     local xml_file = vim.fn.tempname()
-    valgrind_xml_file = xml_file
+    S.valgrind_xml_file = xml_file
     local cmd = { "valgrind", "--num-callers=500", "--xml=yes", "--xml-file=" .. xml_file }
-    for _, supp_path in ipairs(config.valgrind_suppressions) do
+    for _, supp_path in ipairs(S.config.valgrind_suppressions) do
         table.insert(cmd, "--suppressions=" .. supp_path)
     end
     for _, a in ipairs(vim.split(args.args, "%s+", { trimempty = true })) do
@@ -1312,17 +1267,17 @@ M.run_valgrind = function(args)
             end
         end,
         on_exit = function(_, code)
-            valgrind_job_id = nil
+            S.valgrind_job_id = nil
             vim.schedule(function()
                 -- Discard result if a newer run or reset has occurred.
-                if generation ~= valgrind_generation then
+                if generation ~= S.valgrind_generation then
                     return
                 end
 
                 -- Clear the tracked file before loading so that reset_state()
                 -- (called inside valgrind_load_xml) does not delete the file
                 -- we are about to parse.
-                valgrind_xml_file = nil
+                S.valgrind_xml_file = nil
 
                 if vim.fn.filereadable(xml_file) ~= 1 then
                     local msg = "Valgrind did not produce output (exit code " .. code .. ")."
@@ -1349,22 +1304,22 @@ M.run_valgrind = function(args)
                 end
                 vim.fn.delete(xml_file)
 
-                -- Offer to re-run with --track-origins=yes for uninitialised value errors.
+                -- Offer to re-run with --track-origins=yes for uninitialised value S.errors.
                 -- Deferred so the scheduled cfirst from valgrind_load_xml runs
                 -- first; otherwise it dismisses the vim.ui.select prompt.
                 vim.schedule(function()
-                    if config.track_origins == false then return end
-                    if last_valgrind_args and last_valgrind_args:find("%-%-track%-origins") then return end
+                    if S.config.track_origins == false then return end
+                    if S.last_valgrind_args and S.last_valgrind_args:find("%-%-track%-origins") then return end
                     local has_uninit = false
-                    for _, e in ipairs(errors) do
+                    for _, e in ipairs(S.errors) do
                         if e.kind == "UninitCondition" or e.kind == "UninitValue" then
                             has_uninit = true
                             break
                         end
                     end
                     if not has_uninit then return end
-                    local rerun_args = "--track-origins=yes " .. last_valgrind_args
-                    if config.track_origins == true then
+                    local rerun_args = "--track-origins=yes " .. S.last_valgrind_args
+                    if S.config.track_origins == true then
                         M.run_valgrind({ args = rerun_args })
                     else
                         vim.ui.select({ "Yes", "No" }, {
@@ -1382,10 +1337,10 @@ M.run_valgrind = function(args)
     if job_id <= 0 then
         vim.notify("Failed to start valgrind.", vim.log.levels.ERROR)
         vim.fn.delete(xml_file)
-        valgrind_xml_file = nil
-        valgrind_generation = valgrind_generation + 1
+        S.valgrind_xml_file = nil
+        S.valgrind_generation = S.valgrind_generation + 1
     else
-        valgrind_job_id = job_id
+        S.valgrind_job_id = job_id
     end
 end
 
@@ -1394,7 +1349,7 @@ local keymaps_registered = false
 local function register_keymaps()
     if keymaps_registered then return end
     keymaps_registered = true
-    local keymaps = config.keymaps or {}
+    local keymaps = S.config.keymaps or {}
     local next_key = keymaps.stack_next
     if next_key == nil then next_key = "]s" end
     if next_key then
@@ -1430,9 +1385,9 @@ end
 -- Restore fingerprints from a previous session's snapshot file.
 -- Validates that every key is a string and every value is a number.
 local function restore_snapshot()
-    if not config.snapshot_file then return end
-    if prev_error_fingerprints then return end
-    local sf = io.open(config.snapshot_file, "r")
+    if not S.config.snapshot_file then return end
+    if S.prev_error_fingerprints then return end
+    local sf = io.open(S.config.snapshot_file, "r")
     if not sf then return end
     local content = sf:read("*a")
     sf:close()
@@ -1444,27 +1399,27 @@ local function restore_snapshot()
             valid[k] = v
         end
     end
-    prev_error_fingerprints = valid
+    S.prev_error_fingerprints = valid
 end
 
 -- Save current fingerprints to the snapshot file atomically.
 local function save_snapshot()
-    if not config.snapshot_file then return end
+    if not S.config.snapshot_file then return end
     local fps = snapshot_fingerprints()
     local ok, encoded = pcall(vim.json.encode, fps)
     if not ok then return end
-    local tmp_path = config.snapshot_file .. ".tmp"
+    local tmp_path = S.config.snapshot_file .. ".tmp"
     local sf = io.open(tmp_path, "w")
     if not sf then return end
     sf:write(encoded)
     sf:close()
-    os.rename(tmp_path, config.snapshot_file)
+    os.rename(tmp_path, S.config.snapshot_file)
 end
 
--- Prepare diff state before a load: snapshot existing errors or restore from disk.
+-- Prepare diff state before a load: snapshot existing S.errors or restore from disk.
 local function pre_load_diff()
-    if has_loaded then
-        prev_error_fingerprints = snapshot_fingerprints()
+    if S.has_loaded then
+        S.prev_error_fingerprints = snapshot_fingerprints()
     else
         restore_snapshot()
     end
@@ -1474,17 +1429,17 @@ M.valgrind_load_xml = function(args)
     register_keymaps()
     local xml_file = args.args
     pre_load_diff()
-    reset_state()
+    S.reset_state()
     local num_errors = M.parse_valgrind_xml(xml_file)
     populate_quickfix_from_errors()
     set_diagnostics()
     -- Schedule cfirst so it runs after BufReadPost autocmds (e.g.
     -- last-position-jump) that would otherwise override the cursor.
-    if #qf_error_ids > 0 then vim.schedule(function() vim.cmd("cfirst") end) end
-    local msg = "Processed " .. num_errors .. " errors from '" .. xml_file .. "' into " .. #qf_error_ids .. " locations."
+    if #S.qf_error_ids > 0 then vim.schedule(function() vim.cmd("cfirst") end) end
+    local msg = "Processed " .. num_errors .. " errors from '" .. xml_file .. "' into " .. #S.qf_error_ids .. " locations."
     local diff = compute_diff_summary()
     if diff then msg = msg .. diff end
-    has_loaded = true
+    S.has_loaded = true
     save_snapshot()
     vim.notify(msg)
 end
@@ -1492,7 +1447,7 @@ end
 local function load_files(filepaths)
     register_keymaps()
     pre_load_diff()
-    reset_state()
+    S.reset_state()
     for _, filepath in ipairs(filepaths) do
         local format = detect_log_format(filepath)
         if format == "valgrind_xml" then
@@ -1510,16 +1465,16 @@ local function load_files(filepaths)
     set_diagnostics()
     -- Schedule cfirst so it runs after BufReadPost autocmds (e.g.
     -- last-position-jump) that would otherwise override the cursor.
-    if #qf_error_ids > 0 then vim.schedule(function() vim.cmd("cfirst") end) end
-    local msg = "Loaded " .. #errors .. " errors into " .. #qf_error_ids .. " quickfix entries."
+    if #S.qf_error_ids > 0 then vim.schedule(function() vim.cmd("cfirst") end) end
+    local msg = "Loaded " .. #S.errors .. " errors into " .. #S.qf_error_ids .. " quickfix entries."
     local diff = compute_diff_summary()
     if diff then msg = msg .. diff end
-    has_loaded = true
-    last_loaded_files = filepaths
+    S.has_loaded = true
+    S.last_loaded_files = filepaths
     -- Restart watchers if watch mode is active so they track the new files.
-    if #watchers > 0 then
+    if #S.watchers > 0 then
         stop_watching()
-        start_watching(last_loaded_files)
+        start_watching(S.last_loaded_files)
     end
     save_snapshot()
     vim.notify(msg)
@@ -1528,17 +1483,14 @@ end
 -- Stack frame navigation.
 
 local function get_error_by_id(id)
-    return errors_by_id[id]
+    return S.errors_by_id[id]
 end
-
-local stack_bufnr = nil       -- Track the stack split buffer for toggling.
-local stack_frame_map = nil   -- buf line number (1-based) -> { file, line }
 
 -- Return (file, line, error_ids) for a quickfix entry index.
 local function get_qf_entry_position(idx)
     if not idx or idx < 1 then return nil, nil, nil end
-    local ids = qf_error_ids[idx]
-    local fl = qf_file_lines[idx]
+    local ids = S.qf_error_ids[idx]
+    local fl = S.qf_file_lines[idx]
     if fl then return fl.file, fl.line, ids end
     local qflist = vim.fn.getqflist()
     local entry = qflist[idx]
@@ -1575,25 +1527,25 @@ local function is_source_window(win)
     if vim.fn.buflisted(buf) ~= 1 then return false end
     local ft = vim.bo[buf].filetype
     if ft == "qf" or ft == "trouble" then return false end
-    if stack_bufnr and buf == stack_bufnr then return false end
+    if S.stack_bufnr and buf == S.stack_bufnr then return false end
     return true
 end
 
 -- Resolve a line in the stack buffer to the nearest frame entry.
 local function get_stack_frame_position(line)
-    if not stack_frame_map then return nil, nil, nil end
-    local info = stack_frame_map[line]
+    if not S.stack_frame_map then return nil, nil, nil end
+    local info = S.stack_frame_map[line]
     if info and info.file then return info.file, info.line, info.error_ids end
-    local max_line = vim.api.nvim_buf_line_count(stack_bufnr)
+    local max_line = vim.api.nvim_buf_line_count(S.stack_bufnr)
     for offset = 1, max_line do
         local down = line + offset
         if down <= max_line then
-            local d = stack_frame_map[down]
+            local d = S.stack_frame_map[down]
             if d and d.file then return d.file, d.line, d.error_ids end
         end
         local up = line - offset
         if up >= 1 then
-            local u = stack_frame_map[up]
+            local u = S.stack_frame_map[up]
             if u and u.file then return u.file, u.line, u.error_ids end
         end
     end
@@ -1608,7 +1560,7 @@ local function get_current_position()
     local win = vim.api.nvim_get_current_win()
     local buf = vim.api.nvim_win_get_buf(win)
 
-    if stack_bufnr and buf == stack_bufnr then
+    if S.stack_bufnr and buf == S.stack_bufnr then
         local line = vim.api.nvim_win_get_cursor(win)[1]
         local file, resolved_line, ids = get_stack_frame_position(line)
         if file and resolved_line then return file, resolved_line, ids end
@@ -1642,10 +1594,10 @@ local function get_error_at_cursor()
     if not file or not line then return nil end
     local ids = error_ids
     if not ids or #ids == 0 then
-        ids = location_index[file .. ":" .. line]
+        ids = S.location_index[file .. ":" .. line]
     end
     if not ids or #ids == 0 then return nil end
-    return errors_by_id[ids[1]]
+    return S.errors_by_id[ids[1]]
 end
 
 -- Extract addresses from an error's meta.addr field.
@@ -1669,7 +1621,7 @@ end
 -- Returns array of { file, line, label }.
 local function find_adjacent_frames(file, line, direction)
     local key = file .. ":" .. line
-    local ids = location_index[key]
+    local ids = S.location_index[key]
     if not ids then return {} end
 
     local targets = {}
@@ -1721,7 +1673,7 @@ end
 local function jump_to_frame(target)
     local cur_win = vim.api.nvim_get_current_win()
     local cur_buf = vim.api.nvim_win_get_buf(cur_win)
-    local from_stack_window = stack_bufnr and cur_buf == stack_bufnr
+    local from_stack_window = S.stack_bufnr and cur_buf == S.stack_bufnr
 
     if not is_source_window(cur_win) then
         local src_win = find_source_win()
@@ -1946,13 +1898,13 @@ M.suppress_error = function()
         vim.notify(tool_or_reason, vim.log.levels.WARN)
         return
     end
-    table.insert(suppressions, { text = text, tool = tool_or_reason })
-    vim.notify("Suppression queued (" .. #suppressions .. " total).")
+    table.insert(S.suppressions, { text = text, tool = tool_or_reason })
+    vim.notify("Suppression queued (" .. #S.suppressions .. " total).")
 end
 
--- SanitySaveSuppressions: write queued suppressions to file(s).
+-- SanitySaveSuppressions: write queued S.suppressions to file(s).
 M.save_suppressions = function(args)
-    if #suppressions == 0 then
+    if #S.suppressions == 0 then
         vim.notify("No suppressions to save.", vim.log.levels.INFO)
         return
     end
@@ -1960,14 +1912,14 @@ M.save_suppressions = function(args)
     local filename = args and args.args and args.args ~= "" and args.args or nil
 
     if filename then
-        -- Write all suppressions to a single file.
+        -- Write all S.suppressions to a single file.
         local fh, open_err = io.open(filename, "a")
         if not fh then
             vim.notify("Failed to open " .. filename .. ": " .. (open_err or "unknown error"), vim.log.levels.ERROR)
             return
         end
         local ok, write_err
-        for _, s in ipairs(suppressions) do
+        for _, s in ipairs(S.suppressions) do
             ok, write_err = fh:write(s.text .. "\n")
             if not ok then break end
         end
@@ -1976,12 +1928,12 @@ M.save_suppressions = function(args)
             vim.notify("Write failed for " .. filename .. ": " .. (write_err or "unknown error"), vim.log.levels.ERROR)
             return
         end
-        vim.notify("Wrote " .. #suppressions .. " suppression(s) to " .. filename .. ".")
-        suppressions = {}
+        vim.notify("Wrote " .. #S.suppressions .. " suppression(s) to " .. filename .. ".")
+        S.suppressions = {}
     else
         -- Partition by tool and write to default files.
         local by_tool = {}
-        for _, s in ipairs(suppressions) do
+        for _, s in ipairs(S.suppressions) do
             if not by_tool[s.tool] then
                 by_tool[s.tool] = {}
             end
@@ -1989,7 +1941,7 @@ M.save_suppressions = function(args)
         end
         local saved_tools = {}
         for tool, entries in pairs(by_tool) do
-            local path = config.suppression_files[tool]
+            local path = S.config.suppression_files[tool]
             if not path then
                 vim.notify("No default file configured for tool: " .. tool, vim.log.levels.WARN)
                 goto save_continue
@@ -2013,14 +1965,14 @@ M.save_suppressions = function(args)
             saved_tools[tool] = true
             ::save_continue::
         end
-        -- Only remove suppressions that were successfully written.
+        -- Only remove S.suppressions that were successfully written.
         local remaining = {}
-        for _, s in ipairs(suppressions) do
+        for _, s in ipairs(S.suppressions) do
             if not saved_tools[s.tool] then
                 table.insert(remaining, s)
             end
         end
-        suppressions = remaining
+        S.suppressions = remaining
     end
 end
 
@@ -2068,14 +2020,14 @@ local function parse_sanitizer_suppression_names(filepath)
     return result
 end
 
--- SanityAuditSuppressions: report which suppressions were used/unused in the last run.
+-- SanityAuditSuppressions: report which S.suppressions were used/unused in the last run.
 M.audit_suppressions = function()
     -- Collect valgrind suppression files to audit.
     local vg_files = {}
-    for _, path in ipairs(config.valgrind_suppressions) do
+    for _, path in ipairs(S.config.valgrind_suppressions) do
         table.insert(vg_files, path)
     end
-    local default_vg = config.suppression_files.valgrind
+    local default_vg = S.config.suppression_files.valgrind
     if default_vg and vim.fn.filereadable(default_vg) == 1 then
         local already = false
         for _, f in ipairs(vg_files) do
@@ -2089,13 +2041,13 @@ M.audit_suppressions = function()
     -- Collect sanitizer suppression files (TSan, LSan).
     local san_files = {}
     for _, key in ipairs({ "lsan", "tsan" }) do
-        local path = config.suppression_files[key]
+        local path = S.config.suppression_files[key]
         if path and vim.fn.filereadable(path) == 1 then
             table.insert(san_files, path)
         end
     end
 
-    local has_vg_data = not vim.tbl_isempty(suppression_counts)
+    local has_vg_data = not vim.tbl_isempty(S.suppression_counts)
     if #vg_files == 0 and #san_files == 0 then
         vim.notify("No suppression files configured or found.", vim.log.levels.INFO)
         return
@@ -2120,7 +2072,7 @@ M.audit_suppressions = function()
                 end
                 table.insert(lines, filepath .. ":")
                 for _, entry in ipairs(entries) do
-                    local count = suppression_counts[entry.name]
+                    local count = S.suppression_counts[entry.name]
                     if count and count > 0 then
                         table.insert(lines, string.format("  %s  (used %d time%s)",
                             entry.name, count, count == 1 and "" or "s"))
@@ -2162,7 +2114,7 @@ end
 
 -- SanityExport: serialize the current error set to a JSON file.
 M.export_errors = function(args)
-    if #errors == 0 then
+    if #S.errors == 0 then
         vim.notify("No errors to export.", vim.log.levels.INFO)
         return
     end
@@ -2171,7 +2123,7 @@ M.export_errors = function(args)
 
     -- Build a serializable representation of the error set.
     local export = {}
-    for _, err in ipairs(errors) do
+    for _, err in ipairs(S.errors) do
         if not matches_filter(err.kind) then goto export_continue end
         table.insert(export, {
             id = err.id,
@@ -2379,7 +2331,7 @@ end
 
 -- Find related targets sharing the same address as err.
 -- Includes other stacks within the same error (e.g. both sides of a
--- data race) and other errors referencing the same memory address.
+-- data race) and other S.errors referencing the same memory address.
 -- file/line is the current position used to exclude the caller's location.
 -- all_errors is the full error list to search for cross-error matches.
 local function find_related_targets(err, file, line, all_errors)
@@ -2403,7 +2355,7 @@ local function find_related_targets(err, file, line, all_errors)
         end
     end
 
-    -- Other errors sharing any address.
+    -- Other S.errors sharing any address.
     local addrs = extract_addrs(err)
     if #addrs > 0 then
         local seen_ids = { [err.id] = true }
@@ -2440,7 +2392,7 @@ M.show_related = function()
     end
 
     local file, line = get_current_position()
-    local targets = find_related_targets(err, file, line, errors)
+    local targets = find_related_targets(err, file, line, S.errors)
 
     if #targets == 0 then
         vim.notify("No related errors.", vim.log.levels.INFO)
@@ -2466,21 +2418,13 @@ end
 
 -- SanityStack: interactive split showing all stacks at the cursor line.
 
-local stack_win = nil         -- The stack split window.
-local stack_preview_win = nil -- The source/preview window.
-local stack_last_key = nil    -- "file:line" key to avoid redundant refreshes.
-local stack_augroup = nil     -- Augroup for source-tracking autocmd.
-local stack_last_preview = "" -- Preview dedup key.
-local stack_preview_ns = vim.api.nvim_create_namespace("sanity_stack_preview")
-local stack_hl_ns = vim.api.nvim_create_namespace("sanity_stack_hl")
-
 local function close_stack_split()
-    if stack_augroup then
-        vim.api.nvim_del_augroup_by_id(stack_augroup)
-        stack_augroup = nil
+    if S.stack_augroup then
+        vim.api.nvim_del_augroup_by_id(S.stack_augroup)
+        S.stack_augroup = nil
     end
-    if stack_bufnr and vim.api.nvim_buf_is_valid(stack_bufnr) then
-        local wins = vim.fn.win_findbuf(stack_bufnr)
+    if S.stack_bufnr and vim.api.nvim_buf_is_valid(S.stack_bufnr) then
+        local wins = vim.fn.win_findbuf(S.stack_bufnr)
         for _, win in ipairs(wins) do
             vim.api.nvim_win_close(win, true)
         end
@@ -2488,15 +2432,15 @@ local function close_stack_split()
     -- Clear preview highlights from all buffers.
     for _, b in ipairs(vim.api.nvim_list_bufs()) do
         if vim.api.nvim_buf_is_valid(b) then
-            vim.api.nvim_buf_clear_namespace(b, stack_preview_ns, 0, -1)
+            vim.api.nvim_buf_clear_namespace(b, S.stack_preview_ns, 0, -1)
         end
     end
-    stack_bufnr = nil
-    stack_frame_map = nil
-    stack_win = nil
-    stack_preview_win = nil
-    stack_last_key = nil
-    stack_last_preview = ""
+    S.stack_bufnr = nil
+    S.stack_frame_map = nil
+    S.stack_win = nil
+    S.stack_preview_win = nil
+    S.stack_last_key = nil
+    S.stack_last_preview = ""
 end
 
 -- Find a suitable preview window, avoiding quickfix and stack buffer windows.
@@ -2505,13 +2449,13 @@ local function find_preview_win()
     if alt ~= 0 and vim.api.nvim_win_is_valid(alt) then
         local bt = vim.bo[vim.api.nvim_win_get_buf(alt)].buftype
         local bn = vim.api.nvim_win_get_buf(alt)
-        if bt == "" and bn ~= stack_bufnr then
+        if bt == "" and bn ~= S.stack_bufnr then
             return alt
         end
     end
     for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
         local buf = vim.api.nvim_win_get_buf(win)
-        if vim.bo[buf].buftype == "" and buf ~= stack_bufnr then
+        if vim.bo[buf].buftype == "" and buf ~= S.stack_bufnr then
             return win
         end
     end
@@ -2574,7 +2518,7 @@ local function dedup_stacks(stacks)
     return out
 end
 
--- Compose thread-aware stacks for sanitizer errors.  Operation stacks
+-- Compose thread-aware stacks for sanitizer S.errors.  Operation stacks
 -- ("by thread T1") are concatenated with the corresponding creation stacks
 -- ("Thread T1 ... created") so the trie can merge shared callers.
 local function compose_thread_stacks(all_stacks)
@@ -3233,16 +3177,16 @@ end
 
 -- Build the stack content lines and frame map for a given file:line.
 -- When error_ids is provided (from quickfix), uses those directly instead of
--- looking up location_index, which avoids path-normalisation mismatches.
--- Returns buf_lines, frame_map, cursor_line or nil if no errors.
+-- looking up S.location_index, which avoids path-normalisation mismatches.
+-- Returns buf_lines, frame_map, cursor_line or nil if no S.errors.
 local function build_stack_content(file, line, error_ids)
     local ids = error_ids
     if not ids or #ids == 0 then
-        ids = location_index[file .. ":" .. line]
+        ids = S.location_index[file .. ":" .. line]
     end
     if not ids or #ids == 0 then return nil end
 
-    -- Expand to all related errors: any error sharing a frame with the initial
+    -- Expand to all related S.errors: any error sharing a frame with the initial
     -- set is included, transitively.  This ensures the full tree is shown
     -- regardless of which frame the user triggered the stack from.
     local seen_ids = {}
@@ -3260,7 +3204,7 @@ local function build_stack_content(file, line, error_ids)
         if err then
             for _, stack in ipairs(err.stacks) do
                 for _, frame in ipairs(stack.frames) do
-                    local neighbours = location_index[frame.file .. ":" .. frame.line]
+                    local neighbours = S.location_index[frame.file .. ":" .. frame.line]
                     if neighbours then
                         for _, nid in ipairs(neighbours) do
                             if not seen_ids[nid] then
@@ -3395,7 +3339,7 @@ local function build_stack_content(file, line, error_ids)
         end
     end
 
-    -- Group errors by kind so same-kind errors are merged into one tree.
+    -- Group S.errors by kind so same-kind S.errors are merged into one tree.
     local kind_groups = {}
     local kind_order = {}
     for _, err in ipairs(err_list) do
@@ -3480,7 +3424,7 @@ local function build_stack_content(file, line, error_ids)
                     }
                 end
                 render_call_trie(trie_root, common_leaves, emit_frame, emit_label,
-                    config.stack_fold_limit, emit_fold_summary)
+                    S.config.stack_fold_limit, emit_fold_summary)
             end
         end
     end
@@ -3490,7 +3434,7 @@ end
 
 -- Apply syntax highlights to the stack buffer via extmarks.
 local function highlight_stack_buf(buf, lines, fmap)
-    vim.api.nvim_buf_clear_namespace(buf, stack_hl_ns, 0, -1)
+    vim.api.nvim_buf_clear_namespace(buf, S.stack_hl_ns, 0, -1)
     for i, line in ipairs(lines) do
         local row = i - 1
         local fi = fmap[i]
@@ -3498,7 +3442,7 @@ local function highlight_stack_buf(buf, lines, fmap)
             -- Frame line: prefix (tree chars) | function name | file:line.
             local pb = fi.prefix_bytes
             if pb > 0 then
-                vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, 0, {
+                vim.api.nvim_buf_set_extmark(buf, S.stack_hl_ns, row, 0, {
                     end_col = pb, hl_group = "NonText",
                 })
             end
@@ -3515,7 +3459,7 @@ local function highlight_stack_buf(buf, lines, fmap)
                 local func_field = line:sub(pb + 1, func_end_1b)
                 local trimmed = func_field:match("^(.-)%s*$") or func_field
                 if #trimmed > 0 then
-                    vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, pb, {
+                    vim.api.nvim_buf_set_extmark(buf, S.stack_hl_ns, row, pb, {
                         end_col = pb + #trimmed, hl_group = "Function",
                     })
                 end
@@ -3523,26 +3467,26 @@ local function highlight_stack_buf(buf, lines, fmap)
             if loc_byte_idx1 then
                 local loc_start = loc_byte_idx1 - 1
                 if loc_start < #line then
-                    vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, loc_start, {
+                    vim.api.nvim_buf_set_extmark(buf, S.stack_hl_ns, row, loc_start, {
                         end_col = #line, hl_group = "Directory",
                     })
                 end
             end
         elseif line:match("^%[.-%]") then
             -- Header line: [Kind] message.
-            vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, 0, {
+            vim.api.nvim_buf_set_extmark(buf, S.stack_hl_ns, row, 0, {
                 end_col = #line, hl_group = "Title",
             })
         elseif fi and fi.collapsed_frames then
             -- Collapsed chain summary line: highlight entirely as Comment.
             local pb = fi.prefix_bytes or 0
             if pb > 0 then
-                vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, 0, {
+                vim.api.nvim_buf_set_extmark(buf, S.stack_hl_ns, row, 0, {
                     end_col = pb, hl_group = "NonText",
                 })
             end
             if pb < #line then
-                vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, pb, {
+                vim.api.nvim_buf_set_extmark(buf, S.stack_hl_ns, row, pb, {
                     end_col = #line, hl_group = "Comment",
                 })
             end
@@ -3550,12 +3494,12 @@ local function highlight_stack_buf(buf, lines, fmap)
             -- Label line: tree prefix then label text.
             local pb = fi.prefix_bytes
             if pb > 0 then
-                vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, 0, {
+                vim.api.nvim_buf_set_extmark(buf, S.stack_hl_ns, row, 0, {
                     end_col = pb, hl_group = "NonText",
                 })
             end
             if pb < #line then
-                vim.api.nvim_buf_set_extmark(buf, stack_hl_ns, row, pb, {
+                vim.api.nvim_buf_set_extmark(buf, S.stack_hl_ns, row, pb, {
                     end_col = #line, hl_group = "Comment",
                 })
             end
@@ -3564,40 +3508,40 @@ local function highlight_stack_buf(buf, lines, fmap)
 end
 
 -- Refresh the stack buffer content for a new file:line position.
--- When there are no errors at the new position, keeps the last stack visible.
+-- When there are no S.errors at the new position, keeps the last stack visible.
 refresh_stack = function(file, line, error_ids)
-    if not stack_bufnr or not vim.api.nvim_buf_is_valid(stack_bufnr) then return end
+    if not S.stack_bufnr or not vim.api.nvim_buf_is_valid(S.stack_bufnr) then return end
 
     local new_key = file .. ":" .. line
-    if new_key == stack_last_key then return end
+    if new_key == S.stack_last_key then return end
 
     local buf_lines, frame_map, cursor_line = build_stack_content(file, line, error_ids)
     if not buf_lines then
-        stack_last_key = new_key
+        S.stack_last_key = new_key
         return
     end
 
-    stack_last_key = new_key
-    stack_frame_map = frame_map
+    S.stack_last_key = new_key
+    S.stack_frame_map = frame_map
 
-    vim.bo[stack_bufnr].modifiable = true
-    vim.api.nvim_buf_set_lines(stack_bufnr, 0, -1, false, buf_lines)
-    vim.bo[stack_bufnr].modifiable = false
-    highlight_stack_buf(stack_bufnr, buf_lines, frame_map)
+    vim.bo[S.stack_bufnr].modifiable = true
+    vim.api.nvim_buf_set_lines(S.stack_bufnr, 0, -1, false, buf_lines)
+    vim.bo[S.stack_bufnr].modifiable = false
+    highlight_stack_buf(S.stack_bufnr, buf_lines, frame_map)
 
-    if stack_win and vim.api.nvim_win_is_valid(stack_win) then
-        vim.api.nvim_win_set_height(stack_win, math.min(15, #buf_lines))
-        vim.api.nvim_win_set_cursor(stack_win, { cursor_line, 0 })
+    if S.stack_win and vim.api.nvim_win_is_valid(S.stack_win) then
+        vim.api.nvim_win_set_height(S.stack_win, math.min(15, #buf_lines))
+        vim.api.nvim_win_set_cursor(S.stack_win, { cursor_line, 0 })
     end
 
     -- Reset preview so the next CursorMoved triggers a fresh preview.
-    stack_last_preview = ""
+    S.stack_last_preview = ""
 end
 
 -- Expand a collapsed summary line in the stack buffer.
 local function expand_collapsed_line(line_nr)
-    if not stack_bufnr or not vim.api.nvim_buf_is_valid(stack_bufnr) then return end
-    local info = stack_frame_map and stack_frame_map[line_nr]
+    if not S.stack_bufnr or not vim.api.nvim_buf_is_valid(S.stack_bufnr) then return end
+    local info = S.stack_frame_map and S.stack_frame_map[line_nr]
     if not info or not info.collapsed_frames then return end
 
     local frames = info.collapsed_frames
@@ -3606,7 +3550,7 @@ local function expand_collapsed_line(line_nr)
     -- Reuse the prefix from the summary line (up to prefix_bytes).
     -- The summary line was rendered with the correct rail characters, so
     -- we extract that prefix and pad it for each expanded frame.
-    local summary_text = vim.api.nvim_buf_get_lines(stack_bufnr, line_nr - 1, line_nr, false)[1] or ""
+    local summary_text = vim.api.nvim_buf_get_lines(S.stack_bufnr, line_nr - 1, line_nr, false)[1] or ""
     local pb = info.prefix_bytes or 0
     local prefix = summary_text:sub(1, pb) .. "  "
 
@@ -3626,15 +3570,15 @@ local function expand_collapsed_line(line_nr)
     end
 
     -- Replace the summary line with expanded lines.
-    vim.bo[stack_bufnr].modifiable = true
-    vim.api.nvim_buf_set_lines(stack_bufnr, line_nr - 1, line_nr, false, expanded_lines)
-    vim.bo[stack_bufnr].modifiable = false
+    vim.bo[S.stack_bufnr].modifiable = true
+    vim.api.nvim_buf_set_lines(S.stack_bufnr, line_nr - 1, line_nr, false, expanded_lines)
+    vim.bo[S.stack_bufnr].modifiable = false
 
     -- Rebuild frame_map: replace the summary entry with expanded entries
     -- and shift everything after the insertion point.
     local shift = #expanded_lines - 1
     local new_map = {}
-    for k, v in pairs(stack_frame_map) do
+    for k, v in pairs(S.stack_frame_map) do
         if type(k) == "number" then
             if k < line_nr then
                 new_map[k] = v
@@ -3653,17 +3597,17 @@ local function expand_collapsed_line(line_nr)
     for i, entry in ipairs(expanded_entries) do
         new_map[line_nr + i - 1] = entry
     end
-    stack_frame_map = new_map
+    S.stack_frame_map = new_map
 
     -- Re-highlight the buffer.
-    local all_lines = vim.api.nvim_buf_get_lines(stack_bufnr, 0, -1, false)
-    highlight_stack_buf(stack_bufnr, all_lines, stack_frame_map)
+    local all_lines = vim.api.nvim_buf_get_lines(S.stack_bufnr, 0, -1, false)
+    highlight_stack_buf(S.stack_bufnr, all_lines, S.stack_frame_map)
 end
 
 M.sanity_stack = function()
     -- Toggle off if already open.
-    if stack_bufnr and vim.api.nvim_buf_is_valid(stack_bufnr) then
-        local wins = vim.fn.win_findbuf(stack_bufnr)
+    if S.stack_bufnr and vim.api.nvim_buf_is_valid(S.stack_bufnr) then
+        local wins = vim.fn.win_findbuf(S.stack_bufnr)
         if #wins > 0 then
             close_stack_split()
             return
@@ -3683,11 +3627,11 @@ M.sanity_stack = function()
     end
 
     -- Find the preview window before creating the split.
-    stack_preview_win = find_preview_win()
+    S.stack_preview_win = find_preview_win()
 
     -- Create the stack buffer.
     local buf = vim.api.nvim_create_buf(false, true)
-    stack_bufnr = buf
+    S.stack_bufnr = buf
     vim.bo[buf].buftype = "nofile"
     vim.bo[buf].bufhidden = "wipe"
     vim.bo[buf].swapfile = false
@@ -3697,59 +3641,59 @@ M.sanity_stack = function()
     -- Open a horizontal split at the bottom.
     local height = math.min(15, #buf_lines)
     vim.cmd("botright " .. height .. "split")
-    stack_win = vim.api.nvim_get_current_win()
-    vim.api.nvim_win_set_buf(stack_win, buf)
-    vim.wo[stack_win].cursorline = true
-    vim.wo[stack_win].number = false
-    vim.wo[stack_win].relativenumber = false
-    vim.wo[stack_win].signcolumn = "no"
-    vim.wo[stack_win].winfixheight = true
+    S.stack_win = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(S.stack_win, buf)
+    vim.wo[S.stack_win].cursorline = true
+    vim.wo[S.stack_win].number = false
+    vim.wo[S.stack_win].relativenumber = false
+    vim.wo[S.stack_win].signcolumn = "no"
+    vim.wo[S.stack_win].winfixheight = true
 
     -- Set initial content.
-    stack_frame_map = frame_map
-    stack_last_key = file .. ":" .. line
+    S.stack_frame_map = frame_map
+    S.stack_last_key = file .. ":" .. line
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, buf_lines)
     vim.bo[buf].modifiable = false
     highlight_stack_buf(buf, buf_lines, frame_map)
-    vim.api.nvim_win_set_cursor(stack_win, { cursor_line, 0 })
+    vim.api.nvim_win_set_cursor(S.stack_win, { cursor_line, 0 })
 
     -- Preview a frame in the source window.
     local function preview_frame(frame_info)
         local preview_key = frame_info.file .. ":" .. frame_info.line
-        if preview_key == stack_last_preview then return end
-        stack_last_preview = preview_key
+        if preview_key == S.stack_last_preview then return end
+        S.stack_last_preview = preview_key
 
-        if not stack_preview_win or not vim.api.nvim_win_is_valid(stack_preview_win) then
+        if not S.stack_preview_win or not vim.api.nvim_win_is_valid(S.stack_preview_win) then
             return
         end
 
         -- Open the file in the preview window.
-        local cur_buf = vim.api.nvim_win_get_buf(stack_preview_win)
+        local cur_buf = vim.api.nvim_win_get_buf(S.stack_preview_win)
         local cur_name = vim.api.nvim_buf_get_name(cur_buf)
         if cur_name ~= frame_info.file then
-            vim.api.nvim_win_call(stack_preview_win, function()
+            vim.api.nvim_win_call(S.stack_preview_win, function()
                 vim.cmd("edit " .. vim.fn.fnameescape(frame_info.file))
             end)
         end
 
         -- Scroll to the line and centre it.
-        local target_buf = vim.api.nvim_win_get_buf(stack_preview_win)
+        local target_buf = vim.api.nvim_win_get_buf(S.stack_preview_win)
         local lc = vim.api.nvim_buf_line_count(target_buf)
         local target_line = math.min(frame_info.line, lc)
-        vim.api.nvim_win_set_cursor(stack_preview_win, { target_line, 0 })
-        vim.api.nvim_win_call(stack_preview_win, function()
+        vim.api.nvim_win_set_cursor(S.stack_preview_win, { target_line, 0 })
+        vim.api.nvim_win_call(S.stack_preview_win, function()
             vim.cmd("normal! zz")
         end)
 
         -- Highlight the previewed line.
-        vim.api.nvim_buf_clear_namespace(target_buf, stack_preview_ns, 0, -1)
-        vim.api.nvim_buf_add_highlight(target_buf, stack_preview_ns, "CursorLine",
+        vim.api.nvim_buf_clear_namespace(target_buf, S.stack_preview_ns, 0, -1)
+        vim.api.nvim_buf_add_highlight(target_buf, S.stack_preview_ns, "CursorLine",
             target_line - 1, 0, -1)
     end
 
     -- Preview the initial frame.
-    if stack_frame_map[cursor_line] and stack_frame_map[cursor_line].file then
-        preview_frame(stack_frame_map[cursor_line])
+    if S.stack_frame_map[cursor_line] and S.stack_frame_map[cursor_line].file then
+        preview_frame(S.stack_frame_map[cursor_line])
     end
 
     -- CursorMoved autocmd on the stack buffer for live preview.
@@ -3759,9 +3703,9 @@ M.sanity_stack = function()
         buffer = buf,
         nested = true,
         callback = function()
-            if not stack_win or not vim.api.nvim_win_is_valid(stack_win) then return end
-            local cur = vim.api.nvim_win_get_cursor(stack_win)[1]
-            local info = stack_frame_map and stack_frame_map[cur]
+            if not S.stack_win or not vim.api.nvim_win_is_valid(S.stack_win) then return end
+            local cur = vim.api.nvim_win_get_cursor(S.stack_win)[1]
+            local info = S.stack_frame_map and S.stack_frame_map[cur]
             if info and info.file then
                 preview_frame(info)
             end
@@ -3771,11 +3715,11 @@ M.sanity_stack = function()
     -- Source-tracking autocmd: refresh stack when cursor moves in other windows.
     -- Deferred via vim.schedule so buffer modifications happen outside the
     -- CursorMoved handler (avoids silent failures in special buffers like quickfix).
-    stack_augroup = vim.api.nvim_create_augroup("sanity_stack_track", { clear = true })
+    S.stack_augroup = vim.api.nvim_create_augroup("sanity_stack_track", { clear = true })
     vim.api.nvim_create_autocmd("CursorMoved", {
-        group = stack_augroup,
+        group = S.stack_augroup,
         callback = function()
-            if vim.api.nvim_get_current_buf() == stack_bufnr then return end
+            if vim.api.nvim_get_current_buf() == S.stack_bufnr then return end
             vim.schedule(function()
                 local f, l, ids = get_current_position()
                 if f and l then refresh_stack(f, l, ids) end
@@ -3793,13 +3737,13 @@ M.sanity_stack = function()
 
     -- Helper: find next/previous frame line.
     local function jump_to_frame_line(direction)
-        if not stack_win or not vim.api.nvim_win_is_valid(stack_win) then return end
-        local cur = vim.api.nvim_win_get_cursor(stack_win)[1]
-        local line_count = vim.api.nvim_buf_line_count(stack_bufnr)
+        if not S.stack_win or not vim.api.nvim_win_is_valid(S.stack_win) then return end
+        local cur = vim.api.nvim_win_get_cursor(S.stack_win)[1]
+        local line_count = vim.api.nvim_buf_line_count(S.stack_bufnr)
         local target = cur + direction
         while target >= 1 and target <= line_count do
-            if stack_frame_map and stack_frame_map[target] and stack_frame_map[target].file then
-                vim.api.nvim_win_set_cursor(stack_win, { target, 0 })
+            if S.stack_frame_map and S.stack_frame_map[target] and S.stack_frame_map[target].file then
+                vim.api.nvim_win_set_cursor(S.stack_win, { target, 0 })
                 return
             end
             target = target + direction
@@ -3812,7 +3756,7 @@ M.sanity_stack = function()
     -- Close the split.
     local function close()
         -- Capture preview win before close clears it.
-        local pw = stack_preview_win
+        local pw = S.stack_preview_win
         close_stack_split()
         if pw and vim.api.nvim_win_is_valid(pw) then
             vim.api.nvim_set_current_win(pw)
@@ -3823,11 +3767,11 @@ M.sanity_stack = function()
 
     -- Jump to frame under cursor.
     vim.keymap.set("n", "<CR>", function()
-        if not stack_win or not vim.api.nvim_win_is_valid(stack_win) then return end
-        local cur = vim.api.nvim_win_get_cursor(stack_win)[1]
-        local info = stack_frame_map and stack_frame_map[cur]
+        if not S.stack_win or not vim.api.nvim_win_is_valid(S.stack_win) then return end
+        local cur = vim.api.nvim_win_get_cursor(S.stack_win)[1]
+        local info = S.stack_frame_map and S.stack_frame_map[cur]
         if not info or not info.file then return end
-        local pw = stack_preview_win
+        local pw = S.stack_preview_win
         close_stack_split()
         if pw and vim.api.nvim_win_is_valid(pw) then
             vim.api.nvim_set_current_win(pw)
@@ -3842,31 +3786,31 @@ M.sanity_stack = function()
 
     -- Expand collapsed chain summary lines.
     vim.keymap.set("n", "<Tab>", function()
-        if not stack_win or not vim.api.nvim_win_is_valid(stack_win) then return end
-        local cur = vim.api.nvim_win_get_cursor(stack_win)[1]
+        if not S.stack_win or not vim.api.nvim_win_is_valid(S.stack_win) then return end
+        local cur = vim.api.nvim_win_get_cursor(S.stack_win)[1]
         expand_collapsed_line(cur)
     end, kopts)
 end
 
 -- Close all active file watchers.
 stop_watching = function()
-    if watch_timer then
-        watch_timer:stop()
-        watch_timer:close()
-        watch_timer = nil
+    if S.watch_timer then
+        S.watch_timer:stop()
+        S.watch_timer:close()
+        S.watch_timer = nil
     end
-    for _, w in ipairs(watchers) do
+    for _, w in ipairs(S.watchers) do
         w:stop()
         w:close()
     end
-    watchers = {}
+    S.watchers = {}
 end
 
 -- Start watching the given file paths for changes.
 start_watching = function(files)
     -- Create a single shared debounce timer for all watched files.
-    if not watch_timer then
-        watch_timer = vim.uv.new_timer()
+    if not S.watch_timer then
+        S.watch_timer = vim.uv.new_timer()
     end
 
     for _, filepath in ipairs(files) do
@@ -3876,15 +3820,15 @@ start_watching = function(files)
                 if err then return end
                 -- Debounce: restart the shared timer on each change event.
                 vim.schedule(function()
-                    if not watch_timer then return end
-                    watch_timer:stop()
-                    watch_timer:start(100, 0, vim.schedule_wrap(function()
-                        load_files(last_loaded_files)
+                    if not S.watch_timer then return end
+                    S.watch_timer:stop()
+                    S.watch_timer:start(100, 0, vim.schedule_wrap(function()
+                        load_files(S.last_loaded_files)
                     end))
                 end)
             end)
             if ok == 0 then
-                table.insert(watchers, handle)
+                table.insert(S.watchers, handle)
             else
                 handle:close()
                 vim.notify("Failed to watch: " .. filepath .. " (" .. tostring(start_err) .. ")",
@@ -3903,7 +3847,7 @@ M.watch_toggle = function(args)
     elseif arg == "off" then
         want_on = false
     else
-        want_on = #watchers == 0
+        want_on = #S.watchers == 0
     end
 
     if not want_on then
@@ -3912,16 +3856,16 @@ M.watch_toggle = function(args)
         return
     end
 
-    if #last_loaded_files == 0 then
+    if #S.last_loaded_files == 0 then
         vim.notify("No files loaded. Load files first with :SanityLoadLog.", vim.log.levels.WARN)
         return
     end
 
     stop_watching()
-    start_watching(last_loaded_files)
+    start_watching(S.last_loaded_files)
 
     local names = {}
-    for _, f in ipairs(last_loaded_files) do
+    for _, f in ipairs(S.last_loaded_files) do
         table.insert(names, vim.fn.fnamemodify(f, ":t"))
     end
     vim.notify("Watching: " .. table.concat(names, ", "), vim.log.levels.INFO)
@@ -3930,7 +3874,7 @@ end
 M.sanity_load_log = function(args)
     local filepaths = args.fargs
     if #filepaths == 0 then
-        pickers.pick_files(config.picker, load_files)
+        pickers.pick_files(S.config.picker, load_files)
         return
     end
     load_files(filepaths)
@@ -3939,25 +3883,25 @@ end
 -- Expose internals for testing behind a single table.
 M._test = {
   new_error = new_error,
-  reset_state = reset_state,
+  reset_state = S.reset_state,
   build_stack_content = build_stack_content,
   strip_label = strip_label,
   find_related_targets = find_related_targets,
   generate_suppression = generate_suppression,
-  errors = function() return errors end,
-  location_index = function() return location_index end,
+  errors = function() return S.errors end,
+  location_index = function() return S.location_index end,
   error_fingerprint = error_fingerprint,
   snapshot_fingerprints = snapshot_fingerprints,
   compute_diff_summary = function() return compute_diff_summary() end,
   compute_diff_details = function() return compute_diff_details() end,
-  set_prev_fingerprints = function(fps) prev_error_fingerprints = fps; has_loaded = fps ~= nil end,
+  set_prev_fingerprints = function(fps) S.prev_error_fingerprints = fps; S.has_loaded = fps ~= nil end,
   detect_log_format = detect_log_format,
   parse_suppression_names = parse_suppression_names,
   parse_sanitizer_suppression_names = parse_sanitizer_suppression_names,
   get_available_kinds = get_available_kinds,
   expand_filter_args = expand_filter_args,
   matches_filter = matches_filter,
-  set_filter = function(f) current_filter = f end,
+  set_filter = function(f) S.current_filter = f end,
   format_link_set = format_link_set,
   format_valgrind_group = format_valgrind_group,
   format_sanitizer_group = format_sanitizer_group,
@@ -3971,7 +3915,7 @@ M._test = {
   compute_sharing_ratio = compute_sharing_ratio,
   normalize_path = normalize_path,
   resolve_path = resolve_path,
-  set_config = function(key, val) config[key] = val end,
+  set_config = function(key, val) S.config[key] = val end,
   restore_snapshot = restore_snapshot,
   save_snapshot = save_snapshot,
 }
