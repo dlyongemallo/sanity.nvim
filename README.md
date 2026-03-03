@@ -1,6 +1,6 @@
 # sanity.nvim
 
-A Neovim plugin for integrating dynamic analysis tools such as `valgrind` (`memcheck` and `helgrind`) and sanitizers (address and thread).
+A Neovim plugin for integrating dynamic analysis tools such as `valgrind` (`memcheck` and `helgrind`) and sanitizers (address, memory, and thread).
 
 ## Installation
 

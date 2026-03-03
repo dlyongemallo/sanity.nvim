@@ -156,6 +156,18 @@ local M = {
             "Use sigaction with SA_RESTART where appropriate.",
         },
     },
+    ["use-of-uninitialized-value"] = {
+        title = "Use of Uninitialised Value (MSAN)",
+        description = "MemorySanitizer detected a read of memory that was never written to. " ..
+            "Unlike valgrind's bit-level tracking, MSAN catches the use at the point " ..
+            "where the uninitialised data influences program behaviour.",
+        common_fixes = {
+            "Initialise variables at declaration.",
+            "Ensure all struct/array members are set before use.",
+            "Check all code paths initialise the variable.",
+            "Compile with -fsanitize-memory-track-origins for origin tracking.",
+        },
+    },
 }
 
 -- Sanitizer "data-race" is the same explanation as Helgrind "Race".

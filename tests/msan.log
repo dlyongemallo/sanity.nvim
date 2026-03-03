@@ -1,0 +1,9 @@
+==12345==WARNING: MemorySanitizer: use-of-uninitialized-value
+    #0 0x5555555551a0 in process_data /home/user/project/examples/demo.c:42
+    #1 0x555555555300 in main /home/user/project/examples/demo.c:100
+    #2 0x7ffff7a3a249 in __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58
+
+  Uninitialized value was created by an allocation of 'buf' in the stack frame
+    #0 0x555555555180 in process_data /home/user/project/examples/demo.c:38
+
+SUMMARY: MemorySanitizer: use-of-uninitialized-value /home/user/project/examples/demo.c:42 in process_data
