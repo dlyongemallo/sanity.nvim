@@ -150,6 +150,13 @@ local function normalize_path(path)
     return vim.fs.normalize(path)
 end
 
+-- Resolve a possibly-relative path to an absolute, normalised form.
+-- Uses fnamemodify(":p") which is cross-platform (handles Windows drive
+-- letters, backslashes, etc.) and resolves relative paths against cwd.
+local function resolve_path(path)
+    return normalize_path(vim.fn.fnamemodify(path, ":p"))
+end
+
 -- Create an error object, register it, and update location_index.
 local function new_error(kind, message, source, stacks, meta)
     error_id_counter = error_id_counter + 1
@@ -313,6 +320,10 @@ local function detect_log_format(filepath)
         if line:match("WARNING: .*Sanitizer:") or line:match("ERROR: .*Sanitizer:") then
             f:close()
             return "sanitizer_log"
+        end
+        if line:match(": runtime error:") then
+            f:close()
+            return "ubsan_log"
         end
     end
     f:close()
@@ -508,6 +519,9 @@ filter_presets = {
         "InvalidRead", "InvalidWrite", "InvalidFree",
         "UninitCondition", "UninitValue", "Overlap",
         "heap-use-after-free", "heap-buffer-overflow", "stack-buffer-overflow",
+        "use-of-uninitialized-value",
+        "signed-integer-overflow", "division-by-zero", "shift-exponent",
+        "null-pointer-passed-as-argument",
     },
     leaks = {
         "Leak_",
@@ -1137,6 +1151,7 @@ M.parse_sanitizer_log = function(log_file)
             if not target then
                 goto not_source_file_continue
             end
+            target = resolve_path(target)
             if not starts_with(target, cwd) then
                 goto not_source_file_continue
             end
@@ -1165,6 +1180,94 @@ M.parse_sanitizer_log = function(log_file)
     finalize_error()
 
     return num_processed_lines
+end
+
+-- Parse a UndefinedBehaviorSanitizer log file into structured error objects.
+-- UBSAN format: file:line:col: runtime error: message
+-- Optionally followed by ASAN-style stack frames (#N 0xaddr in func file:line).
+M.parse_ubsan_log = function(log_file)
+    local log_file_handle = io.open(log_file, "r")
+    if not log_file_handle then
+        vim.notify("Failed to read UBSAN log file: " .. log_file, vim.log.levels.ERROR)
+        return 0
+    end
+
+    local cwd = vim.fn.getcwd()
+    local num_errors = 0
+    local current_file = nil
+    local current_line_num = nil
+    local current_kind = nil
+    local current_message = nil
+    local current_frames = {}
+
+    -- Finalize the current error (if any).
+    local function finalize_error()
+        if not current_kind then return end
+        local stacks = {}
+        if #current_frames > 0 then
+            table.insert(stacks, { label = current_message, frames = current_frames })
+        elseif current_file and starts_with(current_file, cwd) then
+            -- No stack frames; use the header location as a single-frame stack.
+            table.insert(stacks, {
+                label = current_message,
+                frames = { { file = current_file, line = current_line_num, func = nil } },
+            })
+        end
+        if #stacks > 0 then
+            new_error(current_kind, current_message, "sanitizer", stacks, {})
+            num_errors = num_errors + 1
+        end
+        current_file = nil
+        current_line_num = nil
+        current_kind = nil
+        current_message = nil
+        current_frames = {}
+    end
+
+    local ok, parse_err = pcall(function()
+    for line in log_file_handle:lines() do
+        -- Match UBSAN error header: file:line:col: runtime error: message
+        local file, lnum, msg = line:match("^(.+):(%d+):%d+: runtime error: (.+)$")
+        if file and lnum and msg then
+            finalize_error()
+            current_file = resolve_path(file)
+            current_line_num = tonumber(lnum)
+            current_message = msg
+            -- Derive kind by lowercasing, truncating at the first colon or comma,
+            -- stripping trailing digits/punctuation, then converting spaces to hyphens
+            -- (e.g. "signed integer overflow: ..." -> "signed-integer-overflow",
+            --  "null pointer passed as argument 1, ..." -> "null-pointer-passed-as-argument").
+            local kind_text = msg:match("^(.-)[:,%d]") or msg
+            kind_text = kind_text:gsub("%s+$", ""):lower()
+            current_kind = kind_text:gsub("%s+", "-")
+        elseif current_kind and line:match("^%s+#%d+") then
+            -- Stack frame line (ASAN-style).
+            local func_name = line:match("#%d+ 0x%x+ in (%S+)")
+            local target = line:match("#%d+ 0x%x+ .* (.+)")
+            if target then
+                target = resolve_path(target)
+                if starts_with(target, cwd) then
+                    local filename, line_number = target:match("(%S+):(%d+)")
+                    if filename and line_number then
+                        table.insert(current_frames, {
+                            file = filename,
+                            line = tonumber(line_number),
+                            func = func_name,
+                        })
+                    end
+                end
+            end
+        end
+    end
+    end)
+    log_file_handle:close()
+    if not ok then
+        vim.notify("Error parsing UBSAN log: " .. tostring(parse_err), vim.log.levels.ERROR)
+        return 0
+    end
+
+    finalize_error()
+    return num_errors
 end
 
 M.run_valgrind = function(args)
@@ -1350,6 +1453,9 @@ local function load_files(filepaths)
         elseif format == "sanitizer_log" then
             M.parse_sanitizer_log(filepath)
             vim.notify("Parsed sanitizer log: " .. filepath)
+        elseif format == "ubsan_log" then
+            M.parse_ubsan_log(filepath)
+            vim.notify("Parsed UBSAN log: " .. filepath)
         end
     end
     populate_quickfix_from_errors()
@@ -3730,6 +3836,7 @@ M._test = {
   get_qf_type = get_qf_type,
   compute_sharing_ratio = compute_sharing_ratio,
   normalize_path = normalize_path,
+  resolve_path = resolve_path,
   set_config = function(key, val) config[key] = val end,
 }
 return M
