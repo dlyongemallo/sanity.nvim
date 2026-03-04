@@ -20,10 +20,15 @@ local valgrind_generation = 0 -- Counter to detect stale async callbacks.
 local suppression_counts = {}  -- name -> count from last valgrind XML run.
 local prev_error_fingerprints = nil  -- Fingerprint bag from previous load for diff summary (nil = no previous load).
 local has_loaded = false  -- Whether at least one load has completed.
+local last_loaded_files = {}  -- Paths from the last load_files call.
+local watchers = {}  -- Active vim.uv.new_fs_event handles.
+local watch_timer = nil  -- Debounce timer for watch mode reloads.
 
 local ns = vim.api.nvim_create_namespace("sanity")
 
 local set_diagnostics       -- Forward declaration; defined after populate_quickfix_from_errors.
+local stop_watching         -- Forward declaration; defined after sanity_stack.
+local start_watching        -- Forward declaration; defined after stop_watching.
 local get_available_kinds   -- Forward declaration; defined after format helpers.
 local filter_presets        -- Forward declaration; defined after get_available_kinds.
 local refresh_stack         -- Forward declaration; defined in stack section.
@@ -239,6 +244,10 @@ function M.setup(opts)
     })
     vim.api.nvim_create_user_command("SanityDebug", M.debug_error, { nargs = 0 })
     vim.api.nvim_create_user_command("SanityDiff", M.show_diff, { nargs = 0 })
+    vim.api.nvim_create_user_command("SanityWatch", M.watch_toggle, {
+        nargs = "?",
+        complete = function() return { "on", "off" } end,
+    })
 
     -- Refresh diagnostic columns when a source file is opened.
     vim.api.nvim_create_autocmd("BufReadPost", {
@@ -1467,6 +1476,12 @@ local function load_files(filepaths)
     local diff = compute_diff_summary()
     if diff then msg = msg .. diff end
     has_loaded = true
+    last_loaded_files = filepaths
+    -- Restart watchers if watch mode is active so they track the new files.
+    if #watchers > 0 then
+        stop_watching()
+        start_watching(last_loaded_files)
+    end
     vim.notify(msg)
 end
 
@@ -3791,6 +3806,85 @@ M.sanity_stack = function()
         local cur = vim.api.nvim_win_get_cursor(stack_win)[1]
         expand_collapsed_line(cur)
     end, kopts)
+end
+
+-- Close all active file watchers.
+stop_watching = function()
+    if watch_timer then
+        watch_timer:stop()
+        watch_timer:close()
+        watch_timer = nil
+    end
+    for _, w in ipairs(watchers) do
+        w:stop()
+        w:close()
+    end
+    watchers = {}
+end
+
+-- Start watching the given file paths for changes.
+start_watching = function(files)
+    -- Create a single shared debounce timer for all watched files.
+    if not watch_timer then
+        watch_timer = vim.uv.new_timer()
+    end
+
+    for _, filepath in ipairs(files) do
+        local handle = vim.uv.new_fs_event()
+        if handle then
+            local ok, start_err = handle:start(filepath, {}, function(err)
+                if err then return end
+                -- Debounce: restart the shared timer on each change event.
+                vim.schedule(function()
+                    if not watch_timer then return end
+                    watch_timer:stop()
+                    watch_timer:start(100, 0, vim.schedule_wrap(function()
+                        load_files(last_loaded_files)
+                    end))
+                end)
+            end)
+            if ok == 0 then
+                table.insert(watchers, handle)
+            else
+                handle:close()
+                vim.notify("Failed to watch: " .. filepath .. " (" .. tostring(start_err) .. ")",
+                    vim.log.levels.WARN)
+            end
+        end
+    end
+end
+
+-- SanityWatch: toggle file-system watchers that reload on changes.
+M.watch_toggle = function(args)
+    local arg = args and args.fargs and args.fargs[1]
+    local want_on
+    if arg == "on" then
+        want_on = true
+    elseif arg == "off" then
+        want_on = false
+    else
+        want_on = #watchers == 0
+    end
+
+    if not want_on then
+        stop_watching()
+        vim.notify("Watch mode off.", vim.log.levels.INFO)
+        return
+    end
+
+    if #last_loaded_files == 0 then
+        vim.notify("No files loaded. Load files first with :SanityLoadLog.", vim.log.levels.WARN)
+        return
+    end
+
+    stop_watching()
+    start_watching(last_loaded_files)
+
+    local names = {}
+    for _, f in ipairs(last_loaded_files) do
+        table.insert(names, vim.fn.fnamemodify(f, ":t"))
+    end
+    vim.notify("Watching: " .. table.concat(names, ", "), vim.log.levels.INFO)
 end
 
 M.sanity_load_log = function(args)

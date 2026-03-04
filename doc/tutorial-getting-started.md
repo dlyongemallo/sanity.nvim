@@ -113,6 +113,20 @@ nvim program.c
 
 When called with no arguments, a file picker opens with multi-select support, filtered to `*.xml`, `*.log`, and `*.txt` files. This requires a picker plugin: [fzf-lua](https://github.com/ibhagwan/fzf-lua), [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim), [mini.pick](https://github.com/echasnovski/mini.pick), or [snacks.nvim](https://github.com/folke/snacks.nvim).
 
+## Watch mode
+
+After loading files, you can enable watch mode so the plugin automatically reloads when the files change on disk:
+
+```vim
+:SanityWatch on
+```
+
+This is useful when running your build and test cycle outside Neovim. Each time the log file is updated, the quickfix list, diagnostics, and diff state are refreshed automatically.
+
+```vim
+:SanityWatch off
+```
+
 ## Navigating errors
 
 Quickfix entries carry a `type` marker (`E`/`W`/`I`) reflecting error severity. The native quickfix window displays this marker, and plugins like [trouble.nvim](https://github.com/folke/trouble.nvim) can leverage it for severity-based highlighting or sorting.
