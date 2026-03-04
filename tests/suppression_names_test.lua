@@ -91,3 +91,39 @@ describe("parse_suppression_names", function()
     assert_eq(result, nil)
   end)
 end)
+
+describe("parse_sanitizer_suppression_names", function()
+  it("parses type:function entries from a TSan suppression file", function()
+    local path = write_tmp("tsan.supp", [[
+# TSan suppressions.
+race:my_racy_func
+deadlock:my_deadlock_func
+]])
+    local result = T.parse_sanitizer_suppression_names(path)
+    assert(result, "expected result")
+    assert_eq(#result, 2)
+    assert_eq(result[1].name, "race:my_racy_func")
+    assert_eq(result[2].name, "deadlock:my_deadlock_func")
+    assert_eq(result[1].file, path)
+  end)
+
+  it("skips blank lines and comments", function()
+    local path = write_tmp("lsan.supp", [[
+
+# LSan suppressions.
+
+leak:leaky_func
+
+# End of file.
+]])
+    local result = T.parse_sanitizer_suppression_names(path)
+    assert(result, "expected result")
+    assert_eq(#result, 1)
+    assert_eq(result[1].name, "leak:leaky_func")
+  end)
+
+  it("returns nil for missing file", function()
+    local result = T.parse_sanitizer_suppression_names("/nonexistent/path.supp")
+    assert_eq(result, nil)
+  end)
+end)

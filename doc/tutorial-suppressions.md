@@ -43,4 +43,4 @@ Each file in the list is passed as `--suppressions=<file>` when `:SanityRunValgr
 
 ## Auditing suppressions
 
-`:SanityAuditSuppressions` shows which suppressions from your configured files were used or unused in the last valgrind run. This helps identify stale suppressions that can be removed.
+`:SanityAuditSuppressions` shows which suppressions from your configured files were used or unused. For valgrind suppressions, it reports exact usage counts from the last run. For TSan and LSan suppression files, entries are listed but usage data is not available (sanitizer runs do not report suppression counts). This helps identify stale suppressions that can be removed.
