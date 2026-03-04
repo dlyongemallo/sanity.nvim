@@ -201,6 +201,7 @@ function M.setup(opts)
     config.valgrind_suppressions = opts.valgrind_suppressions or {}
     config.track_origins = opts.track_origins == nil and "ask" or opts.track_origins
     config.stack_fold_limit = opts.stack_fold_limit or 6
+    config.snapshot_file = opts.snapshot_file == nil and ".sanity-snapshot.json" or opts.snapshot_file
 
     vim.api.nvim_create_user_command("SanityRunValgrind", M.run_valgrind, { nargs = 1 })
     vim.api.nvim_create_user_command("SanityLoadLog", M.sanity_load_log, {
@@ -1426,14 +1427,53 @@ local function register_keymaps()
     end
 end
 
+-- Restore fingerprints from a previous session's snapshot file.
+-- Validates that every key is a string and every value is a number.
+local function restore_snapshot()
+    if not config.snapshot_file then return end
+    if prev_error_fingerprints then return end
+    local sf = io.open(config.snapshot_file, "r")
+    if not sf then return end
+    local content = sf:read("*a")
+    sf:close()
+    local ok, decoded = pcall(vim.json.decode, content)
+    if not ok or type(decoded) ~= "table" then return end
+    local valid = {}
+    for k, v in pairs(decoded) do
+        if type(k) == "string" and type(v) == "number" then
+            valid[k] = v
+        end
+    end
+    prev_error_fingerprints = valid
+end
+
+-- Save current fingerprints to the snapshot file atomically.
+local function save_snapshot()
+    if not config.snapshot_file then return end
+    local fps = snapshot_fingerprints()
+    local ok, encoded = pcall(vim.json.encode, fps)
+    if not ok then return end
+    local tmp_path = config.snapshot_file .. ".tmp"
+    local sf = io.open(tmp_path, "w")
+    if not sf then return end
+    sf:write(encoded)
+    sf:close()
+    os.rename(tmp_path, config.snapshot_file)
+end
+
+-- Prepare diff state before a load: snapshot existing errors or restore from disk.
+local function pre_load_diff()
+    if has_loaded then
+        prev_error_fingerprints = snapshot_fingerprints()
+    else
+        restore_snapshot()
+    end
+end
+
 M.valgrind_load_xml = function(args)
     register_keymaps()
     local xml_file = args.args
-    -- Snapshot previous errors for diff summary. On the very first load,
-    -- has_loaded is false so we skip and compute_diff_summary returns nil.
-    if has_loaded then
-        prev_error_fingerprints = snapshot_fingerprints()
-    end
+    pre_load_diff()
     reset_state()
     local num_errors = M.parse_valgrind_xml(xml_file)
     populate_quickfix_from_errors()
@@ -1445,14 +1485,13 @@ M.valgrind_load_xml = function(args)
     local diff = compute_diff_summary()
     if diff then msg = msg .. diff end
     has_loaded = true
+    save_snapshot()
     vim.notify(msg)
 end
 
 local function load_files(filepaths)
     register_keymaps()
-    if has_loaded then
-        prev_error_fingerprints = snapshot_fingerprints()
-    end
+    pre_load_diff()
     reset_state()
     for _, filepath in ipairs(filepaths) do
         local format = detect_log_format(filepath)
@@ -1482,6 +1521,7 @@ local function load_files(filepaths)
         stop_watching()
         start_watching(last_loaded_files)
     end
+    save_snapshot()
     vim.notify(msg)
 end
 
@@ -3932,5 +3972,7 @@ M._test = {
   normalize_path = normalize_path,
   resolve_path = resolve_path,
   set_config = function(key, val) config[key] = val end,
+  restore_snapshot = restore_snapshot,
+  save_snapshot = save_snapshot,
 }
 return M

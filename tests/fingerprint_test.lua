@@ -146,3 +146,69 @@ describe("compute diff summary", function()
     assert_eq(result, " (2 new, 3 fixed, 1 unchanged)")
   end)
 end)
+
+describe("snapshot persistence", function()
+  local tmp_file = os.tmpname()
+
+  it("save_snapshot writes valid JSON that restore_snapshot can read back", function()
+    T.reset_state()
+    T.new_error("Race", "data race", "valgrind", {
+      { label = "s", frames = { { func = "f", file = "a.c", line = 1 } } },
+    }, {})
+    T.set_config("snapshot_file", tmp_file)
+    T.save_snapshot()
+
+    -- Reset and restore.
+    T.reset_state()
+    T.set_prev_fingerprints(nil)
+    T.restore_snapshot()
+    -- Now compute_diff_summary should see the restored fingerprints.
+    T.new_error("Race", "data race", "valgrind", {
+      { label = "s", frames = { { func = "f", file = "a.c", line = 1 } } },
+    }, {})
+    local result = T.compute_diff_summary()
+    assert_eq(result, " (0 new, 0 fixed, 1 unchanged)")
+  end)
+
+  it("restore_snapshot ignores non-number values in the file", function()
+    local sf = io.open(tmp_file, "w")
+    sf:write('{"good\\u0000key":2,"bad\\u0000key":"not a number"}')
+    sf:close()
+
+    T.reset_state()
+    T.set_prev_fingerprints(nil)
+    T.set_config("snapshot_file", tmp_file)
+    T.restore_snapshot()
+
+    -- Only the valid entry should be present (good key with count 2).
+    T.new_error("Race", "data race", "valgrind", {}, {})
+    local result = T.compute_diff_summary()
+    -- 1 new (Race), 2 fixed (good key x2), 0 unchanged.
+    assert_eq(result, " (1 new, 2 fixed, 0 unchanged)")
+  end)
+
+  it("restore_snapshot is a no-op when snapshot_file is falsy", function()
+    T.reset_state()
+    T.set_prev_fingerprints(nil)
+    T.set_config("snapshot_file", false)
+    T.restore_snapshot()
+    local result = T.compute_diff_summary()
+    assert_eq(result, nil)
+  end)
+
+  it("fingerprint keys with NUL survive JSON round-trip", function()
+    T.reset_state()
+    T.new_error("Race", "data race", "valgrind", {
+      { label = "s", frames = { { func = "f", file = "a.c", line = 1 } } },
+    }, {})
+    T.set_config("snapshot_file", tmp_file)
+    T.save_snapshot()
+
+    local sf = io.open(tmp_file, "r")
+    local content = sf:read("*a")
+    sf:close()
+    local ok, decoded = pcall(vim.json.decode, content)
+    assert(ok, "JSON decode should succeed")
+    assert_eq(decoded["Race\0valgrind\0a.c:1"], 1)
+  end)
+end)

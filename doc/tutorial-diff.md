@@ -24,7 +24,7 @@ The quickfix list fills with errors. Now fix one of the bugs without leaving Neo
 :SanityRunValgrind --track-origins=no --tool=memcheck --show-reachable=yes ./examples/demo
 ```
 
-The diff state lives in memory, so staying in the same Neovim session between runs is required. The notification now includes a diff summary such as `(0 new, 2 fixed, 8 unchanged)`.
+The notification now includes a diff summary such as `(0 new, 2 fixed, 8 unchanged)`. Diffs persist across sessions: fingerprints are saved to `.sanity-snapshot.json` in the working directory after each load and restored on the first load of a new session. The file path is configurable via `opts.snapshot_file`; set it to `false` to disable persistence. Consider adding the snapshot file to your `.gitignore`.
 
 ## Viewing the full diff
 
