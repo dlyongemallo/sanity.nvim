@@ -1720,7 +1720,16 @@ local function generate_suppression(err)
         elseif kind == "lock-order-inversion" then
             return "deadlock:" .. func, "tsan"
         else
-            return nil, "Suppression not available for " .. kind .. " errors."
+            -- Only mention ignorelist files for known ASan memory-error kinds.
+            local message = "Suppression not available for " .. kind .. " errors."
+            if kind:match("use%-after")
+                or kind:match("out%-of%-bounds")
+                or kind:match("overflow")
+                or kind:match("^heap%-")
+                or kind:match("^stack%-") then
+                message = message .. " ASAN uses ignorelist files (-fsanitize-ignorelist=) instead of runtime suppressions."
+            end
+            return nil, message
         end
     end
 

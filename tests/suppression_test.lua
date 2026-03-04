@@ -110,7 +110,7 @@ describe("generate_suppression", function()
     assert_eq(tool, "tsan")
   end)
 
-  it("fails for unknown sanitizer kind", function()
+  it("fails for unknown sanitizer kind without ignorelist guidance", function()
     T.reset_state()
     local err = T.new_error("something-else", "unknown", "sanitizer", {
       { label = "stack", frames = { { func = "f", file = "a.c", line = 1 } } },
@@ -118,6 +118,18 @@ describe("generate_suppression", function()
     local text, reason = T.generate_suppression(err)
     assert(not text, "expected nil text")
     assert(reason:find("not available"), "expected 'not available' in reason")
+    assert(not reason:find("ignorelist"), "non-ASan kind should not mention ignorelist")
+  end)
+
+  it("suggests ignorelist for ASan memory-error kinds", function()
+    T.reset_state()
+    local err = T.new_error("heap-use-after-free", "read of freed memory", "sanitizer", {
+      { label = "stack", frames = { { func = "bad_read", file = "a.c", line = 1 } } },
+    }, {})
+    local text, reason = T.generate_suppression(err)
+    assert(not text, "expected nil text")
+    assert(reason:find("not available"), "expected 'not available' in reason")
+    assert(reason:find("ignorelist"), "ASan kind should mention ignorelist")
   end)
 
   it("fails for unknown error source", function()

@@ -27,7 +27,7 @@ opts = {
 
 Valgrind suppressions are full `{ ... }` blocks with `fun:` entries. Sanitizer suppressions use the `type:function` format accepted by LSan and TSan.
 
-ASan memory errors (e.g. heap-use-after-free) have no runtime suppression mechanism and are reported as unsuppressible.
+ASan memory errors (e.g. heap-use-after-free) have no runtime suppression mechanism. Instead, ASan uses ignorelist files passed via `-fsanitize-ignorelist=` at compile time. The plugin will suggest this when you try to suppress an ASan error.
 
 ## Passing suppressions to valgrind
 
