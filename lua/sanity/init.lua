@@ -144,6 +144,12 @@ local function compute_diff_details()
     }
 end
 
+-- Normalise a file path so redundant slashes and relative segments
+-- do not cause location_index misses.
+local function normalize_path(path)
+    return vim.fs.normalize(path)
+end
+
 -- Create an error object, register it, and update location_index.
 local function new_error(kind, message, source, stacks, meta)
     error_id_counter = error_id_counter + 1
@@ -159,6 +165,8 @@ local function new_error(kind, message, source, stacks, meta)
     errors_by_id[err.id] = err
     for _, stack in ipairs(stacks) do
         for _, frame in ipairs(stack.frames) do
+            -- Normalise the stored frame path so all consumers and indexes agree.
+            frame.file = normalize_path(frame.file)
             local key = frame.file .. ":" .. frame.line
             if not location_index[key] then
                 location_index[key] = {}
@@ -1405,7 +1413,7 @@ end
 -- Get the current file and line from cursor position or quickfix entry.
 -- Returns (file, line, error_ids). The third value is non-nil only when
 -- called from a quickfix-like UI, so callers can bypass location_index
--- (whose keys may not match Vim's normalized buffer paths).
+-- and use the pre-resolved error IDs directly.
 local function get_current_position()
     local win = vim.api.nvim_get_current_win()
     local buf = vim.api.nvim_win_get_buf(win)
@@ -1435,7 +1443,7 @@ local function get_current_position()
         return get_qf_entry_position(vim.fn.line("."))
     end
 
-    return vim.api.nvim_buf_get_name(buf), vim.api.nvim_win_get_cursor(win)[1], nil
+    return normalize_path(vim.api.nvim_buf_get_name(buf)), vim.api.nvim_win_get_cursor(win)[1], nil
 end
 
 -- Return the first error at the cursor position, or nil.
@@ -3668,6 +3676,7 @@ M._test = {
   find_related_targets = find_related_targets,
   generate_suppression = generate_suppression,
   errors = function() return errors end,
+  location_index = function() return location_index end,
   error_fingerprint = error_fingerprint,
   snapshot_fingerprints = snapshot_fingerprints,
   compute_diff_summary = function() return compute_diff_summary() end,
@@ -3692,6 +3701,7 @@ M._test = {
   populate_quickfix = populate_quickfix_from_errors,
   get_qf_type = get_qf_type,
   compute_sharing_ratio = compute_sharing_ratio,
+  normalize_path = normalize_path,
   set_config = function(key, val) config[key] = val end,
 }
 return M
