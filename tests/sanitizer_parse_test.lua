@@ -103,6 +103,31 @@ describe("parse TSAN log", function()
   end)
 end)
 
+describe("detect_log_format for MSAN", function()
+  it("identifies MSAN sanitizer log", function()
+    assert_eq(T.detect_log_format("tests/msan.log"), "sanitizer_log")
+  end)
+end)
+
+describe("parse MSAN log", function()
+  it("parses use-of-uninitialized-value from msan.log", function()
+    T.reset_state()
+    local log = H.localize_log("tests/msan.log")
+    local count = M.parse_sanitizer_log(log)
+    assert(count and count > 0, "expected processed lines")
+
+    local errs = T.errors()
+    assert_eq(#errs, 1)
+    assert_eq(errs[1].kind, "use-of-uninitialized-value")
+    assert_eq(errs[1].source, "sanitizer")
+
+    local s1 = errs[1].stacks[1].frames
+    assert(#s1 >= 1, "expected at least one frame in first stack")
+    assert_eq(s1[1].func, "process_data")
+    assert_eq(s1[1].line, 42)
+  end)
+end)
+
 describe("normalize_path in location_index", function()
   it("matches errors despite redundant slashes in frame paths", function()
     T.reset_state()

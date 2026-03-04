@@ -78,6 +78,19 @@ nvim program.c
 :SanityLoadLog tsan.log
 ```
 
+MemorySanitizer detects reads of uninitialised memory. It requires a fully instrumented build (including libc), so it is typically used with clang and an MSAN-instrumented libc/toolchain (see the [Clang MSAN documentation](https://clang.llvm.org/docs/MemorySanitizer.html) for setup details). The following command shows only how to compile and run your programme once such a toolchain is in place:
+
+```bash
+# assumes an MSAN-instrumented libc/toolchain is already configured
+clang -g -fsanitize=memory program.c -o ./program
+./program 2> msan.log
+nvim program.c
+```
+
+```vim
+:SanityLoadLog msan.log
+```
+
 ## Loading multiple files
 
 `:SanityLoadLog` auto-detects the file format (`valgrind` XML or sanitizer log) and accepts multiple files:
