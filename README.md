@@ -4,7 +4,7 @@ A Neovim plugin for integrating dynamic analysis tools such as `valgrind` (`memc
 
 ## Installation
 
-This plugin depends on [xml2lua](https://github.com/manoelcampos/xml2lua). The instructions below for [lazy.nvim](https://github.com/folke/lazy.nvim) will install the dependency automatically.
+Install with [lazy.nvim](https://github.com/folke/lazy.nvim):
 
 ```lua
 {
@@ -24,14 +24,6 @@ This plugin depends on [xml2lua](https://github.com/manoelcampos/xml2lua). The i
     -- track_origins = "ask",  -- true (always), false (never), "ask" (prompt on uninit errors)
     -- stack_fold_limit = 6,  -- fold long call chains in :SanityStack; 0 to disable
     -- valgrind_suppressions = { ".valgrind.supp" },  -- passed as --suppressions= to valgrind
-  },
-  dependencies = {
-    {
-      'vhyrro/luarocks.nvim',
-      opts = {
-        rocks = { 'xml2lua' },
-      }
-    }
   },
 }
 ```
