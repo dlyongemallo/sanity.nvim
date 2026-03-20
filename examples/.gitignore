@@ -7,3 +7,6 @@ demo_tsan
 *.xml
 *.log
 *.supp
+
+# Persistent error snapshots
+.sanity-snapshot.json
