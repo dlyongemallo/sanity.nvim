@@ -6,22 +6,24 @@ This tutorial walks through the basics of using `sanity.nvim`: running `valgrind
 
 After [installing the plugin](../README.md#installation), compile your program with debug symbols (`-g`) so that `valgrind` and sanitizers can report source locations.
 
+The examples below use [examples/demo.c](../examples/demo.c), which contains intentional bugs to illustrate each tool. The [examples/create_logs.sh](../examples/create_logs.sh) script compiles `demo.c` and generates log files for every tool in one step. The commands below assume you have changed into the `examples/` directory.
+
 ## Running `valgrind` from Neovim
 
 ```bash
-gcc -g -lpthread program.c -o ./program
-nvim program.c
+gcc -g -pthread demo.c -o ./demo
+nvim demo.c
 ```
 
 ```vim
-:SanityRunValgrind --tool=memcheck ./program
+:SanityRunValgrind --tool=memcheck ./demo
 :copen
 ```
 
 `--tool=memcheck` is optional as it is the default tool for `valgrind`. For thread-related errors, use helgrind:
 
 ```vim
-:SanityRunValgrind --tool=helgrind ./program
+:SanityRunValgrind --tool=helgrind ./demo
 :copen
 ```
 
@@ -32,8 +34,8 @@ nvim program.c
 If you already have `valgrind` XML output or sanitizer logs, load them directly:
 
 ```bash
-valgrind --tool=memcheck --xml=yes --xml-file=memcheck.xml ./program
-nvim program.c
+valgrind --tool=memcheck --xml=yes --xml-file=memcheck.xml ./demo
+nvim demo.c
 ```
 
 ```vim
@@ -44,8 +46,8 @@ nvim program.c
 Helgrind logs work the same way:
 
 ```bash
-valgrind --tool=helgrind --xml=yes --xml-file=helgrind.xml ./program
-nvim program.c
+valgrind --tool=helgrind --xml=yes --xml-file=helgrind.xml ./demo
+nvim demo.c
 ```
 
 ```vim
@@ -58,8 +60,8 @@ nvim program.c
 Sanitizer output is also supported. Redirect stderr to a file and load it:
 
 ```bash
-gcc -g -fsanitize=address program.c -o ./program
-./program 2> asan.log
+gcc -g -fsanitize=address -pthread demo.c -o ./demo
+./demo 2> asan.log
 ```
 
 ```vim
@@ -69,9 +71,9 @@ gcc -g -fsanitize=address program.c -o ./program
 ThreadSanitizer works similarly:
 
 ```bash
-gcc -g -fsanitize=thread -lpthread program.c -o ./program
-./program 2> tsan.log
-nvim program.c
+gcc -g -fsanitize=thread -pthread demo.c -o ./demo
+./demo 2> tsan.log
+nvim demo.c
 ```
 
 ```vim
@@ -82,9 +84,9 @@ MemorySanitizer detects reads of uninitialised memory. It requires a fully instr
 
 ```bash
 # assumes an MSAN-instrumented libc/toolchain is already configured
-clang -g -fsanitize=memory program.c -o ./program
-./program 2> msan.log
-nvim program.c
+clang -g -fsanitize=memory -pthread demo.c -o ./demo
+./demo 2> msan.log
+nvim demo.c
 ```
 
 ```vim
@@ -94,9 +96,9 @@ nvim program.c
 UndefinedBehaviorSanitizer catches undefined behaviour such as signed integer overflow, null pointer dereferences, and invalid shifts. For best results, enable stack traces:
 
 ```bash
-gcc -g -fsanitize=undefined -fno-omit-frame-pointer program.c -o ./program
-UBSAN_OPTIONS=print_stacktrace=1 ./program 2> ubsan.log
-nvim program.c
+gcc -g -fsanitize=undefined -fno-omit-frame-pointer -pthread demo.c -o ./demo
+UBSAN_OPTIONS=print_stacktrace=1 ./demo 2> ubsan.log
+nvim demo.c
 ```
 
 ```vim
@@ -130,5 +132,3 @@ This is useful when running your build and test cycle outside Neovim. Each time 
 ## Navigating errors
 
 Quickfix entries carry a `type` marker (`E`/`W`/`I`) reflecting error severity. The native quickfix window displays this marker, and plugins like [trouble.nvim](https://github.com/folke/trouble.nvim) can leverage it for severity-based highlighting or sorting.
-
-Further examples may be found in [examples/demo.c](../examples/demo.c).

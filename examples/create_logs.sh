@@ -21,7 +21,11 @@ if [ ! -f demo.c ]; then
     exit 1
 fi
 
-output_files=(memcheck.xml helgrind.xml asan.log tsan.log)
+output_files=(memcheck.xml helgrind.xml asan.log tsan.log ubsan.log)
+has_clang=false
+if command -v clang &>/dev/null; then
+    has_clang=true
+fi
 if ! $force; then
     existing=()
     for f in "${output_files[@]}"; do
@@ -79,6 +83,27 @@ else
     ./demo_tsan 2> tsan.log || true
 fi
 
+echo "Compiling with UndefinedBehaviorSanitizer..."
+gcc -g -fsanitize=undefined -fno-omit-frame-pointer -pthread demo.c -o demo_ubsan
+
+echo "Running UndefinedBehaviorSanitizer..."
+UBSAN_OPTIONS=print_stacktrace=1 ./demo_ubsan 2> ubsan.log || true
+
+if $has_clang; then
+    echo "Compiling with MemorySanitizer..."
+    # MSAN ideally requires a fully instrumented toolchain; without one,
+    # false positives from uninstrumented libc calls are expected.
+    if clang -g -fsanitize=memory -fno-omit-frame-pointer -pthread demo.c -o demo_msan; then
+        echo "Running MemorySanitizer..."
+        ./demo_msan 2> msan.log || true
+        output_files+=(msan.log)
+    else
+        echo "Skipping MemorySanitizer (clang does not support -fsanitize=memory)." >&2
+    fi
+else
+    echo "Skipping MemorySanitizer (clang not found)."
+fi
+
 # Verify all output files were created.
 all_ok=true
 for f in "${output_files[@]}"; do
@@ -88,9 +113,10 @@ for f in "${output_files[@]}"; do
     fi
 done
 
+echo
 if $all_ok; then
     echo "Done.  Load the logs in Neovim with:"
-    echo "  nvim -c \":SanityLoadLog memcheck.xml helgrind.xml asan.log tsan.log\""
+    echo "  nvim -c \":SanityLoadLog ${output_files[*]}\""
 else
     echo "Some output files were not generated — check the errors above." >&2
     exit 1

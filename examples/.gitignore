@@ -2,6 +2,8 @@
 demo
 demo_asan
 demo_tsan
+demo_ubsan
+demo_msan
 
 # Valgrind/sanitizer output files
 *.xml

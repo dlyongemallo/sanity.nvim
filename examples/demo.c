@@ -22,12 +22,23 @@
  *   gcc -g -fsanitize=thread -pthread demo.c -o demo_tsan
  *   setarch $(uname -m) --addr-no-randomize ./demo_tsan 2> tsan.log
  *
+ *   # UndefinedBehaviorSanitizer
+ *   gcc -g -fsanitize=undefined -fno-omit-frame-pointer -pthread demo.c -o demo_ubsan
+ *   UBSAN_OPTIONS=print_stacktrace=1 ./demo_ubsan 2> ubsan.log
+ *
+ *   # MemorySanitizer (requires clang and an MSAN-instrumented toolchain)
+ *   clang -g -fsanitize=memory -fno-omit-frame-pointer -pthread demo.c -o demo_msan
+ *   ./demo_msan 2> msan.log
+ *
  * Open Neovim with sanity.nvim to load and analyze the above logs:
- *   nvim -c ":SanityLoadLog memcheck.xml helgrind.xml asan.log tsan.log"
+ *   nvim -c ":SanityLoadLog memcheck.xml helgrind.xml asan.log tsan.log ubsan.log"
+ *
+ * If you built and ran the MSAN variant, include msan.log in the command above.
  */
 
 #include <pthread.h>
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -293,6 +304,22 @@ void demonstrate_lock_order(void) {
 }
 
 /* ============================================================
+ * BUG 10: Signed Integer Overflow (Undefined Behaviour)
+ *
+ * Adding to INT_MAX causes signed integer overflow, which is
+ * undefined behaviour in C. UndefinedBehaviorSanitizer will
+ * detect this.
+ *
+ * Use :SanityFilter to isolate UBSAN findings.
+ * ============================================================ */
+
+void demonstrate_signed_overflow(void) {
+    int x = INT_MAX;
+    x += 1;  /* BUG: signed integer overflow */
+    printf("Overflowed value: %d\n", x);
+}
+
+/* ============================================================
  * Main: Run all demonstrations
  * ============================================================ */
 
@@ -353,6 +380,12 @@ int main(int argc, char *argv[]) {
     if (demo == 0 || demo == 9) {
         printf("--- Demo 9: Lock Order Violation ---\n");
         demonstrate_lock_order();
+        printf("\n");
+    }
+
+    if (demo == 0 || demo == 10) {
+        printf("--- Demo 10: Signed Integer Overflow ---\n");
+        demonstrate_signed_overflow();
         printf("\n");
     }
 
