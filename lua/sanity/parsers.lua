@@ -264,7 +264,11 @@ function P.parse_frame_line(line, cwd)
     if not target then return nil end
     target = F.resolve_path(target)
     if not F.starts_with(target, cwd) then return nil end
-    local filename, line_number = string.match(target, "(%S+):(%d+)")
+    -- Match file:line:col (clang/MSAN) or file:line (GCC).
+    local filename, line_number = string.match(target, "(%S+):(%d+):%d+")
+    if not filename then
+        filename, line_number = string.match(target, "(%S+):(%d+)")
+    end
     if not filename or not line_number then return nil end
 
     return {
@@ -466,20 +470,9 @@ function P.parse_ubsan_log(log_file)
             current_kind = kind_text:gsub("%s+", "-")
         elseif current_kind and line:match("^%s+#%d+") then
             -- Stack frame line (ASAN-style).
-            local func_name = line:match("#%d+ 0x%x+ in (%S+)")
-            local target = line:match("#%d+ 0x%x+ .* (.+)")
-            if target then
-                target = F.resolve_path(target)
-                if F.starts_with(target, cwd) then
-                    local filename, line_number = target:match("(%S+):(%d+)")
-                    if filename and line_number then
-                        table.insert(current_frames, {
-                            file = filename,
-                            line = tonumber(line_number),
-                            func = func_name,
-                        })
-                    end
-                end
+            local frame = P.parse_frame_line(line, cwd)
+            if frame then
+                table.insert(current_frames, frame)
             end
         end
     end

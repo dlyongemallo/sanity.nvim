@@ -173,6 +173,20 @@ describe("parse MSAN log", function()
     assert_eq(s1[1].func, "process_data")
     assert_eq(s1[1].line, 42)
   end)
+
+  it("strips column numbers from file:line:col frames", function()
+    T.reset_state()
+    local log = H.localize_log("tests/msan.log")
+    M.parse_sanitizer_log(log)
+
+    local errs = T.errors()
+    assert_eq(#errs, 1)
+
+    -- The filename must not include the column (e.g. "demo.c:42").
+    local s1 = errs[1].stacks[1].frames
+    assert(not s1[1].file:match(":%d+$"), "column leaked into filename: " .. s1[1].file)
+    assert(s1[1].file:match("demo%.c$"), "expected filename ending in demo.c, got: " .. s1[1].file)
+  end)
 end)
 
 describe("normalize_path in location_index", function()
