@@ -110,16 +110,50 @@ function N.get_current_position()
     return F.normalize_path(vim.api.nvim_buf_get_name(buf)), vim.api.nvim_win_get_cursor(win)[1], nil
 end
 
--- Return the first error at the cursor position, or nil.
-function N.get_error_at_cursor()
+-- Resolve deduplicated errors at the cursor position.
+-- Returns (errors, file, line) where errors may be empty.
+local function resolve_errors_at_cursor()
     local file, line, error_ids = N.get_current_position()
-    if not file or not line then return nil end
+    if not file or not line then return {}, nil, nil end
     local ids = error_ids
     if not ids or #ids == 0 then
         ids = S.location_index[file .. ":" .. line]
     end
-    if not ids or #ids == 0 then return nil end
-    return S.errors_by_id[ids[1]]
+    if not ids or #ids == 0 then return {}, file, line end
+    -- Deduplicate (the same error can appear more than once when multiple
+    -- frames land on the same line).
+    local seen = {}
+    local errors = {}
+    for _, id in ipairs(ids) do
+        if not seen[id] then
+            seen[id] = true
+            local err = S.errors_by_id[id]
+            if err then table.insert(errors, err) end
+        end
+    end
+    return errors, file, line
+end
+
+-- Resolve the error at the cursor, prompting with vim.ui.select when
+-- multiple errors share the same location.  Calls callback(err, file, line)
+-- with the chosen error and the cursor position captured before any picker
+-- opens (so callers are not affected by cursor movement during selection).
+function N.pick_error_at_cursor(callback)
+    local errors, file, line = resolve_errors_at_cursor()
+    if #errors == 0 then
+        vim.notify("No error at cursor.", vim.log.levels.WARN)
+    elseif #errors == 1 then
+        callback(errors[1], file, line)
+    else
+        vim.ui.select(errors, {
+            prompt = "Multiple errors at cursor:",
+            format_item = function(err)
+                return string.format("[%s] %s", err.kind, err.message)
+            end,
+        }, function(choice)
+            if choice then callback(choice, file, line) end
+        end)
+    end
 end
 
 -- Extract addresses from an error's meta.addr field.
@@ -335,36 +369,60 @@ function N.find_related_targets(err, file, line, all_errors)
 end
 
 -- Jump to a related location sharing the same address.
+-- Pre-filters to errors that actually have related targets so the picker
+-- is only shown when useful.  Targets are cached during filtering to
+-- avoid recomputing them for the chosen error.
 function N.show_related(refresh_stack_fn)
-    local err = N.get_error_at_cursor()
-    if not err then
+    local errors, file, line = resolve_errors_at_cursor()
+    if #errors == 0 then
         vim.notify("No error at cursor.", vim.log.levels.WARN)
         return
     end
 
-    local file, line = N.get_current_position()
-    local targets = N.find_related_targets(err, file, line, S.errors)
-
-    if #targets == 0 then
-        vim.notify("No related errors.", vim.log.levels.INFO)
-        return
-    end
-
-    if #targets == 1 then
-        N.jump_to_frame(targets[1], refresh_stack_fn)
-        vim.notify(targets[1].label, vim.log.levels.INFO)
-        return
-    end
-
-    vim.ui.select(targets, {
-        prompt = "Select related error:",
-        format_item = function(item) return item.label end,
-    }, function(choice)
-        if choice then
-            N.jump_to_frame(choice, refresh_stack_fn)
-            vim.notify(choice.label, vim.log.levels.INFO)
+    -- Collect errors that have at least one related target, caching
+    -- the computed targets so we don't call find_related_targets twice.
+    local candidates = {}
+    local targets_by_id = {}
+    for _, err in ipairs(errors) do
+        local targets = N.find_related_targets(err, file, line, S.errors)
+        if #targets > 0 then
+            table.insert(candidates, err)
+            targets_by_id[err.id] = targets
         end
-    end)
+    end
+
+    local function act(err)
+        local targets = targets_by_id[err.id]
+        if #targets == 1 then
+            N.jump_to_frame(targets[1], refresh_stack_fn)
+            vim.notify(targets[1].label, vim.log.levels.INFO)
+        else
+            vim.ui.select(targets, {
+                prompt = "Select related error:",
+                format_item = function(item) return item.label end,
+            }, function(choice)
+                if choice then
+                    N.jump_to_frame(choice, refresh_stack_fn)
+                    vim.notify(choice.label, vim.log.levels.INFO)
+                end
+            end)
+        end
+    end
+
+    if #candidates == 0 then
+        vim.notify("No related errors.", vim.log.levels.INFO)
+    elseif #candidates == 1 then
+        act(candidates[1])
+    else
+        vim.ui.select(candidates, {
+            prompt = "Multiple errors at cursor:",
+            format_item = function(err)
+                return string.format("[%s] %s", err.kind, err.message)
+            end,
+        }, function(choice)
+            if choice then act(choice) end
+        end)
+    end
 end
 
 return N
