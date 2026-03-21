@@ -250,7 +250,8 @@ end
 -- Parse a sanitizer stack frame line.
 -- Returns a frame table { file, line, func } or nil if the line is not a
 -- frame or the file is outside cwd.
-function P.parse_frame_line(line, cwd)
+-- readable_cache is an optional table used to memoize filereadable() results.
+function P.parse_frame_line(line, cwd, readable_cache)
     -- Extract function name (nil when unavailable).
     local func_name = line:match("#%d+ 0x%x+ in (%S+)")       -- ASAN format.
     if not func_name then
@@ -264,8 +265,21 @@ function P.parse_frame_line(line, cwd)
     if not target then return nil end
     target = F.resolve_path(target)
     if not F.starts_with(target, cwd) then return nil end
-    local filename, line_number = string.match(target, "(%S+):(%d+)")
+    -- Match file:line:col (clang/MSAN) or file:line (GCC).
+    local filename, line_number = string.match(target, "(%S+):(%d+):%d+")
+    if not filename then
+        filename, line_number = string.match(target, "(%S+):(%d+)")
+    end
     if not filename or not line_number then return nil end
+    -- Reject phantom paths (e.g. relative libc sources resolved under cwd).
+    if readable_cache then
+        if readable_cache[filename] == nil then
+            readable_cache[filename] = vim.fn.filereadable(filename) == 1
+        end
+        if not readable_cache[filename] then return nil end
+    elseif vim.fn.filereadable(filename) == 0 then
+        return nil
+    end
 
     return {
         file = filename,
@@ -283,6 +297,7 @@ function P.parse_sanitizer_log(log_file)
     end
 
     local cwd = vim.fn.getcwd()
+    local readable_cache = {}
     local current_message = "NO MESSAGE"
     local current_kind = "unknown"
     local current_meta = {}
@@ -386,7 +401,7 @@ function P.parse_sanitizer_log(log_file)
             end
         else
             -- Frame line.
-            local frame = P.parse_frame_line(line, cwd)
+            local frame = P.parse_frame_line(line, cwd, readable_cache)
             if frame then
                 table.insert(current_frames, frame)
                 num_processed_lines = num_processed_lines + 1
@@ -417,6 +432,7 @@ function P.parse_ubsan_log(log_file)
     end
 
     local cwd = vim.fn.getcwd()
+    local readable_cache = {}
     local num_errors = 0
     local current_file = nil
     local current_line_num = nil
@@ -466,20 +482,9 @@ function P.parse_ubsan_log(log_file)
             current_kind = kind_text:gsub("%s+", "-")
         elseif current_kind and line:match("^%s+#%d+") then
             -- Stack frame line (ASAN-style).
-            local func_name = line:match("#%d+ 0x%x+ in (%S+)")
-            local target = line:match("#%d+ 0x%x+ .* (.+)")
-            if target then
-                target = F.resolve_path(target)
-                if F.starts_with(target, cwd) then
-                    local filename, line_number = target:match("(%S+):(%d+)")
-                    if filename and line_number then
-                        table.insert(current_frames, {
-                            file = filename,
-                            line = tonumber(line_number),
-                            func = func_name,
-                        })
-                    end
-                end
+            local frame = P.parse_frame_line(line, cwd, readable_cache)
+            if frame then
+                table.insert(current_frames, frame)
             end
         end
     end

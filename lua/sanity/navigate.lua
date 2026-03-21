@@ -285,13 +285,24 @@ function N.find_related_targets(err, file, line, all_errors)
         table.insert(targets, { file = f, line = l, label = label, error_ids = ids })
     end
 
-    -- Other stacks within the same error at different locations.
+    -- Deepest frames of other stacks within the same error.
+    -- Skip stacks that contain the current position (intra-stack navigation
+    -- is handled by SanityStackNext/SanityStackPrev).
     if file and line then
         for _, stack in ipairs(err.stacks) do
             local frame = stack.frames[1]
-            if frame and (frame.file ~= file or frame.line ~= line) then
+            if not frame then goto next_stack end
+            local contains_cursor = false
+            for _, f in ipairs(stack.frames) do
+                if f.file == file and f.line == line then
+                    contains_cursor = true
+                    break
+                end
+            end
+            if not contains_cursor then
                 add_target(frame.file, frame.line, stack.label or err.message, { err.id })
             end
+            ::next_stack::
         end
     end
 
