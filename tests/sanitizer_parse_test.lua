@@ -182,9 +182,9 @@ describe("parse MSAN log", function()
     local errs = T.errors()
     assert_eq(#errs, 1)
 
-    -- The filename must not include the column (e.g. "demo.c:42").
+    -- The filename must not include a trailing line/column suffix (e.g. "demo.c:42").
     local s1 = errs[1].stacks[1].frames
-    assert(not s1[1].file:match(":%d+$"), "column leaked into filename: " .. s1[1].file)
+    assert(not s1[1].file:match(":%d+$"), "line/column number leaked into filename: " .. s1[1].file)
     assert(s1[1].file:match("demo%.c$"), "expected filename ending in demo.c, got: " .. s1[1].file)
   end)
 end)

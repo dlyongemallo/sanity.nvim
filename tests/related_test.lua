@@ -84,6 +84,35 @@ describe("find_related_targets", function()
     assert_eq(#targets, 0)
   end)
 
+  it("skips multi-frame stacks containing the cursor position", function()
+    T.reset_state()
+    -- Stack A has two frames; the cursor is on the second (non-deepest) frame.
+    -- Stack B is unrelated to the cursor position.
+    local err = T.new_error("Race", "data race", "test", {
+      {
+        label = "Write",
+        frames = {
+          { func = "inner", file = "src/a.c", line = 10 },
+          { func = "outer", file = "src/c.c", line = 30 },
+        },
+      },
+      {
+        label = "Read",
+        frames = {
+          { func = "reader", file = "src/b.c", line = 20 },
+        },
+      },
+    }, { addr = "0xBEEF" })
+
+    -- Cursor is at src/c.c:30 which appears as a non-first frame in Write.
+    -- Write stack should be skipped; only Read should appear as a target.
+    local targets = T.find_related_targets(err, "src/c.c", 30, { err })
+    assert_eq(#targets, 1)
+    assert_eq(targets[1].file, "src/b.c")
+    assert_eq(targets[1].line, 20)
+    assert_eq(targets[1].label, "Read")
+  end)
+
   it("handles table-valued addr metadata", function()
     T.reset_state()
     local err1 = T.new_error("Race", "race", "test", {
