@@ -270,6 +270,8 @@ function P.parse_frame_line(line, cwd)
         filename, line_number = string.match(target, "(%S+):(%d+)")
     end
     if not filename or not line_number then return nil end
+    -- Reject phantom paths (e.g. relative libc sources resolved under cwd).
+    if vim.fn.filereadable(filename) == 0 then return nil end
 
     return {
         file = filename,
