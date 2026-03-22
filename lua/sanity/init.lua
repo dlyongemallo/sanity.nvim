@@ -402,8 +402,6 @@ end
 -- Stack frame navigation.
 
 -- Local aliases for navigate functions used by thin wrappers below.
-local get_error_at_cursor = N.get_error_at_cursor
-local get_current_position = N.get_current_position
 local is_source_window = N.is_source_window
 local find_source_win = N.find_source_win
 
@@ -422,18 +420,15 @@ local show_floating_window = UI.show_floating_window
 
 -- SanitySuppress: queue a suppression for the error at cursor.
 M.suppress_error = function()
-    local err = get_error_at_cursor()
-    if not err then
-        vim.notify("No error at cursor.", vim.log.levels.WARN)
-        return
-    end
-    local text, tool_or_reason = SUP.generate_suppression(err)
-    if not text then
-        vim.notify(tool_or_reason, vim.log.levels.WARN)
-        return
-    end
-    table.insert(S.suppressions, { text = text, tool = tool_or_reason })
-    vim.notify("Suppression queued (" .. #S.suppressions .. " total).")
+    N.pick_error_at_cursor(function(err)
+        local text, tool_or_reason = SUP.generate_suppression(err)
+        if not text then
+            vim.notify(tool_or_reason, vim.log.levels.WARN)
+            return
+        end
+        table.insert(S.suppressions, { text = text, tool = tool_or_reason })
+        vim.notify("Suppression queued (" .. #S.suppressions .. " total).")
+    end)
 end
 
 M.save_suppressions = function(args) SUP.save_suppressions(args) end
@@ -446,16 +441,16 @@ M.export_errors = function(args) UI.export_errors(args) end
 M.show_diff = function() UI.show_diff() end
 
 M.explain_error = function()
-    UI.explain_error(get_error_at_cursor)
+    N.pick_error_at_cursor(UI.explain_error)
 end
 
 M.debug_error = function()
-    UI.debug_error({
-        get_error_at_cursor = get_error_at_cursor,
-        get_current_position = get_current_position,
-        is_source_window = is_source_window,
-        find_source_win = find_source_win,
-    })
+    N.pick_error_at_cursor(function(err, file, line)
+        UI.debug_error(err, file, line, {
+            is_source_window = is_source_window,
+            find_source_win = find_source_win,
+        })
+    end)
 end
 
 M.show_related = function()
@@ -557,6 +552,7 @@ M._test = {
   build_stack_content = STK.build_stack_content,
   strip_label = STK.strip_label,
   find_related_targets = N.find_related_targets,
+  pick_error_at_cursor = N.pick_error_at_cursor,
   generate_suppression = SUP.generate_suppression,
   errors = function() return S.errors end,
   location_index = function() return S.location_index end,

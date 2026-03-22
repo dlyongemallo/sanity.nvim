@@ -160,14 +160,8 @@ function UI.show_diff()
 end
 
 -- Show a floating window explaining the error type.
--- get_error_at_cursor is passed in because navigate.lua may not be extracted yet.
-function UI.explain_error(get_error_at_cursor)
+function UI.explain_error(err)
     local explanations = require("sanity.explanations")
-    local err = get_error_at_cursor()
-    if not err then
-        vim.notify("No error at cursor.", vim.log.levels.WARN)
-        return
-    end
 
     -- Try exact match first, then prefix match.
     local explanation = explanations[err.kind]
@@ -219,20 +213,8 @@ function UI.explain_error(get_error_at_cursor)
 end
 
 -- Set a breakpoint at the error's location via nvim-dap or GDB clipboard.
--- Navigate functions are passed as a table: { get_error_at_cursor, get_current_position,
--- is_source_window, find_source_win }.
-function UI.debug_error(nav)
-    local err = nav.get_error_at_cursor()
-    if not err then
-        vim.notify("No error at cursor.", vim.log.levels.WARN)
-        return
-    end
-    -- Use the cursor's actual position, not the first stack frame.
-    local file, line = nav.get_current_position()
-    if not file or not line then
-        vim.notify("No position to debug.", vim.log.levels.WARN)
-        return
-    end
+-- nav contains: { is_source_window, find_source_win }.
+function UI.debug_error(err, file, line, nav)
     local ok, dap = pcall(require, "dap")
     if ok then
         local target_win = vim.api.nvim_get_current_win()
