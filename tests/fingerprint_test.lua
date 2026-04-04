@@ -12,14 +12,32 @@ describe("error fingerprint", function()
       } },
     }, {})
     local fp = T.error_fingerprint(err)
-    assert_eq(fp, "Race\0valgrind\0src/w.c:10")
+    assert_eq(fp, "Race\0valgrind\0src/w.c:10\0src/main.c:99")
+  end)
+
+  it("distinguishes errors that share a leaf frame but differ deeper in the stack", function()
+    T.reset_state()
+    local a = T.new_error("Race", "data race", "valgrind", {
+      { label = "s", frames = {
+        { func = "touch", file = "a.c", line = 1 },
+        { func = "path_one", file = "a.c", line = 10 },
+      } },
+    }, {})
+    local b = T.new_error("Race", "data race", "valgrind", {
+      { label = "s", frames = {
+        { func = "touch", file = "a.c", line = 1 },
+        { func = "path_two", file = "a.c", line = 20 },
+      } },
+    }, {})
+    assert(T.error_fingerprint(a) ~= T.error_fingerprint(b),
+      "expected different fingerprints for different call paths")
   end)
 
   it("handles errors with no stacks gracefully", function()
     T.reset_state()
     local err = T.new_error("Race", "data race", "valgrind", {}, {})
     local fp = T.error_fingerprint(err)
-    assert_eq(fp, "Race\0valgrind\0")
+    assert_eq(fp, "Race\0valgrind")
   end)
 
   it("handles errors with empty frames list", function()
@@ -28,7 +46,7 @@ describe("error fingerprint", function()
       { label = "stack", frames = {} },
     }, {})
     local fp = T.error_fingerprint(err)
-    assert_eq(fp, "Race\0valgrind\0")
+    assert_eq(fp, "Race\0valgrind")
   end)
 end)
 
@@ -172,7 +190,7 @@ describe("snapshot persistence", function()
 
   it("restore_snapshot ignores non-number values in the file", function()
     local sf = io.open(tmp_file, "w")
-    sf:write('{"good\\u0000key":2,"bad\\u0000key":"not a number"}')
+    sf:write('{"version":2,"fingerprints":{"good\\u0000key":2,"bad\\u0000key":"not a number"}}')
     sf:close()
 
     T.reset_state()
@@ -185,6 +203,20 @@ describe("snapshot persistence", function()
     local result = T.compute_diff_summary()
     -- 1 new (Race), 2 fixed (good key x2), 0 unchanged.
     assert_eq(result, " (1 new, 2 fixed, 0 unchanged)")
+  end)
+
+  it("restore_snapshot discards unversioned (legacy) snapshots", function()
+    local sf = io.open(tmp_file, "w")
+    sf:write('{"old\\u0000key":1}')
+    sf:close()
+
+    T.reset_state()
+    T.set_prev_fingerprints(nil)
+    T.set_config("snapshot_file", tmp_file)
+    T.restore_snapshot()
+    -- No prior-run fingerprints means compute_diff_summary returns nil.
+    local result = T.compute_diff_summary()
+    assert_eq(result, nil)
   end)
 
   it("restore_snapshot is a no-op when snapshot_file is falsy", function()
@@ -209,6 +241,7 @@ describe("snapshot persistence", function()
     sf:close()
     local ok, decoded = pcall(vim.json.decode, content)
     assert(ok, "JSON decode should succeed")
-    assert_eq(decoded["Race\0valgrind\0a.c:1"], 1)
+    assert_eq(decoded.version, 2)
+    assert_eq(decoded.fingerprints["Race\0valgrind\0a.c:1"], 1)
   end)
 end)
