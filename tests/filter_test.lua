@@ -5,7 +5,7 @@ local T = M._test
 describe("expand_filter_args", function()
   it("expands preset names to kind lists", function()
     local result = T.expand_filter_args({ "leaks" })
-    assert_eq(result, { "Leak_" })
+    assert_eq(result, { "Leak_", "detected-memory-leaks" })
   end)
 
   it("passes through unknown args verbatim", function()
@@ -21,7 +21,7 @@ describe("expand_filter_args", function()
 
   it("handles multiple presets", function()
     local result = T.expand_filter_args({ "leaks", "races" })
-    assert_eq(result, { "Leak_", "Race", "data-race" })
+    assert_eq(result, { "Leak_", "detected-memory-leaks", "Race", "data-race" })
   end)
 end)
 

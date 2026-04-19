@@ -56,7 +56,7 @@ Q.filter_presets = {
         "null-pointer-passed-as-argument",
     },
     leaks = {
-        "Leak_",
+        "Leak_", "detected-memory-leaks",
     },
     races = {
         "Race", "data-race",
@@ -243,7 +243,7 @@ function Q.populate_quickfix_from_errors()
     end
     vim.fn.setqflist({}, "a", { title = title })
 
-    -- Notify plugins (e.g. trouble.nvim) that the quickfix list changed.
+    -- Notify plugins (e.g., trouble.nvim) that the quickfix list changed.
     vim.api.nvim_exec_autocmds("QuickFixCmdPost", { pattern = "*" })
 end
 
@@ -263,7 +263,8 @@ function Q.set_diagnostics(only_bufnr)
     local buf_diags = {}
     for _, group_key in ipairs(group_order) do
         local group = groups[group_key]
-        local bufnr = vim.fn.bufnr(group.file, false)
+        -- `bufnr()` alone falls back to partial name matching.
+        local bufnr = vim.fn.bufexists(group.file) == 1 and vim.fn.bufnr(group.file) or -1
         if bufnr == -1 then goto diag_continue end
         if only_bufnr and bufnr ~= only_bufnr then goto diag_continue end
         if not buf_diags[bufnr] then

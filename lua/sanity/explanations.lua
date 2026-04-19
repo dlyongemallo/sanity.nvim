@@ -169,7 +169,7 @@ local M = {
     ["null-pointer-passed-as-argument"] = {
         title = "Null Pointer Argument",
         description = "A null pointer was passed to a function parameter that is declared " ..
-            "to never be null (e.g. via __attribute__((nonnull)) or _Nonnull).",
+            "to never be null (e.g., via __attribute__((nonnull)) or _Nonnull).",
         common_fixes = {
             "Check the pointer for NULL before passing it.",
             "Ensure the caller's logic guarantees a valid pointer.",
@@ -202,6 +202,37 @@ local M = {
             "Ensure all struct/array members are set before use.",
             "Check all code paths initialise the variable.",
             "Compile with -fsanitize-memory-track-origins for origin tracking.",
+        },
+    },
+    ["double-free"] = {
+        title = "Double Free",
+        description = "A heap allocation was released twice. The second free corrupts the " ..
+            "allocator's bookkeeping; the reported frame is typically where the second " ..
+            "free happened.",
+        common_fixes = {
+            "Set pointers to NULL after freeing so a second free is a no-op.",
+            "Review object ownership, especially across moves/copies in C++.",
+            "Use smart pointers or RAII to make ownership explicit.",
+        },
+    },
+    ["bad-free"] = {
+        title = "Invalid Free",
+        description = "`free()` was called on an address that was never returned from " ..
+            "`malloc`/`calloc`/`realloc`, on a mid-allocation offset, or on the stack.",
+        common_fixes = {
+            "Pass to `free` exactly the pointer value that `malloc` returned.",
+            "Guard against double increment of pointers that are later freed.",
+            "Check that stack-allocated data is not being freed by mistake.",
+        },
+    },
+    ["detected-memory-leaks"] = {
+        title = "Memory Leaks Detected (LSAN)",
+        description = "LeakSanitizer found allocations still reachable or unreferenced at " ..
+            "exit. Each `Direct leak` entry is a separate leak site.",
+        common_fixes = {
+            "Pair every `malloc`/`new` with a corresponding `free`/`delete`.",
+            "Confirm RAII types actually release their resources in destructors.",
+            "Use `__attribute__((cleanup))` or smart pointers for scope-bound allocations.",
         },
     },
 }

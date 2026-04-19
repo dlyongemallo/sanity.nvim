@@ -4,11 +4,34 @@ local F = require("sanity.format")
 
 local SUP = {}
 
+-- Sized access widths valgrind accepts for `Memcheck:Addr<N>`/`Memcheck:Value<N>`.
+local valid_access_sizes = { ["1"] = true, ["2"] = true, ["4"] = true, ["8"] = true, ["16"] = true }
+
 -- Generate a suppression entry for an error.
+-- `cursor_file` and `cursor_line` optionally pick a specific stack of a
+-- multi-stack error (e.g., an LSan report with several leaks, where the user
+-- intends to suppress the one under their cursor rather than the first leak).
 -- Returns (text, tool) on success or (nil, reason) on failure.
-function SUP.generate_suppression(err)
+function SUP.generate_suppression(err, cursor_file, cursor_line)
     if not err.stacks or #err.stacks == 0 or not err.stacks[1].frames or #err.stacks[1].frames == 0 then
         return nil, "No stack frames available for suppression."
+    end
+
+    -- Pick the stack that contains the cursor position, falling back to the
+    -- first stack. Both sides are already normalised: parsers run frame
+    -- paths through F.normalize_path and navigate.get_current_position does
+    -- the same.
+    local stack = err.stacks[1]
+    if cursor_file and cursor_line then
+        for _, s in ipairs(err.stacks) do
+            for _, frame in ipairs(s.frames or {}) do
+                if frame.file == cursor_file and frame.line == cursor_line then
+                    stack = s
+                    goto stack_picked
+                end
+            end
+        end
+        ::stack_picked::
     end
 
     if err.source == "valgrind" then
@@ -21,13 +44,28 @@ function SUP.generate_suppression(err)
         elseif kind == "UnlockUnlocked" or kind == "LockOrder" then
             supp_type = "Helgrind:Misc"
         elseif kind == "InvalidRead" or kind == "InvalidWrite" then
-            supp_type = "Memcheck:Addr"
+            -- Valgrind Memcheck only accepts sized `Memcheck:Addr<N>`
+            -- suppression types with N in {1, 2, 4, 8, 16}; an unsized or
+            -- unsupported-size entry makes valgrind reject the entire
+            -- suppression file. Extract the access size from messages like
+            -- "Invalid read of size 4".
+            local size = err.message and err.message:match("of size (%d+)")
+            if not valid_access_sizes[size] then
+                return nil, "Suppression requires access size (1/2/4/8/16) in message: " .. (err.message or "<nil>")
+            end
+            supp_type = "Memcheck:Addr" .. size
         elseif kind == "InvalidFree" then
             supp_type = "Memcheck:Free"
         elseif kind == "UninitCondition" then
             supp_type = "Memcheck:Cond"
         elseif kind == "UninitValue" then
-            supp_type = "Memcheck:Value"
+            -- Same sizing constraint as Memcheck:Addr<N>; extract from
+            -- messages like "Use of uninitialised value of size 8".
+            local size = err.message and err.message:match("of size (%d+)")
+            if not valid_access_sizes[size] then
+                return nil, "Suppression requires access size (1/2/4/8/16) in message: " .. (err.message or "<nil>")
+            end
+            supp_type = "Memcheck:Value" .. size
         elseif kind == "Overlap" then
             supp_type = "Memcheck:Overlap"
         elseif F.starts_with(kind, "Leak_") then
@@ -48,20 +86,33 @@ function SUP.generate_suppression(err)
             return nil, "Suppression not available for " .. kind .. " errors."
         end
 
-        local lines = { "{", "   <sanity_generated>", "   " .. supp_type }
+        local funcs = {}
+        for _, frame in ipairs(stack.frames) do
+            if frame.func then
+                table.insert(funcs, frame.func)
+            end
+        end
+        if #funcs == 0 then
+            return nil, "No function name available for suppression."
+        end
+
+        -- Unique name across sibling errors: audits key usage counts by name,
+        -- so two errors with the same kind and same innermost function must
+        -- not share a name. Include the full in-project function chain.
+        local name = "<sanity_generated:" .. kind .. ":" .. table.concat(funcs, "/") .. ">"
+        local lines = { "{", "   " .. name, "   " .. supp_type }
         if extra_line then
             table.insert(lines, extra_line)
         end
-        local has_func = false
-        for _, frame in ipairs(err.stacks[1].frames) do
-            if frame.func then
-                table.insert(lines, "   fun:" .. frame.func)
-                has_func = true
-            end
+        -- Wrap every `fun:` with `...` so the suppression matches valgrind's
+        -- actual stack when the parser stripped non-project frames (both
+        -- innermost allocator-style frames and library frames interleaved
+        -- between project frames).
+        for _, func in ipairs(funcs) do
+            table.insert(lines, "   ...")
+            table.insert(lines, "   fun:" .. func)
         end
-        if not has_func then
-            return nil, "No function name available for suppression."
-        end
+        table.insert(lines, "   ...")
         table.insert(lines, "}")
         return table.concat(lines, "\n"), "valgrind"
     end
@@ -69,7 +120,7 @@ function SUP.generate_suppression(err)
     if err.source == "sanitizer" then
         -- Find deepest in-project frame with a function name.
         local func
-        for _, frame in ipairs(err.stacks[1].frames) do
+        for _, frame in ipairs(stack.frames) do
             if frame.func then
                 func = frame.func
                 break
@@ -126,9 +177,16 @@ function SUP.save_suppressions(args)
             ok, write_err = fh:write(s.text .. "\n")
             if not ok then break end
         end
-        fh:close()
+        -- Check the close return as well: buffered writes can succeed while
+        -- the final flush fails (e.g., disk full), and ignoring that would
+        -- clear S.suppressions on data that never reached the file.
+        local close_ok, close_err = fh:close()
         if not ok then
             vim.notify("Write failed for " .. filename .. ": " .. (write_err or "unknown error"), vim.log.levels.ERROR)
+            return
+        end
+        if not close_ok then
+            vim.notify("Close failed for " .. filename .. ": " .. (close_err or "unknown error"), vim.log.levels.ERROR)
             return
         end
         vim.notify("Wrote " .. #S.suppressions .. " suppression(s) to " .. filename .. ".")
@@ -159,9 +217,13 @@ function SUP.save_suppressions(args)
                 ok, write_err = fh:write(text .. "\n")
                 if not ok then break end
             end
-            fh:close()
+            local close_ok, close_err = fh:close()
             if not ok then
                 vim.notify("Write failed for " .. path .. ": " .. (write_err or "unknown error"), vim.log.levels.ERROR)
+                goto save_continue
+            end
+            if not close_ok then
+                vim.notify("Close failed for " .. path .. ": " .. (close_err or "unknown error"), vim.log.levels.ERROR)
                 goto save_continue
             end
             vim.notify("Wrote " .. #entries .. " suppression(s) to " .. path .. ".")

@@ -428,8 +428,8 @@ local show_floating_window = UI.show_floating_window
 
 -- SanitySuppress: queue a suppression for the error at cursor.
 M.suppress_error = function()
-    N.pick_error_at_cursor(function(err)
-        local text, tool_or_reason = SUP.generate_suppression(err)
+    N.pick_error_at_cursor(function(err, file, line)
+        local text, tool_or_reason = SUP.generate_suppression(err, file, line)
         if not text then
             vim.notify(tool_or_reason, vim.log.levels.WARN)
             return

@@ -13,6 +13,7 @@ describe("generate_suppression", function()
     assert_eq(tool, "valgrind")
     assert(text:find("Memcheck:Addr"), "expected Memcheck:Addr")
     assert(text:find("fun:bad_write"), "expected fun:bad_write")
+    assert(text:find("<sanity_generated:InvalidWrite:bad_write>", 1, true), "expected unique name")
   end)
 
   it("generates valgrind Memcheck:Leak with match-leak-kinds", function()
@@ -38,16 +39,36 @@ describe("generate_suppression", function()
     assert(text:find("Memcheck:Cond"), "expected Memcheck:Cond")
   end)
 
-  it("generates valgrind Memcheck:Value for UninitValue", function()
+  it("generates valgrind Memcheck:Value<N> for UninitValue", function()
     T.reset_state()
-    local err = T.new_error("UninitValue", "Use of uninitialised value", "valgrind", {
+    local err = T.new_error("UninitValue", "Use of uninitialised value of size 8", "valgrind", {
       { label = "stack", frames = { { func = "compute", file = "a.c", line = 1 } } },
     }, {})
     local text, tool = T.generate_suppression(err)
     assert(text, "expected suppression text")
     assert_eq(tool, "valgrind")
-    assert(text:find("Memcheck:Value"), "expected Memcheck:Value")
+    assert(text:find("Memcheck:Value8"), "expected Memcheck:Value8")
     assert(not text:find("Memcheck:Cond"), "must not use Memcheck:Cond for UninitValue")
+  end)
+
+  it("fails UninitValue suppression when size is missing from the message", function()
+    T.reset_state()
+    local err = T.new_error("UninitValue", "Use of uninitialised value", "valgrind", {
+      { label = "stack", frames = { { func = "compute", file = "a.c", line = 1 } } },
+    }, {})
+    local text, reason = T.generate_suppression(err)
+    assert(not text, "expected nil text")
+    assert(reason:find("access size"), "expected 'access size' in reason")
+  end)
+
+  it("fails InvalidWrite suppression when size is unsupported", function()
+    T.reset_state()
+    local err = T.new_error("InvalidWrite", "Invalid write of size 32", "valgrind", {
+      { label = "stack", frames = { { func = "bad_write", file = "a.c", line = 1 } } },
+    }, {})
+    local text, reason = T.generate_suppression(err)
+    assert(not text, "expected nil text")
+    assert(reason:find("access size"), "expected 'access size' in reason")
   end)
 
   it("generates valgrind Helgrind:Race for Race", function()
@@ -73,7 +94,7 @@ describe("generate_suppression", function()
 
   it("fails when valgrind frames lack function names", function()
     T.reset_state()
-    local err = T.new_error("InvalidRead", "Invalid read", "valgrind", {
+    local err = T.new_error("InvalidRead", "Invalid read of size 4", "valgrind", {
       { label = "stack", frames = { { file = "a.c", line = 1 } } },
     }, {})
     local text, reason = T.generate_suppression(err)
