@@ -9,15 +9,26 @@ function N.get_error_by_id(id)
 end
 
 -- Return (file, line, error_ids) for a quickfix entry index.
+-- The cached `S.qf_file_lines` / `S.qf_error_ids` are only trusted when they
+-- agree with the live quickfix entry at the same index. External commands
+-- (`:cfilter`, `:cexpr`, etc.) can replace the quickfix list without our
+-- knowledge, in which case the caches hold stale indexes and must not be used
+-- to resolve error IDs.
 function N.get_qf_entry_position(idx)
     if not idx or idx < 1 then return nil, nil, nil end
-    local ids = S.qf_error_ids[idx]
-    local fl = S.qf_file_lines[idx]
-    if fl then return fl.file, fl.line, ids end
     local qflist = vim.fn.getqflist()
     local entry = qflist[idx]
-    if not entry or entry.bufnr == 0 then return nil, nil, nil end
-    return vim.api.nvim_buf_get_name(entry.bufnr), entry.lnum, ids
+    if not entry then return nil, nil, nil end
+    local live_file = entry.bufnr and entry.bufnr > 0
+        and vim.api.nvim_buf_get_name(entry.bufnr) or nil
+    local live_line = entry.lnum
+    local fl = S.qf_file_lines[idx]
+    if fl and live_file and F.normalize_path(fl.file) == F.normalize_path(live_file)
+        and fl.line == live_line then
+        return fl.file, fl.line, S.qf_error_ids[idx]
+    end
+    if not live_file then return nil, nil, nil end
+    return live_file, live_line, nil
 end
 
 -- True only for the built-in quickfix *window* (not loclist, not wrappers).
@@ -28,15 +39,20 @@ function N.is_qflist_window(win)
     return info[1].quickfix == 1 and info[1].loclist ~= 1
 end
 
--- Trouble qflist windows are not native quickfix windows.
+-- True only for a Trouble buffer; a plain `:lopen` location list is not
+-- trouble-like and must not resolve through the global quickfix list.
 function N.is_trouble_like_window(win)
     win = win or vim.api.nvim_get_current_win()
     local buf = vim.api.nvim_win_get_buf(win)
-    if vim.bo[buf].filetype == "trouble" then return true end
-    if vim.bo[buf].buftype == "quickfix" and not N.is_qflist_window(win) then
-        return true
-    end
-    return false
+    return vim.bo[buf].filetype == "trouble"
+end
+
+-- True for a window showing a plain location list (`:lopen`).
+function N.is_loclist_window(win)
+    win = win or vim.api.nvim_get_current_win()
+    local info = vim.fn.getwininfo(win)
+    if not info or not info[1] then return false end
+    return info[1].quickfix == 1 and info[1].loclist == 1
 end
 
 -- A source window is a normal non-floating window showing a source buffer.
@@ -100,6 +116,16 @@ function N.get_current_position()
         local file, line, ids = N.get_qf_entry_position(info and info.idx)
         if file and line then return file, line, ids end
         return nil, nil, nil
+    end
+
+    if N.is_loclist_window(win) then
+        -- Plain location list: resolve against the window-local loclist, not
+        -- the global quickfix list. error_ids are nil because sanity owns the
+        -- quickfix list, not location lists.
+        local loclist = vim.fn.getloclist(win)
+        local entry = loclist[vim.fn.line(".")]
+        if not entry or (entry.bufnr or 0) == 0 then return nil, nil, nil end
+        return F.normalize_path(vim.api.nvim_buf_get_name(entry.bufnr)), entry.lnum, nil
     end
 
     -- Fallback for quickfix-like custom buffers that don't expose wininfo.
@@ -304,7 +330,7 @@ function N.navigate_stack(direction, refresh_stack_fn)
 end
 
 -- Find related targets sharing the same address as err.
--- Includes other stacks within the same error (e.g. both sides of a
+-- Includes other stacks within the same error (e.g., both sides of a
 -- data race) and other errors referencing the same memory address.
 -- file/line is the current position used to exclude the caller's location.
 -- all_errors is the full error list to search for cross-error matches.

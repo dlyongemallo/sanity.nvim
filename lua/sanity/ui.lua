@@ -228,7 +228,8 @@ function UI.debug_error(err, file, line, nav)
         vim.api.nvim_set_current_win(target_win)
         vim.cmd("edit " .. vim.fn.fnameescape(file))
         vim.api.nvim_win_set_cursor(target_win, { line, 0 })
-        dap.toggle_breakpoint()
+        -- `toggle_breakpoint()` would remove an existing breakpoint here.
+        dap.set_breakpoint()
         vim.notify("Breakpoint set at " .. file .. ":" .. line)
     else
         -- Quote the file path so GDB handles spaces and special characters.
