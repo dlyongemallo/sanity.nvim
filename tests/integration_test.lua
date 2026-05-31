@@ -47,20 +47,30 @@ describe("load_files integration", function()
     assert(summary:find("%(0 new, 0 fixed, 1 unchanged%)"), "expected all unchanged: " .. summary)
   end)
 
-  it("shows diff after first load produced 0 errors", function()
+  it("does not establish a diff baseline from an empty load", function()
     T.reset_state()
+    -- set_prev_fingerprints(nil) also resets S.has_loaded to false.
     T.set_prev_fingerprints(nil)
-    -- First load with no files produces 0 errors.
-    capture_notify(function()
+    -- A call with no files must leave state untouched: it should not reset
+    -- S.has_loaded or snapshot a bogus zero-error baseline that a later load
+    -- would then diff against.
+    local before_msgs = capture_notify(function()
       T.load_files({})
     end)
-    -- Second load with actual errors should show diff (all new).
+    -- An empty-filepaths call is allowed to be a silent no-op (the picker
+    -- callback can produce {} when the user escapes), so no summary is
+    -- required. But if any notification fires it must not claim a load.
+    for _, m in ipairs(before_msgs) do
+      assert(not m:find("^Loaded "), "empty load should not emit a Loaded summary: " .. m)
+    end
+    -- A real load afterwards is the first successful load, so no diff suffix.
     local log = H.localize_log("tests/asan.log")
     local msgs = capture_notify(function()
       T.load_files({ log })
     end)
     local summary = msgs[#msgs]
-    assert(summary:find("%(1 new, 0 fixed, 0 unchanged%)"), "expected all-new diff: " .. summary)
+    assert(summary:find("^Loaded "), "expected summary from real load: " .. summary)
+    assert(not summary:find("%("), "expected no diff suffix: " .. summary)
   end)
 
   it("reflects changed errors in diff summary", function()
