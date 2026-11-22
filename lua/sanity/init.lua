@@ -301,6 +301,11 @@ local function register_keymaps()
     end
 end
 
+-- On-disk snapshot schema version. Bump when the fingerprint shape or
+-- envelope changes; older baselines are then discarded instead of diffing
+-- as all "new" and all "fixed".
+local SNAPSHOT_VERSION = 2
+
 -- Restore fingerprints from a previous session's snapshot file.
 -- Validates that every key is a string and every value is a number.
 local function restore_snapshot()
@@ -312,8 +317,9 @@ local function restore_snapshot()
     sf:close()
     local ok, decoded = pcall(vim.json.decode, content)
     if not ok or type(decoded) ~= "table" then return end
+    if decoded.version ~= SNAPSHOT_VERSION or type(decoded.fingerprints) ~= "table" then return end
     local valid = {}
-    for k, v in pairs(decoded) do
+    for k, v in pairs(decoded.fingerprints) do
         if type(k) == "string" and type(v) == "number" then
             valid[k] = v
         end
@@ -324,8 +330,8 @@ end
 -- Save current fingerprints to the snapshot file atomically.
 local function save_snapshot()
     if not S.config.snapshot_file then return end
-    local fps = D.snapshot_fingerprints()
-    local ok, encoded = pcall(vim.json.encode, fps)
+    local payload = { version = SNAPSHOT_VERSION, fingerprints = D.snapshot_fingerprints() }
+    local ok, encoded = pcall(vim.json.encode, payload)
     if not ok then return end
     local tmp_path = S.config.snapshot_file .. ".tmp"
     local sf = io.open(tmp_path, "w")
@@ -372,12 +378,14 @@ local function load_files(filepaths)
         if format == "valgrind_xml" then
             M.parse_valgrind_xml(filepath)
             vim.notify("Parsed valgrind XML: " .. filepath)
-        elseif format == "sanitizer_log" then
+        elseif format == "sanitizer_log" or format == "ubsan_log" then
+            -- A single log can mix ASAN/TSAN/MSAN/LSAN output with UBSAN
+            -- "file:line:col: runtime error:" entries (e.g.,
+            -- `-fsanitize=address,undefined`). Run both parsers so neither
+            -- format is dropped; each only emits errors for its own headers.
             M.parse_sanitizer_log(filepath)
-            vim.notify("Parsed sanitizer log: " .. filepath)
-        elseif format == "ubsan_log" then
             M.parse_ubsan_log(filepath)
-            vim.notify("Parsed UBSAN log: " .. filepath)
+            vim.notify("Parsed sanitizer/UBSAN log: " .. filepath)
         end
     end
     Q.populate_quickfix_from_errors()

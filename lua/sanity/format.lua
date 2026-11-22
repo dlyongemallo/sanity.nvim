@@ -5,6 +5,21 @@ function F.starts_with(str, start)
     return str:sub(1, #start) == start
 end
 
+-- True when `path` is `root` or is strictly inside it. A plain starts_with
+-- comparison would incorrectly admit /x/proj2/foo under root /x/proj.
+function F.path_inside(path, root)
+    if root == "" then return true end
+    -- Strip a trailing slash so "/foo/" matches the same paths as "/foo".
+    if root:sub(-1) == "/" and #root > 1 then
+        root = root:sub(1, -2)
+    end
+    if path == root then return true end
+    -- Filesystem root: every absolute path is inside it.
+    if root == "/" then return path:sub(1, 1) == "/" end
+    if path:sub(1, #root) ~= root then return false end
+    return path:sub(#root + 1, #root + 1) == "/"
+end
+
 -- Normalise a file path so redundant slashes and relative segments
 -- do not cause location_index misses.
 function F.normalize_path(path)
@@ -48,13 +63,19 @@ function F.summarize_table_keys(t, show_only_first_entry, sort_by_numeric_value)
     local n = 0
     for k, _ in pairs(t) do
         if sort_by_numeric_value then
-            k = tonumber(k)
+            -- Strip grouping commas so values like "1,024" from Valgrind's human-readable
+            -- messages convert cleanly to numbers.
+            k = tonumber((tostring(k):gsub(",", "")))
         end
-        table.insert(sorted_t, k)
-        n = n + 1
+        if k ~= nil then
+            table.insert(sorted_t, k)
+            n = n + 1
+        end
     end
     table.sort(sorted_t)
-    if n == 1 then
+    if n == 0 then
+        return ""
+    elseif n == 1 then
         return sorted_t[1]
     elseif show_only_first_entry then
         return sorted_t[1] .. "/..."
@@ -79,15 +100,18 @@ function F.format_link_set(link_set)
             has_end = true
         else
             local filename, line_number = string.match(full_link, "^%->(.*):(%d+)$")
-            line_number = line_number:match("^0*(%d+)$")
-            if filename == prev_filename then
-                summary = summary .. "," .. line_number
-            else
-                if prev_filename ~= "" then
-                    summary = summary .. "/"
+            if filename and line_number then
+                -- Strip leading zeros.
+                line_number = line_number:match("^0*(%d+)$")
+                if filename == prev_filename then
+                    summary = summary .. "," .. line_number
+                else
+                    if prev_filename ~= "" then
+                        summary = summary .. "/"
+                    end
+                    summary = summary .. filename .. ":" .. line_number
+                    prev_filename = filename
                 end
-                summary = summary .. filename .. ":" .. line_number
-                prev_filename = filename
             end
         end
     end

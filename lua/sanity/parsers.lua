@@ -22,7 +22,9 @@ function P.detect_log_format(filepath)
         vim.notify("Failed to open file: " .. filepath, vim.log.levels.ERROR)
         return nil
     end
-    for _ = 1, 10 do
+    -- Scan up to 1000 lines so a long program-stderr prelude doesn't hide
+    -- the sanitizer/valgrind marker.
+    for _ = 1, 1000 do
         local line = f:read("*l")
         if not line then break end
         if line:find("<%?xml") or line:find("<valgrindoutput") then
@@ -92,7 +94,7 @@ function P.parse_valgrind_xml(xml_file)
         end
 
         local lsize, blocks, loss_record, total_records = string.match(message,
-            "(.+) bytes in (%d+) blocks .* in loss record (%d+) of (%d+)")
+            "^(%d[%d,]*) .-bytes in (%d+) blocks .* in loss record (%d+) of (%d+)")
         if lsize then
             meta.leak_type = err_kind:match("^Leak_(.*)") or "unknown"
             meta.size = lsize
@@ -108,7 +110,7 @@ function P.parse_valgrind_xml(xml_file)
         for raw_idx, raw_stack in ipairs(err_stacks_raw) do
             local frames = {}
             for _, f in ipairs(raw_stack.frames) do
-                if f.dir and f.file and F.starts_with(f.dir, cwd) then
+                if f.dir and f.file and F.path_inside(f.dir, cwd) then
                     table.insert(frames, {
                         file = f.dir .. "/" .. f.file,
                         line = tonumber(f.line) or 1,
@@ -174,7 +176,15 @@ function P.parse_valgrind_xml(xml_file)
                 frame_file = nil
                 frame_line = nil
             elseif close_tag == "stack" then
-                table.insert(err_stacks_raw, { frames = stack_frames })
+                -- Only capture stacks that are children of an <error>.
+                -- Helgrind emits <announcethread> blocks (and tools can emit
+                -- <announcelock>, etc.) whose own <stack> children otherwise
+                -- prepend themselves to the next error's stack list and shift
+                -- every auxwhat label by the number of leaked stacks.
+                local parent_tag = name_stack[#name_stack - 1]
+                if parent_tag == "error" then
+                    table.insert(err_stacks_raw, { frames = stack_frames })
+                end
                 stack_frames = {}
             elseif close_tag == "error" then
                 emit_error()
@@ -233,14 +243,40 @@ function P.parse_valgrind_xml(xml_file)
     return num_errors
 end
 
+-- Known sanitizer message prefixes and their canonical kinds, in match order.
+-- Canonical kinds must match the keys in `explanations.lua` and the entries
+-- in `quickfix.Q.filter_presets` so `:SanityFilter`/`:SanityExplain` work.
+local sanitizer_kind_prefixes = {
+    { "data race",                     "data-race" },
+    { "lock-order-inversion",          "lock-order-inversion" },
+    { "signal-unsafe call",            "signal-unsafe-call" },
+    { "heap-use-after-free",           "heap-use-after-free" },
+    { "heap-buffer-overflow",          "heap-buffer-overflow" },
+    { "stack-buffer-overflow",         "stack-buffer-overflow" },
+    { "global-buffer-overflow",        "global-buffer-overflow" },
+    { "attempting double-free",        "double-free" },
+    { "attempting free on",            "bad-free" },
+    { "detected memory leaks",         "detected-memory-leaks" },
+    { "use-of-uninitialized-value",    "use-of-uninitialized-value" },
+    { "use of uninitialized value",    "use-of-uninitialized-value" },
+}
+
 -- Parse a sanitizer error/warning header line.
 -- Returns (kind, message) or nil if the line is not a header.
 function P.parse_section_header(line)
     local msg = string.match(line, "==%d+==ERROR: .*Sanitizer: (.*)")
         or string.match(line, "==%d+==WARNING: .*Sanitizer: (.*)")
+        or string.match(line, "^ERROR: .*Sanitizer: (.*)")
         or string.match(line, "^WARNING: .*Sanitizer: (.*)")
     if not msg then return nil end
-    -- Handle multi-word kinds like "data race (pid=...)" -> "data-race".
+    for _, entry in ipairs(sanitizer_kind_prefixes) do
+        if msg:sub(1, #entry[1]) == entry[1] then
+            return entry[2], msg
+        end
+    end
+    -- Fallback for sanitizer kinds we have not catalogued: take up to the
+    -- first parenthesised suffix (e.g., "foo bar (pid=...)" -> "foo-bar")
+    -- or the first whitespace-delimited token.
     local kind = msg:match("^(%S+%s%S+)%s+%(")
         or msg:match("^(%S+)") or "unknown"
     kind = kind:gsub("%s+", "-")
@@ -252,26 +288,39 @@ end
 -- frame or the file is outside cwd.
 -- readable_cache is an optional table used to memoize filereadable() results.
 function P.parse_frame_line(line, cwd, readable_cache)
-    -- Extract function name (nil when unavailable).
-    local func_name = line:match("#%d+ 0x%x+ in (%S+)")       -- ASAN format.
-    if not func_name then
-        func_name = line:match("#%d+ (%S+) /")                 -- TSAN format.
+    -- Require a frame-index marker so we can't mistake non-frame lines like
+    -- ASAN's SUMMARY line for a stack frame.
+    if not line:match("^%s*#%d+") then return nil end
+    -- Anchor on the source location `path:line[:col]`: both ASAN and TSAN
+    -- place it after the function name, so finding it first lets us recover
+    -- the function name when it contains spaces (C++ demangled signatures
+    -- like `Foo::bar(int, char const*)`). Bogus matches are rejected later
+    -- by `F.path_inside`.
+    local target = line:match("(%S+:%d+:?%d*)")
+    if not target then return nil end
+
+    -- Function name: everything between the `#N` marker and the source
+    -- location, with the ASAN `0x<addr> in` prefix stripped.
+    local func_name
+    local escaped_target = target:gsub("(%W)", "%%%1")
+    local prefix = line:match("^(.-)%s+" .. escaped_target)
+    if prefix then
+        func_name = prefix
+            :gsub("^%s*#%d+%s*", "")
+            :gsub("^0x%x+%s+", "")
+            :gsub("^in%s+", "")
+        if func_name == "" then func_name = nil end
     end
 
-    local target = string.match(line, "#%d+ 0x%x+ .* (.+)")   -- ASAN format.
-    if not target then
-        target = string.match(line, "#%d+ %S+ ([^%(]+)%s+%(") -- TSAN format.
-    end
-    if not target then return nil end
     target = F.resolve_path(target)
-    if not F.starts_with(target, cwd) then return nil end
+    if not F.path_inside(target, cwd) then return nil end
     -- Match file:line:col (clang/MSAN) or file:line (GCC).
     local filename, line_number = string.match(target, "(%S+):(%d+):%d+")
     if not filename then
         filename, line_number = string.match(target, "(%S+):(%d+)")
     end
     if not filename or not line_number then return nil end
-    -- Reject phantom paths (e.g. relative libc sources resolved under cwd).
+    -- Reject phantom paths (e.g., relative libc sources resolved under cwd).
     if readable_cache then
         if readable_cache[filename] == nil then
             readable_cache[filename] = vim.fn.filereadable(filename) == 1
@@ -299,7 +348,7 @@ function P.parse_sanitizer_log(log_file)
     local cwd = vim.fn.getcwd()
     local readable_cache = {}
     local current_message = "NO MESSAGE"
-    local current_kind = "unknown"
+    local current_kind = nil
     local current_meta = {}
     local current_stacks = {}  -- Array of { label, frames }.
     local current_label = ""
@@ -319,12 +368,17 @@ function P.parse_sanitizer_log(log_file)
         end
     end
 
-    -- Finalise the current error (if it has stacks).
+    -- Finalise the current error (if it has both a kind and stacks). A kind
+    -- of nil means no sanitizer section header was seen yet; without it we
+    -- would emit a bogus "unknown" error from stray frame-like lines (e.g.,
+    -- a pure UBSAN log processed through this parser alongside the UBSAN
+    -- parser).
     local function finalize_error()
         finalize_stack()
-        if #current_stacks > 0 then
+        if current_kind and #current_stacks > 0 then
             Q.new_error(current_kind, current_message, "sanitizer", current_stacks, current_meta)
         end
+        current_kind = nil
         current_stacks = {}
         current_meta = {}
         current_label = ""
@@ -336,9 +390,13 @@ function P.parse_sanitizer_log(log_file)
     for line in log_file_handle:lines() do
         if F.starts_with(line, "allocated by") then
             -- "allocated by" continues the current error as a new stack section.
+            -- Do not set `current_meta.heap_block`: that flag selects the
+            -- "Location is heap block of size ... allocated by ..." formatting
+            -- branch, which requires `size`, `addr`, and `thr` metadata that
+            -- only the explicit `Location is heap block of size X at Y` header
+            -- (handled below) populates.
             finalize_stack()
             current_label = last_addr .. " " .. line
-            current_meta.heap_block = true
         elseif not F.starts_with(line, "    #") then
             -- Non-frame line: could be a new error or a section header within an error.
             local kind, msg = P.parse_section_header(line)
@@ -349,6 +407,12 @@ function P.parse_sanitizer_log(log_file)
                 current_kind = kind
                 current_label = msg
                 in_error = true
+            elseif line:match("^(.+):(%d+):%d+: runtime error:") then
+                -- A UBSAN header appeared inside a sanitizer log. Finalize
+                -- the current sanitizer error so the UBSAN frames that
+                -- follow are not attached as an extra stack section;
+                -- parse_ubsan_log picks them up on its own pass.
+                finalize_error()
             elseif in_error then
                 -- Section header within current error.
                 finalize_stack()
@@ -446,7 +510,7 @@ function P.parse_ubsan_log(log_file)
         local stacks = {}
         if #current_frames > 0 then
             table.insert(stacks, { label = current_message, frames = current_frames })
-        elseif current_file and F.starts_with(current_file, cwd) then
+        elseif current_file and F.path_inside(current_file, cwd) then
             -- No stack frames; use the header location as a single-frame stack.
             table.insert(stacks, {
                 label = current_message,
@@ -475,11 +539,17 @@ function P.parse_ubsan_log(log_file)
             current_message = msg
             -- Derive kind by lowercasing, truncating at the first colon or comma,
             -- stripping trailing digits/punctuation, then converting spaces to hyphens
-            -- (e.g. "signed integer overflow: ..." -> "signed-integer-overflow",
+            -- (e.g., "signed integer overflow: ..." -> "signed-integer-overflow",
             --  "null pointer passed as argument 1, ..." -> "null-pointer-passed-as-argument").
             local kind_text = msg:match("^(.-)[:,%d]") or msg
             kind_text = kind_text:gsub("%s+$", ""):lower()
             current_kind = kind_text:gsub("%s+", "-")
+        elseif P.parse_section_header(line) then
+            -- A sanitizer (ASAN/TSAN/MSAN/LSAN) section header appeared. In a
+            -- mixed `-fsanitize=address,undefined` log the following `#N`
+            -- frames belong to that sanitizer error, not this UBSAN one; let
+            -- parse_sanitizer_log handle the ASAN portion on its own pass.
+            finalize_error()
         elseif current_kind and line:match("^%s+#%d+") then
             -- Stack frame line (ASAN-style).
             local frame = P.parse_frame_line(line, cwd, readable_cache)

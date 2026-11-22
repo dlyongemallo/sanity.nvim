@@ -3,14 +3,18 @@ local S = require("sanity.state")
 
 local D = {}
 
--- Build a fingerprint for an error: kind + source + first frame location.
+-- Build a fingerprint for an error: kind + source + the full first-stack
+-- frame location sequence. Including every frame (not just the first) lets
+-- two errors that share a kind and leaf location but have different call
+-- paths be tracked as distinct entries in the diff.
 function D.error_fingerprint(err)
-    local ff = ""
-    if err.stacks and err.stacks[1] and err.stacks[1].frames and err.stacks[1].frames[1] then
-        local f = err.stacks[1].frames[1]
-        ff = f.file .. ":" .. f.line
+    local parts = { err.kind, err.source }
+    if err.stacks and err.stacks[1] and err.stacks[1].frames then
+        for _, f in ipairs(err.stacks[1].frames) do
+            table.insert(parts, f.file .. ":" .. f.line)
+        end
     end
-    return err.kind .. "\0" .. err.source .. "\0" .. ff
+    return table.concat(parts, "\0")
 end
 
 -- Snapshot the current error list as a fingerprint bag (multiset).
@@ -75,16 +79,23 @@ function D.compute_diff_details()
         end
     end
 
-    -- Remaining previous fingerprints are errors that were fixed.
+    -- Remaining previous fingerprints are errors that were fixed. A
+    -- fingerprint is `kind\0source[\0loc1\0loc2...]`: keep the first frame
+    -- location as the display location, and tolerate the two-field
+    -- frameless form.
     local fixed_entries = {}
     for fp, count in pairs(prev_remaining) do
         if count > 0 then
-            local kind, source, location = fp:match("^(.-)%z(.-)%z(.*)$")
+            local kind, source, location = fp:match("^([^%z]*)%z([^%z]*)%z([^%z]*)")
+            if not kind then
+                -- Frameless fingerprint: only kind and source.
+                kind, source = fp:match("^([^%z]*)%z([^%z]*)$")
+            end
             for _ = 1, count do
                 table.insert(fixed_entries, {
-                    kind = kind or "?",
-                    source = source or "?",
-                    location = location ~= "" and location or nil,
+                    kind = (kind and kind ~= "") and kind or "?",
+                    source = (source and source ~= "") and source or "?",
+                    location = (location and location ~= "") and location or nil,
                 })
             end
         end
