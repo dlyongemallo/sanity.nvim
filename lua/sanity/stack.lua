@@ -86,16 +86,25 @@ function STK.compute_sharing_ratio(stacks)
     return shared / total_unique
 end
 
--- Deduplicate stacks by frame sequence.
+-- Deduplicate stacks by (label, frame sequence, sub_labels). All three are
+-- part of the fingerprint because sanitizer reports can carry distinct
+-- per-thread participations with identical call paths: e.g., both threads
+-- in a data race executing the same function (label differs), or two
+-- errors in the same group whose T1 creation stacks share frames but
+-- record different tids (sub_labels differ). Collapsing on frames alone
+-- silently drops one thread's contribution.
 local function dedup_stacks(stacks)
     local seen = {}
     local out = {}
     for _, stack in ipairs(stacks) do
         local parts = {}
-        for _, frame in ipairs(stack.frames) do
+        for i, frame in ipairs(stack.frames) do
             table.insert(parts, frame_key(frame))
+            if stack.sub_labels and stack.sub_labels[i] then
+                table.insert(parts, "\1" .. stack.sub_labels[i])
+            end
         end
-        local fp = table.concat(parts, "\0")
+        local fp = (stack.label or "") .. "\0" .. table.concat(parts, "\0")
         if not seen[fp] then
             seen[fp] = true
             table.insert(out, stack)
@@ -956,10 +965,14 @@ function STK.build_stack_content(file, line, error_ids)
         table.insert(buf_lines, header)
         frame_map[#buf_lines] = { error_ids = active_group_error_ids }
 
-        -- Pool all stacks, deduplicating by frame sequence.
+        -- Compose thread-aware stacks per-error so creation stacks from
+        -- different errors in the same group cannot collide on thread ID
+        -- (`creation_by_tid["T1"]` would otherwise pair every error's T1
+        -- operation with the last-seen T1 creation stack), then pool and
+        -- deduplicate.
         local raw_stacks = {}
         for _, err in ipairs(group_errs) do
-            for _, stack in ipairs(err.stacks) do
+            for _, stack in ipairs(compose_thread_stacks(err.stacks)) do
                 table.insert(raw_stacks, stack)
             end
         end
@@ -969,20 +982,13 @@ function STK.build_stack_content(file, line, error_ids)
             -- Single unique stack: flat display.
             emit_flat(all_stacks[1].frames)
         else
-            -- Compose thread-aware stacks, then dedup again.
-            local composed = compose_thread_stacks(all_stacks)
-            local deduped = dedup_stacks(composed)
-
-            if #deduped == 1 then
-                -- All stacks collapsed after composition: flat display.
-                emit_flat(deduped[1].frames)
-            elseif #deduped > 2 and STK.compute_sharing_ratio(deduped) < 0.3 then
+            if #all_stacks > 2 and STK.compute_sharing_ratio(all_stacks) < 0.3 then
                 -- Low sharing: flat sections are clearer than a trie.
                 -- Count how many stacks each frame_key appears in,
                 -- deduplicating within each stack so recursive calls
                 -- are not incorrectly marked as shared.
                 local shared_keys = {}
-                for _, st in ipairs(deduped) do
+                for _, st in ipairs(all_stacks) do
                     local seen = {}
                     for _, fr in ipairs(st.frames) do
                         local key = frame_key(fr)
@@ -996,9 +1002,9 @@ function STK.build_stack_content(file, line, error_ids)
                 for key, cnt in pairs(shared_keys) do
                     if cnt < 2 then shared_keys[key] = nil end
                 end
-                emit_flat_sections(deduped, shared_keys)
+                emit_flat_sections(all_stacks, shared_keys)
             else
-                local trie_root = build_call_trie(deduped)
+                local trie_root = build_call_trie(all_stacks)
                 local common_leaves = factor_common_leaves(trie_root)
                 local function emit_fold_summary(prefix, hidden_frames, cd)
                     local text = string.format("%s  ... (%d more)", prefix, #hidden_frames)
@@ -1253,28 +1259,40 @@ function STK.sanity_stack()
             return
         end
 
-        -- Open the file in the preview window.
-        local cur_buf = vim.api.nvim_win_get_buf(S.stack_preview_win)
-        local cur_name = vim.api.nvim_buf_get_name(cur_buf)
-        if cur_name ~= frame_info.file then
+        -- Re-entrancy guard: the parent CursorMoved autocmd is nested=true
+        -- (needed so :edit fires BufReadPost/FileType), so the cursor moves
+        -- below would otherwise retrigger the global source-tracking
+        -- autocmd with the preview buffer current and feed back into
+        -- refresh_stack. pcall ensures a thrown :edit still clears the flag.
+        S.is_previewing = true
+        local ok, err = pcall(function()
+            -- Open the file in the preview window.
+            local cur_buf = vim.api.nvim_win_get_buf(S.stack_preview_win)
+            local cur_name = vim.api.nvim_buf_get_name(cur_buf)
+            if cur_name ~= frame_info.file then
+                vim.api.nvim_win_call(S.stack_preview_win, function()
+                    vim.cmd("edit " .. vim.fn.fnameescape(frame_info.file))
+                end)
+            end
+
+            -- Scroll to the line and centre it.
+            local target_buf = vim.api.nvim_win_get_buf(S.stack_preview_win)
+            local lc = vim.api.nvim_buf_line_count(target_buf)
+            local target_line = math.min(frame_info.line, lc)
+            vim.api.nvim_win_set_cursor(S.stack_preview_win, { target_line, 0 })
             vim.api.nvim_win_call(S.stack_preview_win, function()
-                vim.cmd("edit " .. vim.fn.fnameescape(frame_info.file))
+                vim.cmd("normal! zz")
             end)
-        end
 
-        -- Scroll to the line and centre it.
-        local target_buf = vim.api.nvim_win_get_buf(S.stack_preview_win)
-        local lc = vim.api.nvim_buf_line_count(target_buf)
-        local target_line = math.min(frame_info.line, lc)
-        vim.api.nvim_win_set_cursor(S.stack_preview_win, { target_line, 0 })
-        vim.api.nvim_win_call(S.stack_preview_win, function()
-            vim.cmd("normal! zz")
+            -- Highlight the previewed line.
+            vim.api.nvim_buf_clear_namespace(target_buf, S.stack_preview_ns, 0, -1)
+            vim.api.nvim_buf_add_highlight(target_buf, S.stack_preview_ns, "CursorLine",
+                target_line - 1, 0, -1)
         end)
-
-        -- Highlight the previewed line.
-        vim.api.nvim_buf_clear_namespace(target_buf, S.stack_preview_ns, 0, -1)
-        vim.api.nvim_buf_add_highlight(target_buf, S.stack_preview_ns, "CursorLine",
-            target_line - 1, 0, -1)
+        S.is_previewing = false
+        if not ok then
+            vim.notify("Preview failed: " .. tostring(err), vim.log.levels.WARN)
+        end
     end
 
     -- Preview the initial frame.
@@ -1305,6 +1323,11 @@ function STK.sanity_stack()
     vim.api.nvim_create_autocmd("CursorMoved", {
         group = S.stack_augroup,
         callback = function()
+            -- Skip if we are inside preview_frame: it manipulates the
+            -- preview window's cursor, which fires CursorMoved under the
+            -- parent nested=true autocmd and would otherwise feed back into
+            -- refresh_stack.
+            if S.is_previewing then return end
             if vim.api.nvim_get_current_buf() == S.stack_bufnr then return end
             vim.schedule(function()
                 local f, l, ids = N.get_current_position()

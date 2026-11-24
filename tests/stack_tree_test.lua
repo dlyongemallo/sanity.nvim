@@ -79,15 +79,19 @@ describe("tree rendering", function()
       },
       "src/io.c", 10
     )
+    -- Both T1 and T2 participations are preserved (dedup fingerprints on
+    -- stack.label too, not just frames), and the shared spawn/main stack
+    -- below the two creation annotations is rendered once.
     assert_eq(lines, {
       "[Race] data race",
-      TOP .. " by thread T1:",
-      BRANCH .. " Thread T1 (tid=1) created:",
-      fmt(BRANCH .. "  ", "write_buf", "io.c", 10),
+      " " .. TOP .. " by thread T1:",
+      fmt(" " .. MID .. "  ", "write_buf", "io.c", 10),
+      " " .. BRANCH .. " by thread T2:",
+      fmt(" " .. MID .. "  ", "read_buf", "io.c", 20),
+      TOP .. MERGE .. " Thread T1 (tid=1) created:",
+      BRANCH .. "  Thread T2 (tid=2) created:",
       fmt(BRANCH .. "  ", "spawn", "thread.c", 30),
-      fmt(MID .. "  ", "main", "main.c", 100),
-      BOT .. " by thread T2:",
-      fmt("   ", "read_buf", "io.c", 20),
+      fmt(BOT .. "  ", "main", "main.c", 100),
     })
   end)
 
@@ -114,6 +118,61 @@ describe("tree rendering", function()
       fmt(BRANCH .. "  ", "spawn", "thread.c", 30),
       fmt(BOT .. "  ", "main", "main.c", 100),
     })
+  end)
+
+  it("per-error composition pairs each T1 operation with its own creation", function()
+    -- Two errors each with a thread labelled T1 but created at different
+    -- spawn sites. Per-error `compose_thread_stacks` scopes `creation_by_tid`
+    -- to each error, so operations don't borrow another error's T1 creation.
+    local lines = render_multi({
+      { kind = "Race", message = "data race",
+        stacks = {
+          stack({ frame("write_buf", "src/io.c", 10) }, "by thread T1"),
+          stack(
+            { frame("spawn_a", "src/thread.c", 30), frame("main", "src/main.c", 100) },
+            "Thread T1 (tid=1) created"
+          ),
+        } },
+      { kind = "Race", message = "data race",
+        stacks = {
+          stack({ frame("write_buf", "src/io.c", 10) }, "by thread T1"),
+          stack(
+            { frame("spawn_b", "src/thread.c", 40), frame("main", "src/main.c", 100) },
+            "Thread T1 (tid=2) created"
+          ),
+        } },
+    }, "src/io.c", 10)
+    local text = table.concat(lines, "\n")
+    assert_eq(text:find("spawn_a", 1, true) ~= nil, true)
+    assert_eq(text:find("spawn_b", 1, true) ~= nil, true)
+  end)
+
+  it("dedup preserves stacks with identical frames but different sub_labels", function()
+    -- Two errors whose T1 participations share op frames AND creation
+    -- frames but differ only in creation label (tid=1 vs tid=2). Both
+    -- participations must survive dedup because the sub_label records
+    -- which runtime thread played the role.
+    local lines = render_multi({
+      { kind = "Race", message = "data race",
+        stacks = {
+          stack({ frame("write_buf", "src/io.c", 10) }, "by thread T1"),
+          stack(
+            { frame("spawn", "src/thread.c", 30), frame("main", "src/main.c", 100) },
+            "Thread T1 (tid=1) created"
+          ),
+        } },
+      { kind = "Race", message = "data race",
+        stacks = {
+          stack({ frame("write_buf", "src/io.c", 10) }, "by thread T1"),
+          stack(
+            { frame("spawn", "src/thread.c", 30), frame("main", "src/main.c", 100) },
+            "Thread T1 (tid=2) created"
+          ),
+        } },
+    }, "src/io.c", 10)
+    local text = table.concat(lines, "\n")
+    assert_eq(text:find("tid=1", 1, true) ~= nil, true)
+    assert_eq(text:find("tid=2", 1, true) ~= nil, true)
   end)
 
   it("invalid-write shared tail keeps caller link connected", function()
