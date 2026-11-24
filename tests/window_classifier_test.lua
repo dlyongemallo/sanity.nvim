@@ -74,3 +74,39 @@ describe("window classifiers", function()
     vim.cmd("cclose")
   end)
 end)
+
+describe("get_qf_entry_position cache invalidation", function()
+  it("reads error IDs from user_data so same-size reorders don't return stale IDs", function()
+    T.reset_state()
+    local file = vim.fn.fnamemodify("qf_dup.c", ":p")
+    local race = T.new_error("Race", "race msg", "test", {
+      { label = "W", frames = { { func = "w", file = file, line = 7 } } },
+    }, {})
+    local leak = T.new_error("Leak_DefinitelyLost", "leak msg", "test", {
+      { label = "L", frames = { { func = "l", file = file, line = 7 } } },
+    }, {})
+    T.populate_quickfix()
+
+    -- Two groups share (file, 7) but differ in kind, so populate produces
+    -- two entries (sorted by kind: Leak before Race).
+    local items = vim.fn.getqflist()
+    assert_eq(#items, 2)
+    assert_eq(items[1].text, "Leak_DefinitelyLost")
+    assert_eq(items[2].text, "Race")
+
+    -- Replace the list with a same-size reorder: swap the two entries. A
+    -- length-only guard would still trust the stale index-keyed cache and
+    -- hand back the original index-1 entry's error IDs for idx=1. With
+    -- user_data as the source of truth, idx=1 now returns the Race's id.
+    vim.fn.setqflist({ items[2], items[1] }, "r")
+
+    local nav = require("sanity.navigate")
+    local got_file, got_line, got_ids = nav.get_qf_entry_position(1)
+    assert_eq(got_file, file)
+    assert_eq(got_line, 7)
+    assert(got_ids and #got_ids == 1, "expected one id on the surviving entry")
+    assert_eq(got_ids[1], race.id)
+    assert(got_ids[1] ~= leak.id, "must not return the old index-1 entry's id")
+    vim.cmd("silent! only")
+  end)
+end)

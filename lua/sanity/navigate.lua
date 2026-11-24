@@ -9,26 +9,19 @@ function N.get_error_by_id(id)
 end
 
 -- Return (file, line, error_ids) for a quickfix entry index.
--- The cached `S.qf_file_lines` / `S.qf_error_ids` are only trusted when they
--- agree with the live quickfix entry at the same index. External commands
--- (`:cfilter`, `:cexpr`, etc.) can replace the quickfix list without our
--- knowledge, in which case the caches hold stale indexes and must not be used
--- to resolve error IDs.
+-- Error IDs are read from the entry's `user_data` so they stay bound to the
+-- entry across any external replacement or reorder of the list (`:cfilter`,
+-- `:cexpr`, `:cnewer`, etc.); an entry that sanity did not populate (e.g.,
+-- after `:cexpr`) returns `error_ids = nil` and callers fall back to
+-- `S.location_index`.
 function N.get_qf_entry_position(idx)
     if not idx or idx < 1 then return nil, nil, nil end
-    local qflist = vim.fn.getqflist()
-    local entry = qflist[idx]
-    if not entry then return nil, nil, nil end
-    local live_file = entry.bufnr and entry.bufnr > 0
-        and vim.api.nvim_buf_get_name(entry.bufnr) or nil
-    local live_line = entry.lnum
-    local fl = S.qf_file_lines[idx]
-    if fl and live_file and F.normalize_path(fl.file) == F.normalize_path(live_file)
-        and fl.line == live_line then
-        return fl.file, fl.line, S.qf_error_ids[idx]
-    end
-    if not live_file then return nil, nil, nil end
-    return live_file, live_line, nil
+    local entry = vim.fn.getqflist()[idx]
+    if not entry or (entry.bufnr or 0) == 0 then return nil, nil, nil end
+    local file = vim.api.nvim_buf_get_name(entry.bufnr)
+    local ud = entry.user_data
+    local ids = type(ud) == "table" and ud.error_ids or nil
+    return file, entry.lnum, ids
 end
 
 -- True only for the built-in quickfix *window* (not loclist, not wrappers).

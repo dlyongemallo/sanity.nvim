@@ -194,17 +194,22 @@ function Q.populate_quickfix_from_errors()
             msg = kind
         end
 
+        local ids = {}
+        for _, err in ipairs(errs) do
+            table.insert(ids, err.id)
+        end
+
+        -- `user_data.error_ids` is the authoritative per-entry binding that
+        -- survives any external replacement or reorder of the list (`:cfilter`,
+        -- `:cexpr`, `:cnewer`, etc.); the parallel `S.qf_error_ids` index-keyed
+        -- cache is kept only for the populated-count check in `init.lua`.
         table.insert(qf_entries, {
             filename = group.file,
             lnum = group.line,
             text = msg,
             type = Q.get_qf_type(kind),
+            user_data = { error_ids = ids },
         })
-
-        local ids = {}
-        for _, err in ipairs(errs) do
-            table.insert(ids, err.id)
-        end
         table.insert(S.qf_error_ids, ids)
         table.insert(S.qf_file_lines, { file = group.file, line = group.line })
     end
