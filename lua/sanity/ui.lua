@@ -228,9 +228,24 @@ function UI.debug_error(err, file, line, nav)
         vim.api.nvim_set_current_win(target_win)
         vim.cmd("edit " .. vim.fn.fnameescape(file))
         vim.api.nvim_win_set_cursor(target_win, { line, 0 })
-        -- `toggle_breakpoint()` would remove an existing breakpoint here.
-        dap.set_breakpoint()
-        vim.notify("Breakpoint set at " .. file .. ":" .. line)
+        -- Leave any pre-existing breakpoint at this line alone, since
+        -- `set_breakpoint()` would otherwise replace a user's conditional
+        -- breakpoint or logpoint with a plain unconditional one, and
+        -- `toggle_breakpoint()` would remove it.
+        local bp_ok, bp_mod = pcall(require, "dap.breakpoints")
+        local existing = false
+        if bp_ok then
+            local target_buf = vim.api.nvim_win_get_buf(target_win)
+            for _, bp in ipairs((bp_mod.get() or {})[target_buf] or {}) do
+                if bp.line == line then existing = true; break end
+            end
+        end
+        if existing then
+            vim.notify("Breakpoint already set at " .. file .. ":" .. line)
+        else
+            dap.set_breakpoint()
+            vim.notify("Breakpoint set at " .. file .. ":" .. line)
+        end
     else
         -- Quote the file path so GDB handles spaces and special characters.
         local gdb_file = file:gsub('"', '\\"')
