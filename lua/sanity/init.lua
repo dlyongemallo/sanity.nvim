@@ -154,10 +154,20 @@ M.parse_valgrind_xml = P.parse_valgrind_xml
 M.parse_sanitizer_log = P.parse_sanitizer_log
 M.parse_ubsan_log = P.parse_ubsan_log
 
+-- Forward-declared so the track-origins callback inside M.run_valgrind can
+-- reference it; the body is assigned where the function appears below.
+local save_snapshot
+
 M.run_valgrind = function(args)
     if S.valgrind_job_id then
         vim.fn.jobstop(S.valgrind_job_id)
         S.valgrind_job_id = nil
+        -- Any pending track-origins rerun belonged to the stopped run.
+        -- Clearing proactively avoids a race where the stopped job's
+        -- `on_exit` has not fired yet while this new run completes first;
+        -- without this, `pre_load_diff` would consume the stale pending
+        -- flag into this unrelated run's baseline.
+        S.auto_rerun_pending = false
     end
     if S.valgrind_xml_file then
         vim.fn.delete(S.valgrind_xml_file)
@@ -185,11 +195,19 @@ M.run_valgrind = function(args)
                 end
             end
         end,
-        on_exit = function(_, code)
-            S.valgrind_job_id = nil
+        on_exit = function(exiting_job_id, code)
+            -- `jobstop` is asynchronous, so a newer run may already own
+            -- `S.valgrind_job_id` by the time this fires.
+            if S.valgrind_job_id == exiting_job_id then
+                S.valgrind_job_id = nil
+            end
             vim.schedule(function()
                 -- Discard result if a newer run or reset has occurred.
                 if generation ~= S.valgrind_generation then
+                    -- Clear the pending flag along with the result: the
+                    -- rerun was superseded, so the next load must not
+                    -- inherit it and skip its baseline snapshot.
+                    S.auto_rerun_pending = false
                     return
                 end
 
@@ -210,6 +228,18 @@ M.run_valgrind = function(args)
                     end
                     vim.notify(msg, vim.log.levels.ERROR)
                     vim.fn.delete(xml_file)
+                    -- A failed track-origins rerun must not leave the pending
+                    -- flag set, or the next unrelated load would preserve the
+                    -- pre-rerun baseline instead of the real previous state.
+                    -- If this was a rerun, the first-run results are still in
+                    -- memory but not on disk (save was deferred); persist them
+                    -- now so a later session diffs against them, not the stale
+                    -- pre-first-run baseline.
+                    local was_pending_rerun = S.auto_rerun_pending
+                    S.auto_rerun_pending = false
+                    if was_pending_rerun then
+                        save_snapshot()
+                    end
                     return
                 end
 
@@ -217,7 +247,12 @@ M.run_valgrind = function(args)
                     vim.notify("Valgrind exited with code " .. code, vim.log.levels.WARN)
                 end
                 vim.notify("Valgrind completed, loading results...", vim.log.levels.INFO)
+                -- Enable snapshot deferral for the uninit-rerun case.
+                S.defer_snapshot_save = true
                 local ok, load_err = pcall(M.valgrind_load_xml, { args = xml_file })
+                -- Clear in case the pcall caught an exception before
+                -- valgrind_load_xml reached its own clear.
+                S.defer_snapshot_save = false
                 if not ok then
                     vim.notify("Failed to load valgrind XML: " .. tostring(load_err), vim.log.levels.ERROR)
                 end
@@ -238,14 +273,28 @@ M.run_valgrind = function(args)
                     end
                     if not has_uninit then return end
                     local rerun_args = "--track-origins=yes " .. S.last_valgrind_args
+                    -- Capture the state we're responding to; the prompt
+                    -- callback compares against this to ignore a stale
+                    -- response (user kicked off an unrelated run while the
+                    -- prompt was open).
+                    local prompt_generation = S.valgrind_generation
                     if S.config.track_origins == true then
+                        S.auto_rerun_pending = true
                         M.run_valgrind({ args = rerun_args })
                     else
                         vim.ui.select({ "Yes", "No" }, {
                             prompt = "Uninitialised value errors found. Re-run with --track-origins=yes?",
                         }, function(choice)
+                            -- Ignore a stale response: skip if another run
+                            -- has completed or is still in flight.
+                            if S.valgrind_generation ~= prompt_generation then return end
+                            if S.valgrind_job_id then return end
                             if choice == "Yes" then
+                                S.auto_rerun_pending = true
                                 M.run_valgrind({ args = rerun_args })
+                            else
+                                -- Deferred first-run save lands here.
+                                save_snapshot()
                             end
                         end)
                     end
@@ -258,6 +307,14 @@ M.run_valgrind = function(args)
         vim.fn.delete(xml_file)
         S.valgrind_xml_file = nil
         S.valgrind_generation = S.valgrind_generation + 1
+        -- If this was a track-origins rerun, persist the still-displayed
+        -- first-run results (deferred during the first run's load) so a
+        -- later session diffs against them, not the pre-first-run baseline.
+        local was_pending_rerun = S.auto_rerun_pending
+        S.auto_rerun_pending = false
+        if was_pending_rerun then
+            save_snapshot()
+        end
     else
         S.valgrind_job_id = job_id
     end
@@ -328,76 +385,245 @@ local function restore_snapshot()
 end
 
 -- Save current fingerprints to the snapshot file atomically.
-local function save_snapshot()
+save_snapshot = function()
     if not S.config.snapshot_file then return end
     local payload = { version = SNAPSHOT_VERSION, fingerprints = D.snapshot_fingerprints() }
     local ok, encoded = pcall(vim.json.encode, payload)
     if not ok then return end
-    local tmp_path = S.config.snapshot_file .. ".tmp"
-    local sf = io.open(tmp_path, "w")
-    if not sf then return end
-    sf:write(encoded)
-    sf:close()
-    os.rename(tmp_path, S.config.snapshot_file)
+    local dest = S.config.snapshot_file
+    local dir = vim.fn.fnamemodify(dest, ":h")
+    -- Unpredictable O_CREAT|O_EXCL tmp file in the destination directory
+    -- so a planted symlink at the tmp path cannot redirect the write.
+    local fd, tmp_path = vim.uv.fs_mkstemp(dir .. "/.sanity-snapshot-XXXXXX")
+    if not fd then
+        vim.notify("Failed to create snapshot temp file in " .. dir, vim.log.levels.ERROR)
+        return
+    end
+    -- `fs_write` can return a short count (fewer bytes than requested) on
+    -- interrupted writes or odd filesystems; checking only truthiness would
+    -- rename a truncated temp file into place and leave the on-disk
+    -- snapshot as invalid JSON. Loop until the whole payload is on disk.
+    local written = 0
+    while written < #encoded do
+        local n, w_err = vim.uv.fs_write(fd, encoded:sub(written + 1))
+        if not n or n == 0 then
+            vim.notify("Failed to write snapshot: " .. tostring(w_err or "short write"),
+                vim.log.levels.ERROR)
+            vim.uv.fs_close(fd)
+            vim.uv.fs_unlink(tmp_path)
+            return
+        end
+        written = written + n
+    end
+    local c_ok, c_err = vim.uv.fs_close(fd)
+    if not c_ok then
+        vim.notify("Failed to close snapshot temp file: " .. tostring(c_err), vim.log.levels.ERROR)
+        vim.uv.fs_unlink(tmp_path)
+        return
+    end
+    local r_ok, r_err = vim.uv.fs_rename(tmp_path, dest)
+    if not r_ok then
+        vim.notify("Failed to replace snapshot: " .. tostring(r_err), vim.log.levels.ERROR)
+        vim.uv.fs_unlink(tmp_path)
+    end
 end
 
 -- Prepare diff state before a load: snapshot existing S.errors or restore from disk.
 local function pre_load_diff()
-    if S.has_loaded then
+    if S.auto_rerun_pending then
+        -- A tracked-origins rerun must diff against the pre-first-run
+        -- baseline (already in prev_error_fingerprints), not against the
+        -- intermediate first-run results.
+        S.auto_rerun_pending = false
+    elseif S.has_loaded then
         S.prev_error_fingerprints = D.snapshot_fingerprints()
     else
         restore_snapshot()
     end
 end
 
+-- True when valgrind_load_xml should defer save_snapshot because an automatic
+-- track-origins rerun is about to follow and the rerun's save_snapshot should
+-- be the one that lands on disk.
+local function auto_rerun_will_fire()
+    if S.config.track_origins == false then return false end
+    if S.last_valgrind_args and S.last_valgrind_args:find("%-%-track%-origins") then
+        return false
+    end
+    for _, e in ipairs(S.errors) do
+        if e.kind == "UninitCondition" or e.kind == "UninitValue" then
+            return true
+        end
+    end
+    return false
+end
+
 M.valgrind_load_xml = function(args)
     register_keymaps()
     local xml_file = args.args
     pre_load_diff()
+    -- Preserve user-set state (active filter and queued suppressions) across
+    -- a valgrind (re)run; they are session-level, not log-derived.
+    local preserved_filter = S.current_filter
+    local preserved_suppressions = S.suppressions
     S.reset_state()
+    S.current_filter = preserved_filter
+    S.suppressions = preserved_suppressions
+    STK.close_stack_split()
     local num_errors = M.parse_valgrind_xml(xml_file)
     Q.populate_quickfix_from_errors()
     Q.set_diagnostics()
-    -- Schedule cfirst so it runs after BufReadPost autocmds (e.g.
+    -- Schedule cfirst so it runs after BufReadPost autocmds (e.g.,
     -- last-position-jump) that would otherwise override the cursor.
     if #S.qf_error_ids > 0 then vim.schedule(function() vim.cmd("cfirst") end) end
     local msg = "Processed " .. num_errors .. " errors from '" .. xml_file .. "' into " .. #S.qf_error_ids .. " locations."
     local diff = D.compute_diff_summary()
     if diff then msg = msg .. diff end
     S.has_loaded = true
-    save_snapshot()
+    -- Only defer inside run_valgrind's flow when a track-origins rerun is
+    -- about to follow; direct callers persist immediately.
+    local should_defer = S.defer_snapshot_save and auto_rerun_will_fire()
+    S.defer_snapshot_save = false
+    if not should_defer then
+        save_snapshot()
+    end
     vim.notify(msg)
 end
 
-local function load_files(filepaths)
+local function load_files(filepaths, opts)
+    opts = opts or {}
     register_keymaps()
+    -- Expand shell-ish prefixes (~, $HOME, %) that the user command's custom
+    -- completion does not do automatically for `fargs`.
+    local expanded = {}
+    for _, p in ipairs(filepaths or {}) do
+        if p ~= "" then
+            table.insert(expanded, vim.fn.expand(p))
+        end
+    end
+
+    -- Validate before touching state: detect the format of each file first so
+    -- that a bad path, an empty picker selection, or a watch-mode reload of a
+    -- broken log cannot silently wipe the errors, snapshot, filter, and
+    -- queued suppressions. Each file not readable or not in a recognised
+    -- format is reported and skipped; if nothing survives validation we bail
+    -- out without resetting state.
+    local valid = {}
+    -- In watch mode, a tracked file that is temporarily unavailable (empty
+    -- or in an unrecognised format mid-write) is ambiguous: it could be an
+    -- in-progress rewrite, or a settled terminal state (e.g., a clean test
+    -- run that truncated the log to zero bytes and produced no output).
+    -- On the first watch pass, bail and arm a longer stability timer; if no
+    -- further fs event resets the shared debounce in that window, the file
+    -- state has settled, and the stability recheck re-enters with
+    -- `stability_recheck = true` to accept zero-byte files as a clean run.
+    -- Persistently-missing files (e.g., a mistyped path) are tolerated in
+    -- both passes: they never gain a watcher so they never contribute data,
+    -- and bailing on them would permanently freeze watch mode.
+    local watch_transient_skip = false
+    local watch_recheck = opts.from_watch and opts.stability_recheck
+    for _, filepath in ipairs(expanded) do
+        local st = vim.uv.fs_stat(filepath)
+        if not st then
+            if not opts.from_watch then
+                vim.notify("Failed to open file: " .. filepath, vim.log.levels.ERROR)
+            end
+        elseif st.size == 0 then
+            -- Zero-byte readable: a clean run on a direct or recheck load; a
+            -- possibly-transient truncation on a first-pass watch load.
+            if opts.from_watch and not watch_recheck then
+                watch_transient_skip = true
+            else
+                table.insert(valid, { path = filepath, format = "empty" })
+            end
+        else
+            local format = P.detect_log_format(filepath)
+            if format then
+                table.insert(valid, { path = filepath, format = format })
+            elseif opts.from_watch and not watch_recheck then
+                watch_transient_skip = true
+            end
+            -- On a recheck, an unrecognised format is silently skipped like
+            -- any other unreadable file; another pass will not help.
+        end
+    end
+    if watch_transient_skip then
+        -- Reuse the shared watch timer: any new fs event inside the stability
+        -- window will stop and rearm it at the normal 100 ms debounce, which
+        -- naturally supersedes this recheck. If the window elapses quietly,
+        -- re-enter with `stability_recheck = true` to accept the settled
+        -- zero-byte state. Snapshot `expanded` so a direct `:SanityLoadLog`
+        -- between arming and firing cannot redirect the recheck onto a
+        -- different file set.
+        if S.watch_timer then
+            local files_for_recheck = expanded
+            S.watch_timer:stop()
+            S.watch_timer:start(500, 0, vim.schedule_wrap(function()
+                if not vim.deep_equal(files_for_recheck, S.last_loaded_files) then
+                    return
+                end
+                load_files(files_for_recheck, { from_watch = true, stability_recheck = true })
+            end))
+        end
+        return
+    end
+    if #valid == 0 then
+        if #expanded > 0 and not opts.from_watch then
+            vim.notify("No files loaded (none were readable in a recognised format).",
+                vim.log.levels.WARN)
+        end
+        return
+    end
+
+    -- Cancel any pending track-origins rerun so pre_load_diff doesn't
+    -- consume its baseline into this unrelated load.
+    S.auto_rerun_pending = false
+
+    -- Preserve user-set state across a reload: the queued suppressions and
+    -- active filter are session-level settings, not derived from the loaded
+    -- log, and a watch-mode reload must not drop them.
+    local preserved_filter = S.current_filter
+    local preserved_suppressions = S.suppressions
+
     pre_load_diff()
     S.reset_state()
-    for _, filepath in ipairs(filepaths) do
-        local format = P.detect_log_format(filepath)
-        if format == "valgrind_xml" then
-            M.parse_valgrind_xml(filepath)
-            vim.notify("Parsed valgrind XML: " .. filepath)
-        elseif format == "sanitizer_log" or format == "ubsan_log" then
+    -- Error IDs restart from 1 on each load, so any open stack split still
+    -- references old IDs that now resolve to different errors. Close it;
+    -- the user can re-open with :SanityStack.
+    STK.close_stack_split()
+    S.current_filter = preserved_filter
+    S.suppressions = preserved_suppressions
+
+    for _, entry in ipairs(valid) do
+        if entry.format == "valgrind_xml" then
+            M.parse_valgrind_xml(entry.path)
+            vim.notify("Parsed valgrind XML: " .. entry.path)
+        elseif entry.format == "sanitizer_log" or entry.format == "ubsan_log" then
             -- A single log can mix ASAN/TSAN/MSAN/LSAN output with UBSAN
             -- "file:line:col: runtime error:" entries (e.g.,
             -- `-fsanitize=address,undefined`). Run both parsers so neither
             -- format is dropped; each only emits errors for its own headers.
-            M.parse_sanitizer_log(filepath)
-            M.parse_ubsan_log(filepath)
-            vim.notify("Parsed sanitizer/UBSAN log: " .. filepath)
+            M.parse_sanitizer_log(entry.path)
+            M.parse_ubsan_log(entry.path)
+            vim.notify("Parsed sanitizer/UBSAN log: " .. entry.path)
+        elseif entry.format == "empty" then
+            vim.notify("Loaded clean log: " .. entry.path .. " (0 errors).")
         end
     end
     Q.populate_quickfix_from_errors()
     Q.set_diagnostics()
-    -- Schedule cfirst so it runs after BufReadPost autocmds (e.g.
+    -- Schedule cfirst so it runs after BufReadPost autocmds (e.g.,
     -- last-position-jump) that would otherwise override the cursor.
     if #S.qf_error_ids > 0 then vim.schedule(function() vim.cmd("cfirst") end) end
     local msg = "Loaded " .. #S.errors .. " errors into " .. #S.qf_error_ids .. " quickfix entries."
     local diff = D.compute_diff_summary()
     if diff then msg = msg .. diff end
     S.has_loaded = true
-    S.last_loaded_files = filepaths
+    -- Track the user's full intent, not just what was loadable this pass:
+    -- a watch-mode reload must keep watching a file that is momentarily
+    -- empty (mid-truncation) or missing; rebuilding this from `valid` would
+    -- drop it from the next watcher reconfiguration.
+    S.last_loaded_files = expanded
     -- Restart watchers if watch mode is active so they track the new files.
     if #S.watchers > 0 then
         stop_watching()
@@ -487,6 +713,12 @@ start_watching = function(files)
     end
 
     for _, filepath in ipairs(files) do
+        -- Skip paths that don't exist. Warning the user here on every
+        -- restart would spam on each watch-triggered reload; the path was
+        -- already flagged at load time.
+        if not vim.uv.fs_stat(filepath) then
+            goto next_watch
+        end
         local handle = vim.uv.new_fs_event()
         if handle then
             local ok, start_err = handle:start(filepath, {}, function(err)
@@ -496,7 +728,7 @@ start_watching = function(files)
                     if not S.watch_timer then return end
                     S.watch_timer:stop()
                     S.watch_timer:start(100, 0, vim.schedule_wrap(function()
-                        load_files(S.last_loaded_files)
+                        load_files(S.last_loaded_files, { from_watch = true })
                     end))
                 end)
             end)
@@ -508,6 +740,7 @@ start_watching = function(files)
                     vim.log.levels.WARN)
             end
         end
+        ::next_watch::
     end
 end
 
@@ -537,11 +770,20 @@ M.watch_toggle = function(args)
     stop_watching()
     start_watching(S.last_loaded_files)
 
+    -- Only name files that actually got a watcher; the tracked list can hold
+    -- paths that don't exist (e.g., a mistyped entry alongside a good one).
     local names = {}
     for _, f in ipairs(S.last_loaded_files) do
-        table.insert(names, vim.fn.fnamemodify(f, ":t"))
+        if vim.uv.fs_stat(f) then
+            table.insert(names, vim.fn.fnamemodify(f, ":t"))
+        end
     end
-    vim.notify("Watching: " .. table.concat(names, ", "), vim.log.levels.INFO)
+    if #names == 0 then
+        vim.notify("Watch mode on, but no tracked file exists to watch.",
+            vim.log.levels.WARN)
+    else
+        vim.notify("Watching: " .. table.concat(names, ", "), vim.log.levels.INFO)
+    end
 end
 
 M.sanity_load_log = function(args)
