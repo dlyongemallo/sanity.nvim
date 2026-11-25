@@ -85,12 +85,25 @@ describe("export_errors", function()
       { label = "s", frames = { { func = "f", file = "a.c", line = 1 } } },
     }, {})
 
-    local msgs = capture_notify(function()
+    -- Run the export from a fresh temp directory so the default-filename
+    -- write and its cleanup cannot overwrite or delete a file named
+    -- `sanity-export.json` that happens to live in the user's working
+    -- directory when the suite is run.
+    local tmp_dir = vim.fn.tempname()
+    vim.fn.mkdir(tmp_dir, "p")
+    local orig_cwd = vim.fn.getcwd()
+    vim.cmd("lcd " .. vim.fn.fnameescape(tmp_dir))
+
+    local ok, msgs = pcall(capture_notify, function()
       M.export_errors({ args = "" })
     end)
 
+    vim.fn.delete(tmp_dir .. "/sanity-export.json")
+    vim.cmd("lcd " .. vim.fn.fnameescape(orig_cwd))
+    vim.fn.delete(tmp_dir, "rf")
+
+    assert(ok, "export failed")
     local summary = msgs[#msgs]
     assert(summary:find("sanity%-export%.json"), "expected default filename: " .. summary)
-    vim.fn.delete("sanity-export.json")
   end)
 end)
