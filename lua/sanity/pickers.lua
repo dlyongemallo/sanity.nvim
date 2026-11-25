@@ -6,7 +6,7 @@ local function pick_files_fzf_lua(callback)
     require("fzf-lua").files({
         prompt = "SanityLoadLog> ",
         fd_opts = "--type f --no-ignore -e xml -e log -e txt",
-        rg_opts = "--files --no-ignore -g *.xml -g *.log -g *.txt",
+        rg_opts = [[--files --no-ignore -g "*.xml" -g "*.log" -g "*.txt"]],
         actions = {
             ["default"] = function(selected)
                 local paths = {}
@@ -28,17 +28,20 @@ local function pick_files_telescope(callback)
         find_command = { "fd", "--type", "f", "--no-ignore", "-e", "xml", "-e", "log", "-e", "txt" },
         attach_mappings = function(prompt_bufnr, _)
             actions.select_default:replace(function()
+                -- Snapshot both multi-selection and the currently highlighted
+                -- entry BEFORE closing the picker: `actions.close` tears down
+                -- picker state, after which `get_selected_entry()` returns nil.
                 local picker = action_state.get_current_picker(prompt_bufnr)
                 local selections = picker:get_multi_selection()
+                local single_entry = action_state.get_selected_entry()
                 actions.close(prompt_bufnr)
                 local paths = {}
                 if #selections > 0 then
                     for _, entry in ipairs(selections) do
-                        table.insert(paths, entry[1])
+                        table.insert(paths, entry.value)
                     end
-                else
-                    local entry = action_state.get_selected_entry()
-                    if entry then table.insert(paths, entry[1]) end
+                elseif single_entry then
+                    table.insert(paths, single_entry.value)
                 end
                 callback(paths)
             end)
@@ -70,8 +73,11 @@ local function pick_files_snacks(callback)
         ft = { "xml", "log", "txt" },
         ignored = true,
         confirm = function(picker)
-            picker:close()
+            -- Snapshot the selection BEFORE closing: `picker:close()` tears
+            -- down the picker window, after which `picker:selected({fallback=true})`
+            -- cannot resolve the cursor entry via fallback.
             local items = picker:selected({ fallback = true })
+            picker:close()
             local paths = {}
             for _, item in ipairs(items) do
                 if item.file then

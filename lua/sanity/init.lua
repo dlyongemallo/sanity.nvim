@@ -836,5 +836,9 @@ M._test = {
   set_config = function(key, val) S.config[key] = val end,
   restore_snapshot = restore_snapshot,
   save_snapshot = save_snapshot,
+  is_trouble_like_window = N.is_trouble_like_window,
+  is_loclist_window = N.is_loclist_window,
+  is_qflist_window = N.is_qflist_window,
+  is_source_window = N.is_source_window,
 }
 return M
